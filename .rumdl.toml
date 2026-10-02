@@ -1,0 +1,9 @@
+[global]
+exclude = ["target", ".claude", ".serena", ".delta"]
+
+# Prose is hand-wrapped at the same 100 columns as the Rust sources; tables and code blocks
+# carry long literal lines.
+[MD013]
+line-length = 100
+tables = false
+code-blocks = false

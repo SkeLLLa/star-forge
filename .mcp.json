@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "fff": {
+      "command": "mise",
+      "args": [
+        "exec",
+        "--cd",
+        ".",
+        "--",
+        "fff-mcp"
+      ],
+      "type": "stdio"
+    },
+    "ripwire": {
+      "command": "mise",
+      "args": [
+        "exec",
+        "--cd",
+        ".",
+        "--",
+        "ripwire",
+        "--mcp"
+      ],
+      "type": "stdio"
+    }
+  }
+}

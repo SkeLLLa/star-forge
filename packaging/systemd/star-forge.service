@@ -1,0 +1,19 @@
+# systemd user unit: `systemctl --user enable --now star-forge.service`.
+#
+# Optional: without it, `stfg`/`stfgd get` spawn the daemon on first use. The daemon still
+# exits after `daemon.idle_exit` (default 30m) without requests; that clean exit leaves the
+# unit inactive and the next `get` respawns the daemon outside systemd. Set `idle_exit` to a
+# long duration (e.g. "8760h") to keep this unit running for the whole session.
+[Unit]
+Description=star-forge statusline badge cache daemon
+Documentation=https://github.com/SkeLLLa/star-forge
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/stfgd daemon
+ExecReload=/usr/bin/stfgd reload
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=default.target
