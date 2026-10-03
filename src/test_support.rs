@@ -12,17 +12,22 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Self {
-        // pid + counter is unique among live processes; a leftover from a crashed run
-        // with a recycled pid is cleared first.
+        // pid + counter is unique among live processes. A name left over from another run
+        // (recycled pid) is skipped, never deleted: the counter advances until a fresh
+        // directory is created.
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "sf-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "sf-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => panic!("create {}: {err}", path.display()),
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
