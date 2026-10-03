@@ -57,6 +57,39 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  musl:
+    name: musl static build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --locked --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/debug/stfg | grep -q static
+
+  nix:
+    name: Nix build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: Build
+        run: nix build .#default --print-build-logs
+      - name: Check outputs
+        run: |
+          test -x result/bin/stfgd
+          test -x result/bin/stfg
+          grep -q "ExecStart=$(readlink -f result)/bin/stfgd" result/lib/systemd/user/star-forge.service
+
   macos:
     name: macOS (${{ matrix.target }})
     runs-on: macos-latest

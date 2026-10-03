@@ -13,7 +13,7 @@
 
 ### Binary archives
 
-Linux (`x86_64-unknown-linux-gnu`) and macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`)
+Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`)
 archives contain:
 
 - `bin/stfgd`
@@ -21,6 +21,14 @@ archives contain:
 - `README.md`
 - `COPYING`
 - `THIRD_PARTY_NOTICES.md`
+
+The `x86_64-unknown-linux-musl` archive is the same layout with statically linked binaries (no
+libc or `libgcc_s` to load). It is published only as a `tar.gz`; there is no `deb`/`rpm`. Choose it
+when you want the fastest `stfg` startup (a dynamic binary spends roughly 200 µs per call on
+loading and runtime init), or on a distro without a compatible glibc (Alpine, old LTS). Otherwise
+prefer the `gnu` archive or a native package. musl's allocator is slower than glibc's: `stfg`
+barely allocates, but the `stfgd` daemon (tokio) may be marginally slower under load. The musl
+archive is not in the packslip manifest, so `mise` keeps installing the `gnu` build.
 
 ### `deb` / `rpm`
 
@@ -93,11 +101,17 @@ The release flow:
 6. It assembles the Linux binary tarball.
 7. It builds `deb` via `cargo-deb` and `rpm` via `cargo-generate-rpm`.
 8. It verifies both packages contain the binaries, docs, notices, and the user unit.
-9. It generates a combined `SHA256SUMS` file and one `.sha256` sidecar per artifact.
+9. It generates one `.sha256` sidecar per Linux artifact.
 10. It attaches the `tar.gz`, `deb`, `rpm`, and checksum files to the GitHub release and attests
     their build provenance.
-11. A matrix job builds and attaches the macOS tarballs.
-12. It builds and deploys RPM/APT repository metadata to GitHub Pages.
+11. A matrix job builds and attaches the macOS tarballs and their `.sha256` sidecars.
+12. `linux-musl-assets` builds the static `x86_64-unknown-linux-musl` tarball with `musl-tools`,
+    checks the binaries are static, smoke-tests them, and attaches the tarball and its `.sha256`.
+13. Once the gnu and macOS tarballs are attached, `jdx/packslip` publishes a signed
+    `packslip.sigstore.json` manifest covering them (used by the `mise` packslip backend). Its
+    `download` globs exclude the musl tarball, since packslip cannot pick between two linux-x64
+    assets.
+14. It builds and deploys RPM/APT repository metadata to GitHub Pages.
 
 The release workflow uses the default `GITHUB_TOKEN` for repository operations. It does not depend
 on a PAT to trigger a second workflow.
@@ -171,7 +185,12 @@ run:
 sha256sum -c star-forge-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
-The release also includes `SHA256SUMS` for checking all downloaded artifacts at once.
+The release also includes `SHA256SUMS`, merged from every sidecar (Linux, musl, and macOS) once all
+assets are attached. To check everything you downloaded into one directory:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+```
 
 ### Native package
 
@@ -211,3 +230,22 @@ echo 'deb [trusted=yes] https://skellla.github.io/star-forge/deb stable main' | 
 sudo apt update
 sudo apt install star-forge
 ```
+
+### Nix
+
+```bash
+nix profile install github:SkeLLLa/star-forge
+```
+
+The flake builds from source (`packaging/nix/package.nix`) and, on Linux, installs the systemd
+user unit to `lib/systemd/user/` with `ExecStart` pointing at the store path.
+
+### mise
+
+```bash
+mise use -g github:SkeLLLa/star-forge
+```
+
+This installs `stfgd` and `stfg` from the release tarball. No setup is required; the daemon is
+spawned on the first `get`, as with `cargo install`. To start it with the session, use the
+`cargo install` unit above, with `ExecStart` pointing at the mise-installed `stfgd` path.

@@ -27,3 +27,7 @@
 # Local assistant and analysis state
 /.claude/
 /.serena/
+
+# Nix build output
+/result
+/result-*

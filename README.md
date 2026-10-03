@@ -1,17 +1,83 @@
 # star-forge
 
-A small daemon plus a synchronous CLI client that cache statusline values ("badges") so
-prompt tools (starship `[custom.*]`, tmux, …) render instantly. Values are refreshed in the
-background; rendering never waits on a provider.
+[![CI](https://github.com/SkeLLLa/star-forge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/SkeLLLa/star-forge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SkeLLLa/star-forge)](https://github.com/SkeLLLa/star-forge/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/star-forge)](https://crates.io/crates/star-forge)
+[![MSRV](https://img.shields.io/crates/msrv/star-forge)](Cargo.toml)
+[![License: GPL-3.0-or-later](https://img.shields.io/crates/l/star-forge)](COPYING)
 
-- `stfg <badge>...` (the tiny hot-path client; `stfgd get <badge>...` is the exact
-  equivalent) always exits 0 and prints one line per badge (empty on any failure), bounded
-  by a 40 ms deadline. It never writes to stderr and never waits for the daemon to start.
-- The daemon refreshes badges on demand, caches per badge (globally, or per git repo root
-  for git-scoped builtins), and exits after 30 minutes of inactivity by default. The next
-  `get` respawns it.
+Fast, cached badges for your shell prompt and tmux status line.
 
-See `docs/design.md` for the full architecture.
+[Starship](https://starship.rs) is great at drawing a prompt, but it starts from scratch every
+time it draws one. Its built-in modules are quick. A `[custom.*]` module is a different story:
+your public IP, the weather, CI status, or the output of some slow CLI all run again every time
+you press Enter. A 300 ms `curl` means a 300 ms pause before every prompt. If a command takes
+longer than starship's `command_timeout` (500 ms by default), starship kills it, so the module
+doesn't show and a warning goes to the log.
+
+star-forge takes the slow work out of the prompt. A small background daemon runs your
+commands on their own schedule and keeps the latest results. Your prompt reads the cached value
+with `stfg`, which usually answers in under a millisecond and never takes longer than 40 ms.
+Anything that can run a command can use it: starship, tmux, or your own statusline script.
+
+## What you get
+
+- **A prompt that never waits.** Slow commands and HTTP requests refresh in the background,
+  and the prompt shows the last known value right away.
+- **No error noise.** If a command fails or times out, or the daemon isn't running yet, the
+  badge is simply empty. Nothing is ever printed to your terminal.
+- **Each command runs once, not once per shell.** Ten terminals and a tmux status bar all read
+  the same cache, so a weather API gets one request every 30 minutes instead of one per prompt
+  in every pane.
+- **Up-to-date git info at almost no cost.** Branch, commit, rebase/merge state and stash count
+  are read straight from `.git`, without starting a subprocess. Counts that do need
+  `git status` are cached per repository and refreshed as soon as you stage, commit or switch
+  branches.
+- **Fewer processes per prompt.** A group renders several badges from one `stfg` call. It can
+  even style them with starship's own format syntax and your starship palette. In the
+  [example below](#batching-calls), nine custom modules become two.
+- **Easy on your battery.** Badges refresh only while something is using them, refreshes are
+  batched onto a single timer, and you can set slower intervals for when you're on battery. The
+  daemon quits after 30 idle minutes and starts again the next time a badge is requested.
+- **Works with tmux too.** The same badges can be rendered in tmux's own `#[fg=...]` style
+  syntax.
+
+## Is it for me?
+
+It probably is if your prompt has custom modules that make network calls or run slow tools, or
+if you notice a lag after pressing Enter in big repositories. If you only use starship's
+built-in modules and your prompt already feels instant, you don't need star-forge.
+
+## Quick start
+
+1. Install it (see [Install](#install)).
+2. Describe a badge in `~/.config/star-forge/config.toml`:
+
+   ```toml
+   [badge.public_ip]
+   type = "http"
+   url = "https://api.ipify.org?format=json"
+   extract = { kind = "json", pointer = "/ip" }
+   interval = "10m"
+   ```
+
+3. Show it in `~/.config/starship.toml`:
+
+   ```toml
+   [custom.sf_public_ip]
+   command = "public_ip"
+   shell = ["stfg"]
+   use_stdin = false
+   when = true
+   format = "([$output ]($style))"
+   ```
+
+4. Open a new prompt. The very first one may show nothing while the value is fetched. After
+   that the value is always there, and `stfgd status` shows what's cached.
+
+You don't need to start anything yourself: the daemon is launched automatically the first time
+a badge is requested. If you're curious how it works inside, see
+[`docs/design.md`](docs/design.md).
 
 ## Install
 
@@ -44,6 +110,25 @@ echo 'deb [trusted=yes] https://skellla.github.io/star-forge/deb stable main' | 
 sudo apt update
 sudo apt install star-forge
 ```
+
+For Nix (flakes), on Linux and macOS:
+
+```sh
+nix profile install github:SkeLLLa/star-forge
+nix run github:SkeLLLa/star-forge -- --help
+```
+
+On Linux the package also ships the systemd user unit under `lib/systemd/user/`.
+
+For [`mise`](https://mise.jdx.dev), on Linux and macOS:
+
+```sh
+mise use -g github:SkeLLLa/star-forge
+```
+
+To pin a specific release: `mise use -g github:SkeLLLa/star-forge@1.0.0`. Releases from 1.1.0
+on also publish a signed `packslip.sigstore.json` manifest. This installs both binaries but no
+systemd unit; see the first-run notes below.
 
 The repositories are unsigned. See [`docs/distribution.md`](docs/distribution.md) for artifact
 contents, the release pipeline, and first-run steps per install method.
@@ -108,11 +193,15 @@ retry_min = "2s"           # default 2s: backoff after a failed fetch starts her
 retry_max = "5m"           # default 5m: backoff cap
 timeout = "2s"             # default 2s: fallback hard kill for the whole fetch + extract
 power_check = "60s"        # default 60s: how often AC/battery state is re-checked
-config_check = "2s"        # default 2s: how often the config file's mtime is polled for an implicit reload
+config_check = "2s"        # default 2s: how often the config and palette_from files are stat'ed for an implicit reload
 cold_wait = "20ms"         # default 20ms: how long a cold (no value yet) `get` waits for its own fetch; must be < 40ms
 path_evict = "30m"         # default 30m: idle git-scoped badges are dropped after this long
 max_paths = 256            # default 256: LRU cap on git-scoped (per-repo) cache entries
 max_output = 65536         # default 64 KiB: fallback cap on command stdout / HTTP body
+palette_from = "~/.config/starship.toml"   # optional: import the active starship palette (see Styled groups)
+
+[palette]                  # optional: inline color names for group styles; overrides palette_from
+# color_bg_l1 = "#3b4252"
 
 [badge.<name>]
 type = "builtin" | "command" | "http"
@@ -261,6 +350,98 @@ format = " {value}"
 extract = { kind = "regex", pattern = '^(\d+\.\d+)', group = 1 }
 ```
 
+### Groups
+
+A group renders several badges on one line, from a single `stfg` call (tmux `#()` shows only
+the first output line):
+
+```toml
+[groups.right]
+badges = ["battery", "uptime", "git_branch"]
+separator = " "        # optional, default " "
+```
+
+`stfg right` resolves each member as if requested individually (same cwd/scope handling,
+staleness, `cold_wait`), then joins the non-empty values with `separator`; all empty ⇒ empty
+line. A group name must not collide with a badge name, members must be defined badges (no
+nesting), the list must be non-empty, and `separator` must not contain newline, CR, or 0x1F.
+Group changes are picked up by config reload like any other.
+
+#### Styled groups
+
+Instead of `badges`/`separator`, a group may set `format` (mutually exclusive with both),
+using starship's format syntax:
+
+- `{badge}` — the badge's value (empty if it has none).
+- `[text](style)` — a styled span; spans nest.
+- `( ... )` — a conditional section, dropped (padding and all) when every badge inside is empty.
+- Escapes: `\[ \] \( \) \{ \} \\`.
+
+Styles are starship style strings: `fg:`/`bg:`/bare color, `#rrggbb`, named colors (`black red
+green yellow blue purple cyan white`, `bright-*`), 0-255, or palette names, plus modifiers
+`bold italic underline dimmed inverted blink hidden strikethrough none`. Output is raw ANSI
+unless the group sets `output = "tmux"` (see [tmux](#tmux)). A `( ... )` section containing no
+`{badge}` at all is never rendered (mirrors starship).
+
+Palette names come from `[daemon] palette_from`, which imports the active palette of a
+starship config (`palette = "<name>"` plus `[palettes.<name>]`); an inline `[palette]` table in
+the star-forge config overrides it. The palette file is watched along with the
+config: editing it is picked up automatically within `config_check` (or run `stfgd reload`).
+Changes are detected by inode, size and ctime rather than mtime alone, so `rsync -a`/`cp -p`
+copies and Nix/home-manager symlink switches are noticed too. On a filesystem that doesn't
+report this metadata (some FUSE mounts), run `stfgd reload` yourself, e.g. from a
+home-manager activation hook or a chezmoi `run_after_` script.
+
+The template is parsed once at config load; per request only badge substitution happens.
+
+Worked example: replace several per-badge starship modules (each with powerline separators)
+by one module per group. Copy the chunk of your starship `format`, replacing `${custom.sf_x}`
+with `{x}`:
+
+```toml
+[daemon]
+palette_from = "~/.config/starship.toml"
+
+[groups.git]
+format = """
+([  {git_branch} ](bg:color_bg_l2 fg:color_fg_l2))\
+([{git_conflicted} ](bg:color_bg_l2 fg:color_fg_l2))\
+([{git_staged} ](bg:color_bg_l2 fg:color_fg_l2))\
+([{git_modified} ](bg:color_bg_l2 fg:color_fg_l2))\
+"""
+
+[groups.right]
+format = """
+([󰩠 {public_ip} ](bg:color_bg_l2 fg:color_fg_l2))\
+[](bg:color_bg_l2 fg:color_bg_l1)\
+([󰚥 {battery}% ](fg:color_fg_l1 bg:color_bg_l1))\
+"""
+```
+
+and on the starship side:
+
+```toml
+[custom.sf_right]
+command = "right"
+shell = ["stfg"]
+use_stdin = false
+when = true
+format = '$output'
+```
+
+Use `format = '$output'` and no module `style`: starship applies `style` once as a prefix, and
+any reset in the output cancels it, so the group carries all of its own styling. Starship wraps
+the ANSI for bash/zsh itself and measures width correctly (verified on starship 1.26); it does
+not interpret `[..](..)` markup in custom output, which is why star-forge renders it.
+
+This also cuts process spawns: one `stfg` per module, not per badge (e.g. 9 → 2).
+
+TOML note: in basic strings (`"..."`, `"""..."""`) a trailing `\` at line end trims the newline
+and following whitespace (wanted above), but `\[` is an invalid TOML escape. To get a literal
+`\[` in the template write `\\[`, or use literal strings (`'''...'''`).
+
+For tmux, set `output = "tmux"` on the group instead; tmux does not render ANSI (see below).
+
 ## starship
 
 ```toml
@@ -279,16 +460,78 @@ resolve correctly.
 
 Empty output ⇒ `$output` is empty, and the conditional `( … )` group drops the module's text,
 including padding/icons; a plain `[$output ]` group would still render its literal space.
-One `[custom.*]` block per badge; verified against starship 1.26.
+One `[custom.*]` block per badge; verified against starship 1.26. To show several badges in
+one module, define a group and use its name: `command = "right"`.
 
 ## tmux
 
-```text
-#(stfg battery)
+tmux does **not** render ANSI escapes in `#()` output (the ESC byte is dropped and `[31m` shows
+up literally). It does re-expand the output as a format string: `#[fg=...]` styles work, and
+every literal `#` must be written `##`. Set `output = "tmux"` on a group (plain or `format`) to
+get that dialect:
+
+```toml
+[groups.right_tmux]
+output = "tmux"
+format = """
+[ {git_branch} ](fg:#5a5a5a bg:#81c784 bold)\
+([ {battery}% ](fg:#ffffff bg:#3b4252))\
+"""
 ```
 
-Same hot-path client, no daemon-start wait: empty on a cold cache, filled in on the next
-render once the background refresh lands.
+```text
+set -g status-right '#(stfg right_tmux)'
+```
+
+- Plain group: values are joined as usual, with every `#` in values and `separator` doubled.
+- Format group: spans become `#[fg=..,bg=..,bold]` ... `#[default]`; nested spans re-emit the outer
+  style after the inner one closes. `#[default]` restores tmux's `status-style` (colours and
+  attributes), not the terminal default. Literal template text and badge values have `#`
+  doubled. The tmux dialect adds no control bytes, but ESC or other control bytes inside badge
+  values pass through (tmux shows them literally).
+- Colors: `#rrggbb` stays, 0-255 becomes `colourN`, `purple` becomes `magenta`, `bright-x`
+  becomes `brightx`; palette names resolve to these. Modifiers map to `bold dim italics
+  underscore blink reverse hidden strikethrough`.
+
+Same hot-path client, no daemon-start wait.
+
+### Limitations & workarounds
+
+- One group cannot serve both starship and tmux (`output` is per group). Define two groups, e.g.
+  `right` and `right_tmux`, with the same badges; palette names keep their colors consistent.
+- Plain `#(stfg <badge>)` (a single badge, no group) does **not** escape `#`. A value containing
+  `#` (e.g. from an http or command badge) can break or inject into the status line. Wrap it in
+  a one-member tmux group instead.
+- tmux refreshes `#()` once per `status-interval` and shows the previous output meanwhile; the
+  first render is empty.
+- tmux uses only one output line, so a multi-badge `stfg a b` is wrong there; use a group.
+
+## Batching calls
+
+Every `stfg` invocation is a process spawn (about 0.4–0.65 ms measured); the IPC and daemon
+work is only ~0.14 ms of a ~0.7 ms call. So processes per prompt is the main cost. Starship runs
+custom modules in parallel, so the saving is mostly CPU, plus less daemon work: one request
+means one git repo discovery and `.git` read instead of one per badge.
+
+Rules of thumb:
+
+1. Adjacent badges with the same style: one plain [group](#groups) (`badges` + `separator`) in
+   one module.
+2. Badges spanning powerline segments or different colors: one [styled group](#styled-groups)
+   (`format`), used with `format = '$output'` in starship.
+3. tmux: one `#(stfg <group>)` per status side, with the group set to `output = "tmux"`. `#()`
+   shows only the first line, so a multi-badge `stfg a b` (multi-line) is wrong there; use a
+   group.
+4. Group by prompt position: badges separated by non-star-forge starship modules (`$fill`,
+   `$kubernetes`, ...) need separate groups, so the realistic minimum is one call per
+   contiguous run.
+5. Path-scoped git badges and global badges can share a group (cwd is sent once per call).
+
+Before/after: 9 per-badge modules (7 git badges + `public_ip` + `battery`) become 2 modules,
+the `git` group and the `right` styled group from the example above: 9 `stfg` calls → 2.
+
+Verify with `hyperfine -N 'stfg git'` and by counting your `[custom.*]` modules; `stfgd status`
+shows the configured badges.
 
 ## Filesystem isolation
 

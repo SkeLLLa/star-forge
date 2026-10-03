@@ -11,6 +11,7 @@ mod duration;
 mod extract;
 mod ipc;
 mod provider;
+mod template;
 
 use std::time::Duration;
 

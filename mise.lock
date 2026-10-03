@@ -70,6 +70,11 @@ checksum = "sha256:d1e8671f40c89c445aaa1728a21ec04b74be2e5f99091485caeabcc97f99a
 url = "https://github.com/dmtrKovalenko/fff/releases/download/v0.11.0/fff-mcp-x86_64-unknown-linux-musl"
 url_api = "https://api.github.com/repos/dmtrKovalenko/fff/releases/assets/578309693"
 
+[[tools."github:jdx/packslip"]]
+version = "1.2.0"
+backend = "github:jdx/packslip"
+specifiers = ["1.2.0"]
+
 [[tools."github:redhat-et/ripwire"]]
 version = "0.6.2"
 backend = "github:redhat-et/ripwire"
@@ -87,6 +92,17 @@ url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/579085
 checksum = "sha256:62ca4bf6dda09a23fe5829489232e64445ac80f42e51017614e31e201cc92b5a"
 url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.2/ripwire-0.6.2-linux-x64.tar.gz"
 url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/579085389"
+
+[[tools."github:redhat-et/ripwire"]]
+version = "0.6.2"
+backend = "github:redhat-et/ripwire"
+
+[tools."github:redhat-et/ripwire".options]
+asset_pattern = "ripwire-*-macos-x64.tar.gz"
+
+[[tools."github:redhat-et/ripwire"]]
+version = "0.6.2"
+backend = "github:redhat-et/ripwire"
 
 [[tools.jq]]
 version = "1.8.2"
@@ -293,9 +309,9 @@ url_api = "https://api.github.com/repos/rvben/rumdl/releases/assets/598548749"
 provenance = "github-attestations"
 
 [[tools.rust]]
-version = "1.98.1"
+version = "1.99.0"
 backend = "core:rust"
-specifiers = ["1.98.1"]
+specifiers = ["1.99.0"]
 
 [tools.rust.options]
 components = "rust-analyzer,rust-src"

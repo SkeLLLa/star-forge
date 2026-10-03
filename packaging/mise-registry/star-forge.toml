@@ -1,0 +1,18 @@
+# Staged copy of the mise registry entry for star-forge.
+#
+# Not consumed by mise from here - this repo's own .mise.toml does not use it. Once
+# star-forge meets mise's popularity bar
+# (https://mise.jdx.dev/contributing.html#adding-tools), copy this file to
+# registry/star-forge.toml in a jdx/mise PR.
+#
+# `mise install packslip:github.com/SkeLLLa/star-forge@1.1.0`, and adjust min_version.
+
+version_order = "semver"
+description = "Cached statusline badges for starship, tmux, and other prompt tools"
+backends = [
+  { full = "packslip:github.com/SkeLLLa/star-forge", min_version = "1.1.0" },
+  "github:SkeLLLa/star-forge", # fallback for pre-1.1.0 tags, which have no packslip manifest
+]
+bins = ["stfgd", "stfg"]
+os = ["linux", "macos"]
+# No `test`: neither binary has a --version flag.

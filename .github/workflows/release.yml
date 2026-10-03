@@ -176,7 +176,6 @@ jobs:
             for asset in "${assets[@]}"; do
               sha256sum -- "${asset}" > "${asset}.sha256"
             done
-            sha256sum -- "${assets[@]}" > SHA256SUMS
           )
 
       - name: Attest build provenance
@@ -199,7 +198,9 @@ jobs:
             target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-${{ env.RUST_TARGET }}.tar.gz
             target/release-assets/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb
             target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm
-            target/release-assets/SHA256SUMS
+            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-${{ env.RUST_TARGET }}.tar.gz.sha256
+            target/release-assets/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb.sha256
+            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm.sha256
 
       - name: Upload package repository inputs
         if: ${{ steps.release-plz.outputs.released == 'true' }}
@@ -281,6 +282,122 @@ jobs:
           files: |
             target/release-assets/star-forge-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz
             target/release-assets/star-forge-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+
+  linux-musl-assets:
+    name: Linux musl assets (x86_64-unknown-linux-musl)
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-musl
+
+      # aws-lc-sys (rustls crypto) compiles C through the `musl-gcc` wrapper from musl-tools.
+      - name: Build release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target "${TARGET}"
+
+      - name: Assemble binary distribution
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          STAGE="target/release-assets"
+          DIST_ROOT="target/dist/star-forge-${VERSION}-${TARGET}"
+          mkdir -p "${DIST_ROOT}/bin" "${STAGE}"
+          install -m 755 "target/${TARGET}/release/stfgd" "target/${TARGET}/release/stfg" "${DIST_ROOT}/bin/"
+          install -m 644 README.md COPYING THIRD_PARTY_NOTICES.md "${DIST_ROOT}/"
+          tar -C target/dist -czf "${STAGE}/star-forge-${VERSION}-${TARGET}.tar.gz" "star-forge-${VERSION}-${TARGET}"
+          (
+            cd "${STAGE}"
+            sha256sum -- "star-forge-${VERSION}-${TARGET}.tar.gz" > "star-forge-${VERSION}-${TARGET}.tar.gz.sha256"
+          )
+          # The point of this target: no dynamic loader, no shared libraries.
+          for bin in stfgd stfg; do
+            file "${DIST_ROOT}/bin/${bin}" | grep -q 'static'
+          done
+          # `stfg` always exits 0; with no daemon it spawns one, so stop it afterwards.
+          export STAR_FORGE_CONFIG=/dev/null XDG_RUNTIME_DIR="${RUNNER_TEMP}"
+          "${DIST_ROOT}/bin/stfg" smoke
+          "${DIST_ROOT}/bin/stfgd" stop || true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.release.outputs.tag_name }}
+          append_body: true
+          fail_on_unmatched_files: true
+          files: |
+            target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+            target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz.sha256
+
+  packslip:
+    name: Publish packslip manifest
+    needs: [release, macos-assets]
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      # Runs after the glibc Linux and macOS tarballs are on the release, so one
+      # manifest covers them. The musl tarball is deliberately left out: packslip has no
+      # libc selector, so a second linux-x64 asset would make installs ambiguous.
+      - name: Publish packslip manifest
+        uses: jdx/packslip@v1
+        with:
+          download: star-forge-*-unknown-linux-gnu.tar.gz star-forge-*-apple-darwin.tar.gz
+          bin: stfgd stfg
+          tag: ${{ needs.release.outputs.tag_name }}
+          version: ${{ needs.release.outputs.version }}
+          attest: link
+
+  checksums:
+    name: Publish SHA256SUMS
+    needs: [release, macos-assets, linux-musl-assets]
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Single writer: merge every per-asset .sha256 (Linux, musl, macOS) into one manifest.
+      - name: Assemble and upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir sums && cd sums
+          gh release download "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --pattern '*.sha256'
+          cat -- *.sha256 | sort -k2 > SHA256SUMS
+          gh release upload "${TAG_NAME}" SHA256SUMS --repo "${GITHUB_REPOSITORY}" --clobber
 
   package-repositories:
     name: Publish package repositories

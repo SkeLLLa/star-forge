@@ -128,6 +128,59 @@ content. Version mismatch (`ver` differs from the daemon's own `CARGO_PKG_VERSIO
 answers normally, then initiates the same graceful shutdown `stop` uses (no added client latency;
 see §1 upgrade safety). Both directions are capped at 64 KiB per line.
 
+**Groups** — a requested name that matches a `[groups.<name>]` entry (`badges`, optional
+`separator`, default `" "`) is resolved daemon-side: the members are fetched through the normal
+`handle_get` path as if requested individually, and the non-empty values are joined with the
+separator into that name's single output line (empty if none). The wire protocol and client are
+unchanged; this exists because tmux `#()` and starship custom modules only use one line. Group
+names cannot collide with badge names and cannot nest (validated at config load).
+
+**Styled groups** — a group may instead set `format` (mutually exclusive with `badges` and
+`separator`), a template in starship's format syntax: `{badge}` placeholders, `[text](style)`
+styled spans (nestable), `( ... )` conditional sections that are dropped when every badge inside
+is empty, and the escapes `\[ \] \( \) \{ \} \\`. The template is parsed once at config load into
+a node tree (literal / badge / styled span / conditional); badge references are validated then, and
+the referenced badges form the group's member set. Per request only substitution runs: resolve
+members via `handle_get`, walk the tree, emit. Client and protocol are unchanged.
+
+Styles follow starship style strings: `fg:`/`bg:`/bare color; `#rrggbb`; named colors (`black red
+green yellow blue purple cyan white`, `bright-*`); 0-255; palette names; modifiers `bold italic
+underline dimmed inverted blink hidden strikethrough none`. Output is raw ANSI SGR by default. A
+`( ... )` section containing no `{badge}` is never rendered (mirrors starship).
+Palette names resolve from `[daemon] palette_from` (a starship.toml: `palette = "<name>"` plus
+`[palettes.<name>]`), overridden by the inline `[palette]` table. The palette file is read at
+config load/reload and its identity (inode, size, ctime) is watched together with the
+config's (`ConfigMeta.stamp`), so edits are picked up within `config_check`; a failed reload is
+retried every `config_check` while the old config stays active.
+Unknown style tokens/palette names are rejected at load.
+
+Why star-forge renders the markup: starship does not interpret `[..](..)` in a custom module's
+output. Verified on starship 1.26: raw SGR in output is passed through, starship wraps it for
+bash/zsh itself (`\[ \]` / `%{ %}`) and measures prompt width correctly, so star-forge never
+shell-wraps. Starship applies a module's `style` once, as a prefix, so any reset in the output
+kills it; styled groups must therefore be used with `format = '$output'` and no module `style`.
+
+**tmux output** — tmux does not render ANSI in `#()` output (ESC is dropped, `[31m` shows
+literally) but re-expands the output as a format: `#[..]` styles work, `#[default]` restores the
+`status-style`, and every literal `#` must be doubled. A group may set `output = "tmux"` (default
+`"ansi"`; anything else is rejected at load; valid for plain and `format` groups). The renderer
+is one tree walk shared by both dialects (`template::Dialect`); the dialect only supplies span
+open (`ESC[..m` / `#[fg=..,bg=..,attrs]`), span close (`ESC[0m` / `#[default]`), outer-style
+re-emit, and text escaping (identity / `#` to `##`, applied to template text and badge values;
+plain groups escape values and separator). Nested spans inherit as in ANSI; an inner span over an
+active outer one opens with `#[default]` then its full style, and the outer is re-emitted
+after close. Limitations: one group cannot serve both starship and tmux (define two groups);
+plain single-badge `#(stfg <badge>)` does not escape `#`, so wrap such badges in a one-member
+tmux group; tmux shows the previous `#()` output until the next `status-interval` and uses only
+one line.
+
+Escape discipline: `\` escapes are interpreted by the star-forge template parser, but TOML basic
+strings (`"..."`, `"""..."""`) process backslashes first, so a literal `\[` must be written `\\[`
+there, or use literal strings (`'...'`, `'''...'''`). A trailing `\` at a line end in a basic
+multi-line string is TOML's line-continuation (newline and following whitespace trimmed), which
+the examples rely on. Why batching matters (spawn
+cost dominates a call) is covered in the README's "Batching calls" section.
+
 ## 3. Module layout
 
 - `src/main.rs` — CLI parsing and dispatch for the `stfgd` binary; `mod client;` for `get`.
@@ -185,7 +238,7 @@ struct DaemonConfig {
     retry_max: Duration,         // default 5m: backoff cap
     timeout: Duration,           // default 2s: fallback hard kill for the whole fetch + extract
     power_check: Duration,       // default 60s: how often on_ac() is re-checked
-    config_check: Duration,      // default 2s: how often the config file's mtime is polled
+    config_check: Duration,      // default 2s: how often the config and palette_from files are stat'ed
     cold_wait: Duration,         // default 20ms: must stay < the client's 40ms deadline
     idle_exit: Duration,         // default 30m: exit after no client requests for this long
     path_evict: Duration,        // default 30m: idle path-scoped keys are dropped after this
@@ -410,8 +463,10 @@ Goal: near-zero wakeups when the user isn't looking at a prompt.
 - **Idle exit.** No client request for `idle_exit` (default 30 min) → daemon exits. The next
   `get` respawns it.
 - **No fs watchers.** Config is reloaded by `stfgd reload`, and additionally the daemon `stat`s
-  the config file at most once per `config_check` (default 2s) on incoming requests and reloads
-  if mtime changed. A config that fails to parse or validate is logged and the previous config
+  the config file (and `palette_from` file, if set) at most once per `config_check` (default
+  2s) on incoming requests and reloads if inode, size or ctime changed (not mtime: `cp -p`/
+  `rsync -a` preserve it and Nix store files all have mtime 1, so a home-manager symlink switch
+  would be missed). A config that fails to parse or validate is logged and the previous config
   kept running (on initial daemon startup, where there is no previous config yet, an empty
   default config is used instead and logged the same way). Implicit checks run in the
   background, with no filesystem access on the event loop; explicit reload waits at most

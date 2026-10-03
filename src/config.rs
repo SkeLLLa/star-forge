@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::duration;
 use crate::extract::{Extract, RawExtract};
+use crate::template::{Dialect, Palette, Template};
 
 /// Builtin providers, keyed by name in `[badge.*] type = "builtin"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -345,6 +346,8 @@ struct RawDaemonConfig {
     path_evict: Option<String>,
     max_paths: Option<usize>,
     max_output: Option<usize>,
+    /// starship.toml to import `palette`/`[palettes.<name>]` colors from for group formats.
+    palette_from: Option<String>,
 }
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
@@ -382,6 +385,8 @@ pub struct DaemonConfig {
     pub path_evict: Duration,
     pub max_paths: usize,
     pub max_output: usize,
+    /// Expanded `palette_from` path; watched alongside the config file.
+    pub palette_from: Option<std::path::PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -401,6 +406,7 @@ impl Default for DaemonConfig {
             path_evict: DEFAULT_PATH_EVICT,
             max_paths: DEFAULT_MAX_PATHS,
             max_output: DEFAULT_MAX_OUTPUT,
+            palette_from: None,
         }
     }
 }
@@ -411,12 +417,78 @@ struct RawConfig {
     daemon: RawDaemonConfig,
     #[serde(default)]
     badge: BTreeMap<String, RawBadgeConfig>,
+    #[serde(default)]
+    groups: BTreeMap<String, RawGroup>,
+    /// Inline palette (name -> color); overrides entries imported via `palette_from`.
+    #[serde(default)]
+    palette: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGroup {
+    badges: Option<Vec<String>>,
+    separator: Option<String>,
+    format: Option<String>,
+    /// `"ansi"` (default) or `"tmux"`.
+    output: Option<String>,
+}
+
+/// `[groups.<name>]`: a request for `<name>` resolves each member badge as if requested
+/// individually, then renders one line: either the non-empty values joined with `separator`,
+/// or (`format` set) the styled template.
+#[derive(Debug)]
+pub struct Group {
+    /// Member badges to fetch (for a template: its distinct `{vars}`).
+    pub badges: Vec<String>,
+    pub separator: String,
+    pub template: Option<Template>,
+    pub output: Dialect,
+}
+
+/// `~/` -> `$HOME/`; anything else is used as-is.
+fn expand_tilde(p: &str) -> std::path::PathBuf {
+    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => Path::new(&home).join(rest),
+        _ => p.into(),
+    }
+}
+
+/// Reads `palette = "<name>"` and `[palettes.<name>]` from a starship.toml. Read at config
+/// load/reload; the daemon reloads when this file's mtime changes.
+fn load_palette_from(p: &Path) -> Result<Palette, String> {
+    let text = std::fs::read_to_string(p)
+        .map_err(|e| format!("daemon.palette_from: reading {}: {e}", p.display()))?;
+    let doc: toml::Table = toml::from_str(&text)
+        .map_err(|e| format!("daemon.palette_from: parsing {}: {e}", p.display()))?;
+    let Some(name) = doc.get("palette").and_then(toml::Value::as_str) else {
+        return Ok(Palette::new());
+    };
+    let table = doc
+        .get("palettes")
+        .and_then(|v| v.get(name))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            format!(
+                "daemon.palette_from: {} selects palette `{name}` but has no [palettes.{name}]",
+                p.display()
+            )
+        })?;
+    table
+        .iter()
+        .map(|(k, v)| {
+            v.as_str()
+                .map(|s| (k.to_ascii_lowercase(), s.to_string()))
+                .ok_or_else(|| format!("daemon.palette_from: palettes.{name}.{k} must be a string"))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
 pub struct Config {
     pub daemon: DaemonConfig,
     pub badge: BTreeMap<String, BadgeConfig>,
+    pub groups: BTreeMap<String, Group>,
 }
 
 /// Parses `raw` (if set) or falls back to `default`, tagging any parse error with `ctx`.
@@ -506,6 +578,7 @@ impl Config {
             )?,
             max_paths: raw.daemon.max_paths.unwrap_or(DEFAULT_MAX_PATHS),
             max_output: raw.daemon.max_output.unwrap_or(DEFAULT_MAX_OUTPUT),
+            palette_from: raw.daemon.palette_from.as_deref().map(expand_tilde),
         };
 
         let mut badge = BTreeMap::new();
@@ -570,8 +643,91 @@ impl Config {
             );
         }
 
+        let mut palette = daemon
+            .palette_from
+            .as_deref()
+            .map(load_palette_from)
+            .transpose()?
+            .unwrap_or_default();
+        palette.extend(
+            raw.palette
+                .into_iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v)),
+        );
+
+        let mut groups = BTreeMap::new();
+        for (name, g) in raw.groups {
+            if badge.contains_key(&name) {
+                return Err(format!("groups.{name}: name collides with badge {name}"));
+            }
+            let output = match g.output.as_deref() {
+                None | Some("ansi") => Dialect::Ansi,
+                Some("tmux") => Dialect::Tmux,
+                Some(o) => {
+                    return Err(format!(
+                        "groups.{name}.output: `{o}` is invalid (expected \"ansi\" or \"tmux\")"
+                    ));
+                }
+            };
+            let (badges, separator, template) = match (g.format, g.badges) {
+                (Some(_), Some(_) | None) if g.separator.is_some() => {
+                    return Err(format!(
+                        "groups.{name}: `format` is mutually exclusive with `separator`"
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "groups.{name}: `format` is mutually exclusive with `badges`"
+                    ));
+                }
+                (None, None) => {
+                    return Err(format!("groups.{name}: set either `badges` or `format`"));
+                }
+                (Some(f), None) => {
+                    let t = Template::parse(&f, &palette)
+                        .map_err(|e| format!("groups.{name}.format: {e}"))?;
+                    if t.vars().is_empty() {
+                        return Err(format!(
+                            "groups.{name}.format must reference at least one {{badge}}"
+                        ));
+                    }
+                    (t.vars().to_vec(), String::new(), Some(t))
+                }
+                (None, Some(badges)) => {
+                    if badges.is_empty() {
+                        return Err(format!("groups.{name}.badges must not be empty"));
+                    }
+                    let separator = g.separator.unwrap_or_else(|| " ".to_string());
+                    if separator.contains(['\n', '\r', '\u{1f}']) {
+                        return Err(format!(
+                            "groups.{name}.separator must not contain newline, CR, or 0x1F"
+                        ));
+                    }
+                    (badges, separator, None)
+                }
+            };
+            if let Some(m) = badges.iter().find(|m| !badge.contains_key(*m)) {
+                return Err(format!(
+                    "groups.{name}: `{m}` is not a defined badge (groups cannot nest)"
+                ));
+            }
+            groups.insert(
+                name,
+                Group {
+                    badges,
+                    separator,
+                    template,
+                    output,
+                },
+            );
+        }
+
         validate(&daemon, &badge)?;
-        Ok(Self { daemon, badge })
+        Ok(Self {
+            daemon,
+            badge,
+            groups,
+        })
     }
 }
 
@@ -1111,5 +1267,199 @@ scope = "repo"
 "#;
         let path = write_temp(toml);
         assert!(Config::load(&path).is_err());
+    }
+
+    fn group_err(toml: &str) -> String {
+        Config::load(&write_temp(toml)).unwrap_err()
+    }
+
+    const TWO_BADGES: &str = "[badge.a]\ntype = \"builtin\"\nname = \"hostname\"\n\
+                              [badge.b]\ntype = \"builtin\"\nname = \"hostname\"\n";
+
+    #[test]
+    fn parses_group_with_default_separator() {
+        let cfg = Config::load(&write_temp(&format!(
+            "{TWO_BADGES}[groups.r]\nbadges = [\"b\", \"a\"]\n"
+        )))
+        .unwrap();
+        assert_eq!(cfg.groups["r"].badges, ["b", "a"]);
+        assert_eq!(cfg.groups["r"].separator, " ");
+    }
+
+    #[test]
+    fn rejects_bad_groups() {
+        let g = |body: &str| group_err(&format!("{TWO_BADGES}[groups.{body}"));
+        assert!(g("a]\nbadges = [\"b\"]\n").contains("collides"));
+        assert!(g("r]\nbadges = []\n").contains("must not be empty"));
+        assert!(g("r]\nbadges = [\"zzz\"]\n").contains("not a defined badge"));
+        assert!(g("r]\nbadges = [\"a\"]\nseparator = \"\\n\"\n").contains("separator"));
+        assert!(g("r]\nbadges = [\"a\"]\nbogus = 1\n").contains("bogus"));
+    }
+
+    #[test]
+    fn format_groups() {
+        let g = |body: &str| group_err(&format!("{TWO_BADGES}[groups.{body}"));
+        assert!(g("r]\nformat = \"{a}\"\nbadges = [\"b\"]\n").contains("exclusive"));
+        assert!(g("r]\nformat = \"{a}\"\nseparator = \"|\"\n").contains("exclusive"));
+        assert!(g("r]\n").contains("either"));
+        assert!(g("r]\nformat = \"hi\"\n").contains("at least one"));
+        assert!(g("r]\nformat = \"{zzz}\"\n").contains("not a defined badge"));
+        let e = g("r]\nformat = \"[{a}](fg:nope)\"\n");
+        assert!(e.contains("groups.r.format") && e.contains("`nope`"), "{e}");
+        assert!(g("r]\nformat = \"[{a}\"\n").contains("groups.r.format: at"));
+
+        let cfg = Config::load(&write_temp(&format!(
+            "{TWO_BADGES}[groups.r]\nformat = \"[{{b}}](red) {{a}} {{b}}\"\n"
+        )))
+        .unwrap();
+        assert_eq!(cfg.groups["r"].badges, ["b", "a"]);
+        assert!(cfg.groups["r"].template.is_some());
+    }
+
+    #[test]
+    fn group_output_validation() {
+        let load = |extra: &str| {
+            Config::load(&write_temp(&format!(
+                "{TWO_BADGES}[groups.r]\nformat = \"{{a}}\"\n{extra}"
+            )))
+        };
+        assert_eq!(load("").unwrap().groups["r"].output, Dialect::Ansi);
+        assert_eq!(
+            load("output = \"tmux\"\n").unwrap().groups["r"].output,
+            Dialect::Tmux
+        );
+        let e = load("output = \"html\"\n").unwrap_err();
+        assert!(e.contains("groups.r.output") && e.contains("html"), "{e}");
+        let e = Config::load(&write_temp(&format!(
+            "{TWO_BADGES}[groups.r]\nbadges = [\"a\"]\noutput = \"x\"\n"
+        )))
+        .unwrap_err();
+        assert!(e.contains("groups.r.output"), "{e}");
+    }
+
+    #[test]
+    fn palette_from_file_and_inline_override() {
+        let pf = write_temp(
+            "palette = \"p\"\n[palettes.p]\nbrand = \"#112233\"\nother = \"#445566\"\n\
+             [palettes.q]\nbrand = \"#000000\"\n",
+        );
+        let load = |extra: &str, fmt: &str| {
+            Config::load(&write_temp(&format!(
+                "[daemon]\npalette_from = '{}'\n{extra}{TWO_BADGES}[groups.r]\nformat = '{fmt}'\n",
+                pf.display()
+            )))
+        };
+        assert!(load("", "[{a}](brand)").is_ok());
+        assert!(load("", "[{a}](nope)").unwrap_err().contains("`nope`"));
+        // Inline [palette] defines new names (placed before [badge] tables, after [daemon]).
+        let cfg = load("", "[{a}](brand)").unwrap();
+        let t = cfg.groups["r"].template.as_ref().unwrap();
+        assert_eq!(
+            t.render(Dialect::Ansi, |_| "x".into()),
+            "\x1b[38;2;17;34;51mx\x1b[0m"
+        );
+        let cfg = Config::load(&write_temp(&format!(
+            "{TWO_BADGES}[palette]\nbrand = \"#abcdef\"\n[groups.r]\nformat = '[{{a}}](brand)'\n"
+        )))
+        .unwrap();
+        let t = cfg.groups["r"].template.as_ref().unwrap();
+        assert_eq!(
+            t.render(Dialect::Ansi, |_| "x".into()),
+            "\x1b[38;2;171;205;239mx\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn palette_from_errors_and_override() {
+        let err = Config::load(&write_temp(
+            "[daemon]\npalette_from = '/nonexistent/s.toml'\n",
+        ))
+        .unwrap_err();
+        assert!(err.contains("palette_from"), "{err}");
+        let pf = write_temp("palette = \"p\"\n[palettes.p]\nbrand = \"#112233\"\n");
+        let cfg = Config::load(&write_temp(&format!(
+            "[daemon]\npalette_from = '{}'\n[palette]\nbrand = \"#abcdef\"\n{TWO_BADGES}\
+             [groups.r]\nformat = '[{{a}}](brand)'\n",
+            pf.display()
+        )))
+        .unwrap();
+        let t = cfg.groups["r"].template.as_ref().unwrap();
+        assert_eq!(
+            t.render(Dialect::Ansi, |_| "x".into()),
+            "\x1b[38;2;171;205;239mx\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_cases() {
+        let home = std::env::var_os("HOME");
+        assert_eq!(expand_tilde("/a/b"), Path::new("/a/b"));
+        assert_eq!(expand_tilde("~x/y"), Path::new("~x/y"));
+        assert_eq!(expand_tilde("~"), Path::new("~"));
+        if let Some(home) = home {
+            assert_eq!(expand_tilde("~/s.toml"), Path::new(&home).join("s.toml"));
+        }
+    }
+
+    #[test]
+    fn palette_from_selection_errors() {
+        let load = |pf: &str| {
+            let pf = write_temp(pf);
+            Config::load(&write_temp(&format!(
+                "[daemon]\npalette_from = '{}'\n",
+                pf.display()
+            )))
+        };
+        // No `palette = ".."` selected: valid, empty palette.
+        assert!(load("[palettes.p]\nbrand = \"#112233\"\n").is_ok());
+        let e = load("palette = \"p\"\n[palettes.q]\nbrand = \"red\"\n").unwrap_err();
+        assert!(
+            e.contains("selects palette `p`") && e.contains("[palettes.p]"),
+            "{e}"
+        );
+        let e = load("palette = \"p\"\n[palettes.p]\nbrand = 5\n").unwrap_err();
+        assert!(e.contains("palettes.p.brand must be a string"), "{e}");
+        let e = load("not [[[ toml").unwrap_err();
+        assert!(e.contains("palette_from: parsing"), "{e}");
+        let e = Config::load(&write_temp(
+            "[daemon]\npalette_from = '/nonexistent/s.toml'\n",
+        ))
+        .unwrap_err();
+        assert!(e.contains("palette_from: reading"), "{e}");
+    }
+
+    #[test]
+    fn palette_names_are_case_insensitive_and_bad_values_rejected() {
+        let ok = Config::load(&write_temp(&format!(
+            "{TWO_BADGES}[palette]\nBrand = \"#010203\"\n[groups.r]\nformat = '[{{a}}](BRAND)'\n"
+        )));
+        assert!(ok.is_ok(), "{:?}", ok.err());
+        let e = group_err(&format!(
+            "{TWO_BADGES}[palette]\nbrand = \"zzz\"\n[groups.r]\nformat = '[{{a}}](brand)'\n"
+        ));
+        assert!(e.contains("palette color `brand`"), "{e}");
+    }
+
+    #[test]
+    fn group_separator_control_chars_rejected() {
+        for sep in ["\\r", "\\u001f", "a\\nb"] {
+            let e = group_err(&format!(
+                "{TWO_BADGES}[groups.r]\nbadges = [\"a\"]\nseparator = \"{sep}\"\n"
+            ));
+            assert!(e.contains("separator must not contain"), "{sep}: {e}");
+        }
+        let cfg = Config::load(&write_temp(&format!(
+            "{TWO_BADGES}[groups.r]\nbadges = [\"a\", \"b\"]\nseparator = \"\"\n"
+        )))
+        .unwrap();
+        assert_eq!(cfg.groups["r"].separator, "");
+    }
+
+    #[test]
+    fn group_member_unknown_and_group_cannot_be_member() {
+        let e = group_err(&format!(
+            "{TWO_BADGES}[groups.g]\nbadges = [\"a\"]\n[groups.r]\nbadges = [\"g\"]\n"
+        ));
+        assert!(e.contains("`g` is not a defined badge"), "{e}");
     }
 }
