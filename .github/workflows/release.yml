@@ -27,6 +27,7 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy --no-default-features --all-targets -- -D warnings
           cargo test
           RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 
@@ -56,7 +57,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -115,6 +116,14 @@ jobs:
       - name: Build release binary
         if: ${{ steps.release-plz.outputs.released == 'true' }}
         run: cargo build --release --locked --target "${RUST_TARGET}"
+
+      - name: Build static stfg
+        if: ${{ steps.release-plz.outputs.released == 'true' }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --no-default-features --bin stfg --target x86_64-unknown-linux-musl
+          install -m 755 target/x86_64-unknown-linux-musl/release/stfg "target/${RUST_TARGET}/release/stfg"
+          file "target/${RUST_TARGET}/release/stfg" | grep -q static
 
       - name: Assemble binary distribution
         if: ${{ steps.release-plz.outputs.released == 'true' }}

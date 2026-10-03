@@ -34,7 +34,10 @@ run = "cargo fmt --all -- --check"
 
 [tasks.lint]
 description = "Run Clippy with warnings denied"
-run = "cargo clippy --all-targets --all-features -- -D warnings"
+run = [
+  "cargo clippy --all-targets --all-features -- -D warnings",
+  "cargo clippy --no-default-features --all-targets -- -D warnings",
+]
 
 [tasks.test]
 description = "Run the test suite"

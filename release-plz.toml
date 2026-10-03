@@ -7,3 +7,4 @@ semver_check = false
 [[package]]
 name = "star-forge"
 changelog_path = "CHANGELOG.md"
+git_tag_name = "v{{ version }}"

@@ -1,7 +1,7 @@
 //! Hand-rolled duration parser for config timing knobs: `<integer><unit>` where unit is
 //! one of `ms|s|m|h` (e.g. `"500ms"`, `"60s"`, `"5m"`, `"1h"`). No derived formulas or
 //! multipliers anywhere in this crate — every timing knob is one of these strings with a
-//! single fixed default (see `config.rs`).
+//! single fixed default (see `config/mod.rs`).
 
 use std::time::Duration;
 
@@ -9,6 +9,9 @@ use std::time::Duration;
 /// Rejects anything else (missing/unknown unit, empty/non-digit number, overflow) with a
 /// message naming the offending string.
 pub fn parse(s: &str) -> Result<Duration, String> {
+    if s.is_empty() {
+        return Err("invalid duration \"\": empty duration".to_string());
+    }
     let split_at = s
         .find(|c: char| !c.is_ascii_digit())
         .ok_or_else(|| format!("invalid duration {s:?}: missing unit (expected ms|s|m|h)"))?;
@@ -53,31 +56,42 @@ mod tests {
         assert_eq!(parse("0s").unwrap(), Duration::ZERO);
     }
 
-    #[test]
-    fn rejects_missing_unit() {
-        assert!(parse("60").is_err());
+    fn e(s: &str) -> String {
+        parse(s).unwrap_err()
     }
 
     #[test]
-    fn rejects_missing_number() {
-        assert!(parse("s").is_err());
-        assert!(parse("").is_err());
+    fn rejects_missing_unit() {
+        assert_eq!(
+            e("60"),
+            "invalid duration \"60\": missing unit (expected ms|s|m|h)"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_missing_number() {
+        assert_eq!(e(""), "invalid duration \"\": empty duration");
+        assert_eq!(e("s"), "invalid duration \"s\": missing number");
     }
 
     #[test]
     fn rejects_unknown_unit() {
-        assert!(parse("60d").is_err());
-        assert!(parse("60 s").is_err());
+        assert_eq!(
+            e("60d"),
+            "invalid duration \"60d\": unknown unit \"d\" (expected ms|s|m|h)"
+        );
+        assert!(e("60 s").contains("unknown unit \" s\""));
     }
 
     #[test]
     fn rejects_negative_or_float() {
-        assert!(parse("-5s").is_err());
-        assert!(parse("1.5s").is_err());
+        assert!(e("-5s").contains("missing number"));
+        assert!(e("1.5s").contains("unknown unit \".5s\""));
     }
 
     #[test]
     fn rejects_overflow() {
-        assert!(parse("99999999999999999999h").is_err());
+        assert!(e("99999999999999999999h").contains("not a valid integer"));
+        assert!(e("18446744073709551615h").contains("overflow"));
     }
 }

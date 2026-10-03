@@ -6,7 +6,7 @@ The design of star-forge — a daemon that computes statusline values once and s
 results to every caller over a Unix socket — comes from
 [beachcomber](https://github.com/NavistAu/beachcomber).
 
-Portions of `src/provider.rs` are adapted from
+Portions of `src/provider/git.rs` are adapted from
 [beachcomber](https://github.com/NavistAu/beachcomber) (commit `e3c3bd2`,
 `src/provider/git.rs`):
 

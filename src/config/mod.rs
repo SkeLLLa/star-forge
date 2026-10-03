@@ -9,6 +9,9 @@
 //! `resolve_battery_interval`). A config that fails to parse or validate is rejected
 //! wholesale; the caller (`daemon::check_reload`) keeps the previous config running.
 
+mod builtin;
+mod raw;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -19,69 +22,46 @@ use crate::duration;
 use crate::extract::{Extract, RawExtract};
 use crate::template::{Dialect, Palette, Template};
 
-/// Builtin providers, keyed by name in `[badge.*] type = "builtin"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Builtin {
-    GitBranch,
-    GitStatus,
-    /// One of `GitField`'s counts, read via one `git status --porcelain=v2 --branch` call.
-    GitCounts,
-    /// Short commit hash, resolved in-process from `HEAD` (no subprocess).
-    GitCommit,
-    /// `REBASING`/`MERGING`/`CHERRY-PICKING`/`BISECTING`, read from `.git` state files.
-    GitState,
-    /// Stash entry count, read from the stash reflog.
-    GitStash,
-    Battery,
-    Hostname,
-    LoadAvg,
-    MemUsedPercent,
-    Uptime,
-}
-
-impl Builtin {
-    /// Git builtins are keyed by repo root; everything else is a global key.
-    pub const fn is_path_scoped(self) -> bool {
-        matches!(
-            self,
-            Self::GitBranch
-                | Self::GitStatus
-                | Self::GitCounts
-                | Self::GitCommit
-                | Self::GitState
-                | Self::GitStash
-        )
-    }
-}
-
-/// Which field `name = "git_counts"` reports; required for `git_counts`, rejected on every
-/// other builtin (see `RawBadgeConfig::into_parts`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitField {
-    Ahead,
-    Behind,
-    Staged,
-    Modified,
-    Untracked,
-    Conflicted,
-}
+pub use builtin::{Builtin, GitField};
+use raw::RawBadgeConfig;
 
 /// Cache scope for a badge: git builtins always use `GitRoot`; everything else defaults to
-/// `Global`. Non-git builtins, `command`, and `http` badges can override either scope via
-/// `scope = "git_root" | "global"` — e.g. a command badge scoped to `git_root` runs with cwd
-/// = the repo root and is cached per repo, same as a git builtin.
+/// `Global`. Non-git builtins, `command`, and `http` badges can override the scope via
+/// `scope = "git_root" | "project_root" | "global"` — e.g. a command badge scoped to `git_root`
+/// runs with cwd = the repo root and is cached per repo, same as a git builtin. `ProjectRoot`
+/// is the nearest ancestor of the client's cwd containing one of the badge's `markers`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     Global,
     GitRoot,
+    ProjectRoot,
+}
+
+/// `pattern` is a variable name, or a prefix with one trailing `*`.
+pub fn env_matches(pattern: &str, name: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .map_or(pattern == name, |prefix| name.starts_with(prefix))
+}
+
+/// Options for command badges: path scoping (all empty = unset) and env forwarding.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PathOpts {
+    /// `env = ["PATH", "MISE_*"]`: variables taken from the requesting client (a trailing `*`
+    /// is a prefix glob) and made part of the cache key. Empty = the daemon's env.
+    pub env: Vec<String>,
+    /// `scope = "project_root"`: files/dirs whose presence marks a project root.
+    pub markers: Vec<String>,
+    /// Paths (relative to the scope root) whose change refreshes the cached value.
+    pub watch: Vec<String>,
+    /// Render empty without spawning unless one of these exists in the scope root.
+    pub when_file: Vec<String>,
 }
 
 /// Where a badge's raw value comes from (compiled: `device` already validated against
 /// `name`, see `RawBadgeConfig::into_parts`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Builtin {
         name: Builtin,
@@ -105,206 +85,6 @@ pub enum Source {
     },
 }
 
-fn default_format() -> String {
-    "{value}".to_string()
-}
-
-/// One `[badge.<name>]` entry, deserialized directly (no `#[serde(flatten)]`): each variant
-/// duplicates the handful of common fields so `deny_unknown_fields` actually catches config
-/// typos (flatten + `deny_unknown_fields` don't combine in serde — see design.md §4).
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum RawBadgeConfig {
-    Builtin {
-        name: Builtin,
-        /// `battery`-only option; rejected on every other builtin (`into_parts`).
-        #[serde(default)]
-        device: Option<String>,
-        /// `git_counts`-only option; required for it, rejected on every other builtin
-        /// (`into_parts`).
-        #[serde(default)]
-        field: Option<GitField>,
-        #[serde(default = "default_format")]
-        format: String,
-        #[serde(default)]
-        interval: Option<String>,
-        #[serde(default)]
-        battery_interval: Option<String>,
-        #[serde(default)]
-        active_window: Option<String>,
-        #[serde(default)]
-        timeout: Option<String>,
-        #[serde(default)]
-        max_output: Option<usize>,
-        #[serde(default)]
-        extract: Option<RawExtract>,
-        #[serde(default)]
-        scope: Option<Scope>,
-    },
-    Command {
-        command: String,
-        #[serde(default)]
-        args: Option<Vec<String>>,
-        #[serde(default = "default_format")]
-        format: String,
-        #[serde(default)]
-        interval: Option<String>,
-        #[serde(default)]
-        battery_interval: Option<String>,
-        #[serde(default)]
-        active_window: Option<String>,
-        #[serde(default)]
-        timeout: Option<String>,
-        #[serde(default)]
-        max_output: Option<usize>,
-        #[serde(default)]
-        extract: Option<RawExtract>,
-        #[serde(default)]
-        scope: Option<Scope>,
-    },
-    Http {
-        url: String,
-        #[serde(default)]
-        headers: BTreeMap<String, String>,
-        #[serde(default = "default_format")]
-        format: String,
-        #[serde(default)]
-        interval: Option<String>,
-        #[serde(default)]
-        battery_interval: Option<String>,
-        #[serde(default)]
-        active_window: Option<String>,
-        #[serde(default)]
-        timeout: Option<String>,
-        #[serde(default)]
-        max_output: Option<usize>,
-        #[serde(default)]
-        extract: Option<RawExtract>,
-        #[serde(default)]
-        scope: Option<Scope>,
-    },
-}
-
-/// Fields shared by every badge type, pulled out of whichever `RawBadgeConfig` variant
-/// matched (see `RawBadgeConfig::into_parts`).
-struct RawCommon {
-    format: String,
-    interval: Option<String>,
-    battery_interval: Option<String>,
-    active_window: Option<String>,
-    timeout: Option<String>,
-    max_output: Option<usize>,
-    extract: Option<RawExtract>,
-    scope: Option<Scope>,
-}
-
-impl RawBadgeConfig {
-    /// Splits into the provider-specific `Source` and the shared timing/format fields.
-    /// Validates builtin-specific options against the wrong builtin (e.g. `device` on
-    /// `git_branch`), since serde can't express that conditionally.
-    fn into_parts(self, badge_name: &str) -> Result<(Source, RawCommon), String> {
-        match self {
-            Self::Builtin {
-                name,
-                device,
-                field,
-                format,
-                interval,
-                battery_interval,
-                active_window,
-                timeout,
-                max_output,
-                extract,
-                scope,
-            } => {
-                if device.is_some() && name != Builtin::Battery {
-                    return Err(format!(
-                        "badge {badge_name}: `device` is only valid for `type = \"builtin\"` \
-                         `name = \"battery\"`"
-                    ));
-                }
-                if field.is_some() && name != Builtin::GitCounts {
-                    return Err(format!(
-                        "badge {badge_name}: `field` is only valid for `type = \"builtin\"` \
-                         `name = \"git_counts\"`"
-                    ));
-                }
-                if field.is_none() && name == Builtin::GitCounts {
-                    return Err(format!(
-                        "badge {badge_name}: `type = \"builtin\"` `name = \"git_counts\"` \
-                         requires `field`"
-                    ));
-                }
-                Ok((
-                    Source::Builtin {
-                        name,
-                        device,
-                        field,
-                    },
-                    RawCommon {
-                        format,
-                        interval,
-                        battery_interval,
-                        active_window,
-                        timeout,
-                        max_output,
-                        extract,
-                        scope,
-                    },
-                ))
-            }
-            Self::Command {
-                command,
-                args,
-                format,
-                interval,
-                battery_interval,
-                active_window,
-                timeout,
-                max_output,
-                extract,
-                scope,
-            } => Ok((
-                Source::Command { command, args },
-                RawCommon {
-                    format,
-                    interval,
-                    battery_interval,
-                    active_window,
-                    timeout,
-                    max_output,
-                    extract,
-                    scope,
-                },
-            )),
-            Self::Http {
-                url,
-                headers,
-                format,
-                interval,
-                battery_interval,
-                active_window,
-                timeout,
-                max_output,
-                extract,
-                scope,
-            } => Ok((
-                Source::Http { url, headers },
-                RawCommon {
-                    format,
-                    interval,
-                    battery_interval,
-                    active_window,
-                    timeout,
-                    max_output,
-                    extract,
-                    scope,
-                },
-            )),
-        }
-    }
-}
-
 /// One `[badge.<name>]` entry, ready to use (extract regex already compiled, every timing
 /// knob resolved to a concrete `Duration`).
 #[derive(Debug)]
@@ -318,6 +98,7 @@ pub struct BadgeConfig {
     pub timeout: Duration,
     pub max_output: usize,
     pub scope: Scope,
+    pub path: PathOpts,
 }
 
 /// Default cache scope when a badge doesn't set `scope` explicitly: the path-scoped
@@ -499,148 +280,27 @@ fn resolve(raw: Option<&str>, default: Duration, ctx: &str) -> Result<Duration, 
 }
 
 impl Config {
-    /// Parses, compiles, and validates a config file. A missing file is treated as an empty
-    /// config (no badges, default daemon settings) so a first run works without setup.
+    /// Reads, parses, compiles, and validates a config file. A missing file is treated as an
+    /// empty config (no badges, default daemon settings) so a first run works without setup.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("reading {}: {e}", path.display())),
         };
-        let raw: RawConfig =
-            toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        Self::parse(&text, &path.display().to_string())
+    }
 
-        let interval = resolve(
-            raw.daemon.interval.as_deref(),
-            DEFAULT_INTERVAL,
-            "daemon.interval",
-        )?;
-        // No hardcoded 120s here: an unset daemon.battery_interval is simply the same as
-        // daemon.interval (design.md §4/§7) -- the only fallback chain in this file that
-        // isn't a fixed constant.
-        let battery_interval = resolve(
-            raw.daemon.battery_interval.as_deref(),
-            interval,
-            "daemon.battery_interval",
-        )?;
-        let daemon = DaemonConfig {
-            interval,
-            battery_interval,
-            active_window: resolve(
-                raw.daemon.active_window.as_deref(),
-                DEFAULT_ACTIVE_WINDOW,
-                "daemon.active_window",
-            )?,
-            coalesce: resolve(
-                raw.daemon.coalesce.as_deref(),
-                DEFAULT_COALESCE,
-                "daemon.coalesce",
-            )?,
-            retry_min: resolve(
-                raw.daemon.retry_min.as_deref(),
-                DEFAULT_RETRY_MIN,
-                "daemon.retry_min",
-            )?,
-            retry_max: resolve(
-                raw.daemon.retry_max.as_deref(),
-                DEFAULT_RETRY_MAX,
-                "daemon.retry_max",
-            )?,
-            timeout: resolve(
-                raw.daemon.timeout.as_deref(),
-                DEFAULT_TIMEOUT,
-                "daemon.timeout",
-            )?,
-            power_check: resolve(
-                raw.daemon.power_check.as_deref(),
-                DEFAULT_POWER_CHECK,
-                "daemon.power_check",
-            )?,
-            config_check: resolve(
-                raw.daemon.config_check.as_deref(),
-                DEFAULT_CONFIG_CHECK,
-                "daemon.config_check",
-            )?,
-            cold_wait: resolve(
-                raw.daemon.cold_wait.as_deref(),
-                DEFAULT_COLD_WAIT,
-                "daemon.cold_wait",
-            )?,
-            idle_exit: resolve(
-                raw.daemon.idle_exit.as_deref(),
-                DEFAULT_IDLE_EXIT,
-                "daemon.idle_exit",
-            )?,
-            path_evict: resolve(
-                raw.daemon.path_evict.as_deref(),
-                DEFAULT_PATH_EVICT,
-                "daemon.path_evict",
-            )?,
-            max_paths: raw.daemon.max_paths.unwrap_or(DEFAULT_MAX_PATHS),
-            max_output: raw.daemon.max_output.unwrap_or(DEFAULT_MAX_OUTPUT),
-            palette_from: raw.daemon.palette_from.as_deref().map(expand_tilde),
-        };
+    /// Parses, compiles, and validates config `text`; `label` (the file path) tags TOML
+    /// syntax errors.
+    pub fn parse(text: &str, label: &str) -> Result<Self, String> {
+        let raw: RawConfig = toml::from_str(text).map_err(|e| format!("parsing {label}: {e}"))?;
+        let daemon = resolve_daemon(&raw.daemon)?;
 
         let mut badge = BTreeMap::new();
         for (name, raw_badge) in raw.badge {
-            let (source, common) = raw_badge.into_parts(&name)?;
-            let extract = common
-                .extract
-                .map(RawExtract::compile)
-                .transpose()
-                .map_err(|e| format!("badge {name}: {e}"))?;
-
-            let badge_interval = match common.interval.as_deref() {
-                Some(s) => duration::parse(s).map_err(|e| format!("badge {name}.interval: {e}"))?,
-                None => daemon.interval,
-            };
-            // battery_interval resolution order: badge.battery_interval -> badge.interval
-            // (if set) -> daemon.battery_interval -> daemon.interval (the last two already
-            // folded into `daemon.battery_interval` above).
-            let badge_battery_interval = if let Some(s) = common.battery_interval.as_deref() {
-                duration::parse(s).map_err(|e| format!("badge {name}.battery_interval: {e}"))?
-            } else if common.interval.is_some() {
-                badge_interval
-            } else {
-                daemon.battery_interval
-            };
-            let active_window = match common.active_window.as_deref() {
-                Some(s) => {
-                    duration::parse(s).map_err(|e| format!("badge {name}.active_window: {e}"))?
-                }
-                None => daemon.active_window,
-            };
-            let timeout = match common.timeout.as_deref() {
-                Some(s) => duration::parse(s).map_err(|e| format!("badge {name}.timeout: {e}"))?,
-                None => daemon.timeout,
-            };
-            let max_output = common.max_output.unwrap_or(daemon.max_output);
-            let default_scope = default_scope(&source);
-            let scope = match (common.scope, default_scope) {
-                (Some(Scope::Global), Scope::GitRoot) => {
-                    return Err(format!(
-                        "badge {name}: git builtins require `scope = \"git_root\"`; \
-                         `scope = \"global\"` is invalid here"
-                    ));
-                }
-                (Some(scope), _) => scope,
-                (None, default_scope) => default_scope,
-            };
-
-            badge.insert(
-                name,
-                BadgeConfig {
-                    source,
-                    extract,
-                    format: common.format,
-                    interval: badge_interval,
-                    battery_interval: badge_battery_interval,
-                    active_window,
-                    timeout,
-                    max_output,
-                    scope,
-                },
-            );
+            let cfg = resolve_badge(&name, raw_badge, &daemon)?;
+            badge.insert(name, cfg);
         }
 
         let mut palette = daemon
@@ -657,69 +317,8 @@ impl Config {
 
         let mut groups = BTreeMap::new();
         for (name, g) in raw.groups {
-            if badge.contains_key(&name) {
-                return Err(format!("groups.{name}: name collides with badge {name}"));
-            }
-            let output = match g.output.as_deref() {
-                None | Some("ansi") => Dialect::Ansi,
-                Some("tmux") => Dialect::Tmux,
-                Some(o) => {
-                    return Err(format!(
-                        "groups.{name}.output: `{o}` is invalid (expected \"ansi\" or \"tmux\")"
-                    ));
-                }
-            };
-            let (badges, separator, template) = match (g.format, g.badges) {
-                (Some(_), Some(_) | None) if g.separator.is_some() => {
-                    return Err(format!(
-                        "groups.{name}: `format` is mutually exclusive with `separator`"
-                    ));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(format!(
-                        "groups.{name}: `format` is mutually exclusive with `badges`"
-                    ));
-                }
-                (None, None) => {
-                    return Err(format!("groups.{name}: set either `badges` or `format`"));
-                }
-                (Some(f), None) => {
-                    let t = Template::parse(&f, &palette)
-                        .map_err(|e| format!("groups.{name}.format: {e}"))?;
-                    if t.vars().is_empty() {
-                        return Err(format!(
-                            "groups.{name}.format must reference at least one {{badge}}"
-                        ));
-                    }
-                    (t.vars().to_vec(), String::new(), Some(t))
-                }
-                (None, Some(badges)) => {
-                    if badges.is_empty() {
-                        return Err(format!("groups.{name}.badges must not be empty"));
-                    }
-                    let separator = g.separator.unwrap_or_else(|| " ".to_string());
-                    if separator.contains(['\n', '\r', '\u{1f}']) {
-                        return Err(format!(
-                            "groups.{name}.separator must not contain newline, CR, or 0x1F"
-                        ));
-                    }
-                    (badges, separator, None)
-                }
-            };
-            if let Some(m) = badges.iter().find(|m| !badge.contains_key(*m)) {
-                return Err(format!(
-                    "groups.{name}: `{m}` is not a defined badge (groups cannot nest)"
-                ));
-            }
-            groups.insert(
-                name,
-                Group {
-                    badges,
-                    separator,
-                    template,
-                    output,
-                },
-            );
+            let group = resolve_group(&name, g, &badge, &palette)?;
+            groups.insert(name, group);
         }
 
         validate(&daemon, &badge)?;
@@ -731,6 +330,189 @@ impl Config {
     }
 }
 
+fn resolve_daemon(raw: &RawDaemonConfig) -> Result<DaemonConfig, String> {
+    let r = |v: &Option<String>, default, key: &str| {
+        resolve(v.as_deref(), default, &format!("daemon.{key}"))
+    };
+    let interval = r(&raw.interval, DEFAULT_INTERVAL, "interval")?;
+    Ok(DaemonConfig {
+        interval,
+        // No hardcoded 120s here: an unset daemon.battery_interval is simply the same as
+        // daemon.interval (design.md §4/§7) -- the only fallback chain in this file that
+        // isn't a fixed constant.
+        battery_interval: r(&raw.battery_interval, interval, "battery_interval")?,
+        active_window: r(&raw.active_window, DEFAULT_ACTIVE_WINDOW, "active_window")?,
+        coalesce: r(&raw.coalesce, DEFAULT_COALESCE, "coalesce")?,
+        retry_min: r(&raw.retry_min, DEFAULT_RETRY_MIN, "retry_min")?,
+        retry_max: r(&raw.retry_max, DEFAULT_RETRY_MAX, "retry_max")?,
+        timeout: r(&raw.timeout, DEFAULT_TIMEOUT, "timeout")?,
+        power_check: r(&raw.power_check, DEFAULT_POWER_CHECK, "power_check")?,
+        config_check: r(&raw.config_check, DEFAULT_CONFIG_CHECK, "config_check")?,
+        cold_wait: r(&raw.cold_wait, DEFAULT_COLD_WAIT, "cold_wait")?,
+        idle_exit: r(&raw.idle_exit, DEFAULT_IDLE_EXIT, "idle_exit")?,
+        path_evict: r(&raw.path_evict, DEFAULT_PATH_EVICT, "path_evict")?,
+        max_paths: raw.max_paths.unwrap_or(DEFAULT_MAX_PATHS),
+        max_output: raw.max_output.unwrap_or(DEFAULT_MAX_OUTPUT),
+        palette_from: raw.palette_from.as_deref().map(expand_tilde),
+    })
+}
+
+/// Compiles one `[badge.<name>]`: resolves every knob against `daemon` and checks the
+/// scope/markers/env/watch combinations.
+fn resolve_badge(
+    name: &str,
+    raw_badge: RawBadgeConfig,
+    daemon: &DaemonConfig,
+) -> Result<BadgeConfig, String> {
+    let (source, common) = raw_badge.into_parts(name)?;
+    let extract = common
+        .extract
+        .map(RawExtract::compile)
+        .transpose()
+        .map_err(|e| format!("badge {name}: {e}"))?;
+
+    let r = |v: &Option<String>, default, key: &str| {
+        resolve(v.as_deref(), default, &format!("badge {name}.{key}"))
+    };
+    let interval = r(&common.interval, daemon.interval, "interval")?;
+    // battery_interval resolution order: badge.battery_interval -> badge.interval
+    // (if set) -> daemon.battery_interval -> daemon.interval (the last two already
+    // folded into `daemon.battery_interval`).
+    let battery_default = if common.interval.is_some() {
+        interval
+    } else {
+        daemon.battery_interval
+    };
+    let battery_interval = r(
+        &common.battery_interval,
+        battery_default,
+        "battery_interval",
+    )?;
+    let active_window = r(&common.active_window, daemon.active_window, "active_window")?;
+    let timeout = r(&common.timeout, daemon.timeout, "timeout")?;
+    let max_output = common.max_output.unwrap_or(daemon.max_output);
+    let default_scope = default_scope(&source);
+    let scope = match (common.scope, default_scope) {
+        (Some(s), Scope::GitRoot) if s != Scope::GitRoot => {
+            return Err(format!(
+                "badge {name}: git builtins require `scope = \"git_root\"`; \
+                 `scope = \"{}\"` is invalid here",
+                if s == Scope::Global {
+                    "global"
+                } else {
+                    "project_root"
+                }
+            ));
+        }
+        (Some(scope), _) => scope,
+        (None, default_scope) => default_scope,
+    };
+    let path = common.path;
+    if (scope == Scope::ProjectRoot) == path.markers.is_empty() {
+        return Err(format!(
+            "badge {name}: `markers` is required with, and only valid for, \
+             `scope = \"project_root\"`"
+        ));
+    }
+    if let Some(bad) = path.env.iter().find(|p| {
+        let body = p.strip_suffix('*').unwrap_or(p);
+        body.is_empty() || body.contains(['*', '='])
+    }) {
+        return Err(format!(
+            "badge {name}: invalid `env` entry {bad:?} (a variable name, or a prefix \
+             with one trailing `*`)"
+        ));
+    }
+    if scope == Scope::Global && !(path.watch.is_empty() && path.when_file.is_empty()) {
+        return Err(format!(
+            "badge {name}: `watch` and `when_file` require a path scope \
+             (`git_root` or `project_root`)"
+        ));
+    }
+
+    Ok(BadgeConfig {
+        source,
+        extract,
+        format: common.format,
+        interval,
+        battery_interval,
+        active_window,
+        timeout,
+        max_output,
+        scope,
+        path,
+    })
+}
+
+/// Compiles one `[groups.<name>]` against the already-resolved `badge`s and `palette`.
+fn resolve_group(
+    name: &str,
+    g: RawGroup,
+    badge: &BTreeMap<String, BadgeConfig>,
+    palette: &Palette,
+) -> Result<Group, String> {
+    if badge.contains_key(name) {
+        return Err(format!("groups.{name}: name collides with badge {name}"));
+    }
+    let output = match g.output.as_deref() {
+        None | Some("ansi") => Dialect::Ansi,
+        Some("tmux") => Dialect::Tmux,
+        Some(o) => {
+            return Err(format!(
+                "groups.{name}.output: `{o}` is invalid (expected \"ansi\" or \"tmux\")"
+            ));
+        }
+    };
+    let (badges, separator, template) = match (g.format, g.badges) {
+        (Some(_), Some(_) | None) if g.separator.is_some() => {
+            return Err(format!(
+                "groups.{name}: `format` is mutually exclusive with `separator`"
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "groups.{name}: `format` is mutually exclusive with `badges`"
+            ));
+        }
+        (None, None) => {
+            return Err(format!("groups.{name}: set either `badges` or `format`"));
+        }
+        (Some(f), None) => {
+            let t =
+                Template::parse(&f, palette).map_err(|e| format!("groups.{name}.format: {e}"))?;
+            if t.vars().is_empty() {
+                return Err(format!(
+                    "groups.{name}.format must reference at least one {{badge}}"
+                ));
+            }
+            (t.vars().to_vec(), String::new(), Some(t))
+        }
+        (None, Some(badges)) => {
+            if badges.is_empty() {
+                return Err(format!("groups.{name}.badges must not be empty"));
+            }
+            let separator = g.separator.unwrap_or_else(|| " ".to_string());
+            if separator.contains(['\n', '\r', '\u{1f}']) {
+                return Err(format!(
+                    "groups.{name}.separator must not contain newline, CR, or 0x1F"
+                ));
+            }
+            (badges, separator, None)
+        }
+    };
+    if let Some(m) = badges.iter().find(|m| !badge.contains_key(*m)) {
+        return Err(format!(
+            "groups.{name}: `{m}` is not a defined badge (groups cannot nest)"
+        ));
+    }
+    Ok(Group {
+        badges,
+        separator,
+        template,
+        output,
+    })
+}
+
 /// Rejects a config whose resolved values would make the scheduler misbehave: this runs
 /// after every value is resolved, so it sees the same numbers the scheduler will use.
 fn validate(daemon: &DaemonConfig, badge: &BTreeMap<String, BadgeConfig>) -> Result<(), String> {
@@ -740,6 +522,11 @@ fn validate(daemon: &DaemonConfig, badge: &BTreeMap<String, BadgeConfig>) -> Res
     }
     if daemon.battery_interval < one_sec {
         return Err("daemon.battery_interval must be >= 1s".to_string());
+    }
+    // Zero would retry a failing badge immediately, in a tight loop (`retry_max` can't be 0
+    // either: it is >= `retry_min`).
+    if daemon.retry_min == Duration::ZERO {
+        return Err("daemon.retry_min must be > 0".to_string());
     }
     if daemon.retry_min > daemon.retry_max {
         return Err("daemon.retry_min must be <= daemon.retry_max".to_string());
@@ -788,51 +575,30 @@ fn validate(daemon: &DaemonConfig, badge: &BTreeMap<String, BadgeConfig>) -> Res
     Ok(())
 }
 
+/// Test-only: a global command badge with the defaults the daemon tests share.
+#[cfg(test)]
+pub fn test_badge() -> BadgeConfig {
+    BadgeConfig {
+        source: Source::Command {
+            command: "true".into(),
+            args: None,
+        },
+        extract: None,
+        format: "{value}".into(),
+        interval: Duration::from_secs(60),
+        battery_interval: Duration::from_secs(60),
+        active_window: Duration::from_secs(300),
+        timeout: Duration::from_secs(2),
+        max_output: 1024,
+        scope: Scope::Global,
+        path: PathOpts::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-
-    fn write_temp(contents: &str) -> tempfile_path::TempPath {
-        tempfile_path::write(contents)
-    }
-
-    /// Minimal same-crate stand-in for a temp file, so we don't add a dev-dependency.
-    mod tempfile_path {
-        use super::*;
-        use std::path::PathBuf;
-
-        pub struct TempPath(pub PathBuf);
-        impl std::ops::Deref for TempPath {
-            type Target = Path;
-            fn deref(&self) -> &Path {
-                &self.0
-            }
-        }
-        impl Drop for TempPath {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-
-        pub fn write(contents: &str) -> TempPath {
-            // macOS clocks tick in microseconds, so parallel tests can read the same
-            // timestamp; the counter keeps their paths distinct.
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "star-forge-test-{}-{}-{}.toml",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(contents.as_bytes()).unwrap();
-            TempPath(path)
-        }
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn missing_file_is_empty_config() {
@@ -867,8 +633,7 @@ url = "https://api.ipify.org?format=json"
 interval = "10m"
 extract = { kind = "json", pointer = "/ip" }
 "#;
-        let path = write_temp(toml);
-        let cfg = Config::load(&path).unwrap();
+        let cfg = parse(toml).unwrap();
         assert_eq!(cfg.daemon.idle_exit, Duration::from_secs(60));
         assert_eq!(cfg.badge.len(), 3);
         match &cfg.badge["git_branch"].source {
@@ -895,10 +660,153 @@ extract = { kind = "json", pointer = "/ip" }
         ));
     }
 
+    fn parse(toml: &str) -> Result<Config, String> {
+        Config::parse(toml, "test")
+    }
+
+    fn err(toml: &str) -> String {
+        parse(toml).unwrap_err()
+    }
+
+    #[test]
+    fn project_root_watch_when_file_parse_and_validate() {
+        let ok = r#"
+[badge.node]
+type = "command"
+command = "node -v"
+scope = "project_root"
+markers = [".nvmrc"]
+watch = [".nvmrc"]
+when_file = ["package.json"]
+"#;
+        let cfg = parse(ok).unwrap();
+        let b = &cfg.badge["node"];
+        assert_eq!(b.scope, Scope::ProjectRoot);
+        assert_eq!(b.path.markers, [".nvmrc"]);
+        assert_eq!(b.path.watch, [".nvmrc"]);
+        assert_eq!(b.path.when_file, ["package.json"]);
+
+        let cmd = "[badge.x]\ntype = \"command\"\ncommand = \"true\"\n";
+        // markers required with project_root, rejected otherwise.
+        assert!(err(&format!("{cmd}scope = \"project_root\"\n")).contains("markers"));
+        assert!(
+            err(&format!("{cmd}scope = \"git_root\"\nmarkers = [\"a\"]\n")).contains("markers")
+        );
+        assert!(err(&format!("{cmd}markers = [\"a\"]\n")).contains("markers"));
+        // watch / when_file need a path scope.
+        assert!(err(&format!("{cmd}watch = [\"a\"]\n")).contains("watch"));
+        assert!(err(&format!("{cmd}when_file = [\"a\"]\n")).contains("when_file"));
+        // git builtins stay git_root only.
+        let git = "[badge.g]\ntype = \"builtin\"\nname = \"git_branch\"\n";
+        assert!(err(&format!("{git}scope = \"project_root\"\n")).contains("git_root"));
+        // Command-only options on other types are unknown fields.
+        let http = "[badge.h]\ntype = \"http\"\nurl = \"http://x\"\nwatch = [\"a\"]\n";
+        assert!(err(http).contains("watch"));
+    }
+
+    #[test]
+    fn tool_version_expands_to_a_project_root_command() {
+        let cfg = parse(
+            "[badge.rs]\ntype = \"builtin\"\nname = \"tool_version\"\ntool = \"rust\"\n\
+             [badge.n]\ntype = \"builtin\"\nname = \"tool_version\"\ntool = \"node\"\n\
+             markers = [\"x\"]\nenv = [\"PATH\"]\n",
+        )
+        .unwrap();
+        let b = &cfg.badge["rs"];
+        assert!(matches!(&b.source, Source::Command { command, args }
+            if command == "rustc" && args.as_deref() == Some(&["--version".to_string()][..])));
+        assert_eq!(b.scope, Scope::ProjectRoot);
+        assert_eq!(
+            b.path.markers,
+            ["rust-toolchain.toml", "rust-toolchain", "Cargo.toml"]
+        );
+        assert_eq!(b.path.when_file, b.path.markers);
+        assert!(b.path.watch.contains(&"Cargo.toml".to_string()));
+        assert!(b.path.watch.contains(&".tool-versions".to_string()));
+        assert!(b.path.watch.contains(&"mise.toml".to_string()));
+        assert!(b.path.env.contains(&"PATH".to_string()));
+        assert!(b.path.env.contains(&"MISE_*".to_string()));
+        assert!(b.path.env.contains(&"RUSTUP_TOOLCHAIN".to_string()));
+        let re = b.extract.as_ref().unwrap();
+        let out = crate::extract::apply(Some(re), b"rustc 1.88.0 (abc 2025-06-23)\n").unwrap();
+        assert_eq!(crate::extract::render("{value}", &out), "1.88.0");
+        // Overrides replace the defaults (when_file follows markers).
+        let n = &cfg.badge["n"];
+        assert_eq!(
+            (&n.path.markers[..], &n.path.when_file[..]),
+            (&["x".to_string()][..], &["x".to_string()][..])
+        );
+        assert_eq!(n.path.env, ["PATH"]);
+        assert!(n.path.watch.contains(&"package.json".to_string()));
+    }
+
+    #[test]
+    fn tool_version_runs_each_tools_real_version_command() {
+        use std::fmt::Write as _;
+        let mut toml = String::new();
+        for t in ["node", "python", "rust", "go", "ruby"] {
+            write!(
+                toml,
+                "[badge.{t}]\ntype = \"builtin\"\nname = \"tool_version\"\ntool = \"{t}\"\n"
+            )
+            .unwrap();
+        }
+        let cfg = parse(&toml).unwrap();
+        let cmd = |t: &str| match &cfg.badge[t].source {
+            Source::Command { command, args } => (command.clone(), args.clone().unwrap()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cmd("node"), ("node".into(), vec!["--version".into()]));
+        assert_eq!(cmd("python"), ("python3".into(), vec!["--version".into()]));
+        assert_eq!(cmd("rust"), ("rustc".into(), vec!["--version".into()]));
+        assert_eq!(cmd("go"), ("go".into(), vec!["version".into()]));
+        assert_eq!(cmd("ruby"), ("ruby".into(), vec!["--version".into()]));
+
+        let src = |extra: &str| {
+            let toml = format!(
+                "[badge.p]\ntype = \"builtin\"\nname = \"tool_version\"\ntool = \"python\"\n{extra}"
+            );
+            parse(&toml).unwrap().badge["p"].source.clone()
+        };
+        let cmd = |command: &str, args: Option<&[&str]>| Source::Command {
+            command: command.into(),
+            args: args.map(|a| a.iter().map(ToString::to_string).collect()),
+        };
+        assert_eq!(src("args = [\"-V\"]\n"), cmd("python3", Some(&["-V"])));
+        assert_eq!(
+            src("command = \"uv\"\nargs = [\"run\", \"python\", \"--version\"]\n"),
+            cmd("uv", Some(&["run", "python", "--version"]))
+        );
+        assert_eq!(
+            src("command = \"python --version 2>&1\"\n"),
+            cmd("python --version 2>&1", None)
+        );
+    }
+
+    #[test]
+    fn tool_version_and_env_validation() {
+        let tv = "[badge.x]\ntype = \"builtin\"\nname = \"tool_version\"\n";
+        assert!(err(tv).contains("tool"));
+        let host = "[badge.h]\ntype = \"builtin\"\nname = \"hostname\"\n";
+        assert!(err(&format!("{host}tool = \"node\"\n")).contains("tool_version"));
+        assert!(err(&format!("{host}env = [\"A\"]\n")).contains("tool_version"));
+        let cmd = "[badge.c]\ntype = \"command\"\ncommand = \"true\"\n";
+        assert!(err(&format!("{cmd}env = [\"A*B\"]\n")).contains("env"));
+        assert!(err(&format!("{cmd}env = [\"*\"]\n")).contains("env"));
+        let ok = parse(&format!("{cmd}env = [\"PATH\", \"MISE_*\"]\n")).unwrap();
+        assert_eq!(ok.badge["c"].path.env, ["PATH", "MISE_*"]);
+    }
+
+    #[test]
+    fn parse_error_includes_label() {
+        let e = Config::parse("not valid [[[ toml", "my/config.toml").unwrap_err();
+        assert!(e.starts_with("parsing my/config.toml:"), "{e}");
+    }
+
     #[test]
     fn invalid_toml_errors() {
-        let path = write_temp("not valid [[[ toml");
-        assert!(Config::load(&path).is_err());
+        let src = "not valid [[[ toml";
+        assert!(parse(src).is_err());
     }
 
     #[test]
@@ -910,8 +818,7 @@ command = "echo"
 interval = "1s"
 extract = { kind = "regex", pattern = "(", group = 0 }
 "#;
-        let path = write_temp(toml);
-        assert!(Config::load(&path).is_err());
+        assert!(parse(toml).is_err());
     }
 
     #[test]
@@ -922,8 +829,7 @@ type = "builtin"
 name = "hostname"
 interval = "5s"
 "#;
-        let path = write_temp(toml);
-        let cfg = Config::load(&path).unwrap();
+        let cfg = parse(toml).unwrap();
         let b = &cfg.badge["hostname"];
         assert_eq!(b.format, "{value}");
         assert_eq!(b.timeout, Duration::from_secs(2));
@@ -938,8 +844,7 @@ type = "builtin"
 name = "git_branch"
 device = "BAT0"
 "#;
-        let path = write_temp(toml);
-        let err = Config::load(&path).unwrap_err();
+        let err = parse(toml).unwrap_err();
         assert!(err.contains("device"), "error was: {err}");
     }
 
@@ -951,8 +856,7 @@ type = "builtin"
 name = "battery"
 device = "BAT0"
 "#;
-        let path = write_temp(toml);
-        let cfg = Config::load(&path).unwrap();
+        let cfg = parse(toml).unwrap();
         match &cfg.badge["battery"].source {
             Source::Builtin { name, device, .. } => {
                 assert_eq!(*name, Builtin::Battery);
@@ -970,8 +874,7 @@ type = "builtin"
 name = "git_branch"
 field = "ahead"
 "#;
-        let path = write_temp(toml);
-        let err = Config::load(&path).unwrap_err();
+        let err = parse(toml).unwrap_err();
         assert!(err.contains("field"), "error was: {err}");
     }
 
@@ -982,8 +885,7 @@ field = "ahead"
 type = "builtin"
 name = "git_counts"
 "#;
-        let path = write_temp(toml);
-        let err = Config::load(&path).unwrap_err();
+        let err = parse(toml).unwrap_err();
         assert!(err.contains("field"), "error was: {err}");
     }
 
@@ -995,8 +897,7 @@ type = "builtin"
 name = "git_counts"
 field = "ahead"
 "#;
-        let path = write_temp(toml);
-        let cfg = Config::load(&path).unwrap();
+        let cfg = parse(toml).unwrap();
         match &cfg.badge["ahead"].source {
             Source::Builtin { name, field, .. } => {
                 assert_eq!(*name, Builtin::GitCounts);
@@ -1014,8 +915,7 @@ type = "command"
 command = "echo"
 bogus_field = "x"
 "#;
-        let path = write_temp(toml);
-        assert!(Config::load(&path).is_err());
+        assert!(parse(toml).is_err());
     }
 
     #[test]
@@ -1024,41 +924,35 @@ bogus_field = "x"
 [daemon]
 bogus_field = "x"
 "#;
-        let path = write_temp(toml);
-        assert!(Config::load(&path).is_err());
+        assert!(parse(toml).is_err());
     }
 
     /// The four documented fallback levels for a badge's `battery_interval` (design.md §7).
     #[test]
     fn battery_interval_resolution_order() {
         // 1. badge.battery_interval wins outright.
-        let path = write_temp(
-            r#"
+        let src = r#"
 [badge.a]
 type = "command"
 command = "echo"
 interval = "10s"
 battery_interval = "40s"
-"#,
-        );
-        let cfg = Config::load(&path).unwrap();
+"#;
+        let cfg = parse(src).unwrap();
         assert_eq!(cfg.badge["a"].battery_interval, Duration::from_secs(40));
 
         // 2. no badge.battery_interval -> falls back to badge.interval.
-        let path = write_temp(
-            r#"
+        let src = r#"
 [badge.a]
 type = "command"
 command = "echo"
 interval = "15s"
-"#,
-        );
-        let cfg = Config::load(&path).unwrap();
+"#;
+        let cfg = parse(src).unwrap();
         assert_eq!(cfg.badge["a"].battery_interval, Duration::from_secs(15));
 
         // 3. no badge interval/battery_interval -> falls back to daemon.battery_interval.
-        let path = write_temp(
-            r#"
+        let src = r#"
 [daemon]
 interval = "30s"
 battery_interval = "90s"
@@ -1066,95 +960,97 @@ battery_interval = "90s"
 [badge.a]
 type = "command"
 command = "echo"
-"#,
-        );
-        let cfg = Config::load(&path).unwrap();
+"#;
+        let cfg = parse(src).unwrap();
         assert_eq!(cfg.badge["a"].battery_interval, Duration::from_secs(90));
 
         // 4. nothing set anywhere -> falls back to daemon.interval (its own resolved
         // value, since daemon.battery_interval is itself unset).
-        let path = write_temp(
-            r#"
+        let src = r#"
 [daemon]
 interval = "45s"
 
 [badge.a]
 type = "command"
 command = "echo"
-"#,
-        );
-        let cfg = Config::load(&path).unwrap();
+"#;
+        let cfg = parse(src).unwrap();
         assert_eq!(cfg.badge["a"].battery_interval, Duration::from_secs(45));
     }
 
     #[test]
     fn validation_rejects_sub_second_interval() {
-        let path = write_temp(
-            r#"
+        let src = r#"
 [daemon]
 interval = "500ms"
-"#,
-        );
-        assert!(Config::load(&path).is_err());
+"#;
+        assert!(parse(src).is_err());
     }
 
     #[test]
     fn validation_rejects_coalesce_not_below_interval() {
-        let path = write_temp(
-            r#"
+        let src = r#"
 [daemon]
 interval = "1s"
 coalesce = "1s"
-"#,
-        );
-        assert!(Config::load(&path).is_err());
+"#;
+        assert!(parse(src).is_err());
     }
 
     #[test]
     fn validation_rejects_retry_min_above_retry_max() {
-        let path = write_temp(
-            r#"
+        let src = r#"
 [daemon]
 retry_min = "10m"
 retry_max = "5m"
-"#,
-        );
-        assert!(Config::load(&path).is_err());
+"#;
+        assert!(parse(src).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_zero_retry_min() {
+        let e = err("[daemon]\nretry_min = \"0s\"\n");
+        assert!(e.contains("retry_min must be > 0"), "{e}");
+    }
+
+    #[test]
+    fn tool_version_rejects_non_project_root_scope() {
+        for scope in ["global", "git_root"] {
+            let e = err(&format!(
+                "[badge.n]\ntype = \"builtin\"\nname = \"tool_version\"\ntool = \"node\"\n\
+                 scope = \"{scope}\"\n"
+            ));
+            assert!(e.contains("requires `scope = \"project_root\"`"), "{e}");
+        }
     }
 
     #[test]
     fn validation_rejects_cold_wait_at_or_above_40ms() {
-        let path = write_temp(
-            r#"
+        let src = r#"
 [daemon]
 cold_wait = "40ms"
-"#,
-        );
-        assert!(Config::load(&path).is_err());
+"#;
+        assert!(parse(src).is_err());
     }
 
     #[test]
     fn validation_rejects_zero_max_paths() {
-        let path = write_temp(
-            r"
+        let src = r"
 [daemon]
 max_paths = 0
-",
-        );
-        assert!(Config::load(&path).is_err());
+";
+        assert!(parse(src).is_err());
     }
 
     #[test]
     fn validation_rejects_zero_timeout() {
-        let path = write_temp(
-            r#"
+        let src = r#"
 [badge.a]
 type = "command"
 command = "echo"
 timeout = "0s"
-"#,
-        );
-        assert!(Config::load(&path).is_err());
+"#;
+        assert!(parse(src).is_err());
     }
 
     #[test]
@@ -1168,8 +1064,7 @@ name = "git_branch"
 type = "builtin"
 name = "hostname"
 "#;
-        let path = write_temp(toml);
-        let cfg = Config::load(&path).unwrap();
+        let cfg = parse(toml).unwrap();
         assert_eq!(cfg.badge["git_branch"].scope, Scope::GitRoot);
         assert_eq!(cfg.badge["hostname"].scope, Scope::Global);
     }
@@ -1201,8 +1096,8 @@ name = "{builtin}"
 {field}{scope_config}
 "#
                 );
-                let path = write_temp(&toml);
-                let result = Config::load(&path);
+                let src = &toml;
+                let result = parse(src);
 
                 if accepted {
                     let cfg = result.unwrap_or_else(|err| {
@@ -1249,8 +1144,7 @@ type = "http"
 url = "https://example.com/ip"
 scope = "git_root"
 "#;
-        let path = write_temp(toml);
-        let cfg = Config::load(&path).unwrap();
+        let cfg = parse(toml).unwrap();
         assert_eq!(cfg.badge["hostname"].scope, Scope::GitRoot);
         assert_eq!(cfg.badge["battery"].scope, Scope::Global);
         assert_eq!(cfg.badge["repo_ls"].scope, Scope::GitRoot);
@@ -1265,12 +1159,7 @@ type = "command"
 command = "echo"
 scope = "repo"
 "#;
-        let path = write_temp(toml);
-        assert!(Config::load(&path).is_err());
-    }
-
-    fn group_err(toml: &str) -> String {
-        Config::load(&write_temp(toml)).unwrap_err()
+        assert!(parse(toml).is_err());
     }
 
     const TWO_BADGES: &str = "[badge.a]\ntype = \"builtin\"\nname = \"hostname\"\n\
@@ -1278,9 +1167,9 @@ scope = "repo"
 
     #[test]
     fn parses_group_with_default_separator() {
-        let cfg = Config::load(&write_temp(&format!(
+        let cfg = parse(&format!(
             "{TWO_BADGES}[groups.r]\nbadges = [\"b\", \"a\"]\n"
-        )))
+        ))
         .unwrap();
         assert_eq!(cfg.groups["r"].badges, ["b", "a"]);
         assert_eq!(cfg.groups["r"].separator, " ");
@@ -1288,7 +1177,7 @@ scope = "repo"
 
     #[test]
     fn rejects_bad_groups() {
-        let g = |body: &str| group_err(&format!("{TWO_BADGES}[groups.{body}"));
+        let g = |body: &str| err(&format!("{TWO_BADGES}[groups.{body}"));
         assert!(g("a]\nbadges = [\"b\"]\n").contains("collides"));
         assert!(g("r]\nbadges = []\n").contains("must not be empty"));
         assert!(g("r]\nbadges = [\"zzz\"]\n").contains("not a defined badge"));
@@ -1298,7 +1187,7 @@ scope = "repo"
 
     #[test]
     fn format_groups() {
-        let g = |body: &str| group_err(&format!("{TWO_BADGES}[groups.{body}"));
+        let g = |body: &str| err(&format!("{TWO_BADGES}[groups.{body}"));
         assert!(g("r]\nformat = \"{a}\"\nbadges = [\"b\"]\n").contains("exclusive"));
         assert!(g("r]\nformat = \"{a}\"\nseparator = \"|\"\n").contains("exclusive"));
         assert!(g("r]\n").contains("either"));
@@ -1308,9 +1197,9 @@ scope = "repo"
         assert!(e.contains("groups.r.format") && e.contains("`nope`"), "{e}");
         assert!(g("r]\nformat = \"[{a}\"\n").contains("groups.r.format: at"));
 
-        let cfg = Config::load(&write_temp(&format!(
+        let cfg = parse(&format!(
             "{TWO_BADGES}[groups.r]\nformat = \"[{{b}}](red) {{a}} {{b}}\"\n"
-        )))
+        ))
         .unwrap();
         assert_eq!(cfg.groups["r"].badges, ["b", "a"]);
         assert!(cfg.groups["r"].template.is_some());
@@ -1319,9 +1208,9 @@ scope = "repo"
     #[test]
     fn group_output_validation() {
         let load = |extra: &str| {
-            Config::load(&write_temp(&format!(
+            parse(&format!(
                 "{TWO_BADGES}[groups.r]\nformat = \"{{a}}\"\n{extra}"
-            )))
+            ))
         };
         assert_eq!(load("").unwrap().groups["r"].output, Dialect::Ansi);
         assert_eq!(
@@ -1330,24 +1219,33 @@ scope = "repo"
         );
         let e = load("output = \"html\"\n").unwrap_err();
         assert!(e.contains("groups.r.output") && e.contains("html"), "{e}");
-        let e = Config::load(&write_temp(&format!(
+        let e = parse(&format!(
             "{TWO_BADGES}[groups.r]\nbadges = [\"a\"]\noutput = \"x\"\n"
-        )))
+        ))
         .unwrap_err();
         assert!(e.contains("groups.r.output"), "{e}");
     }
 
+    /// Writes a starship.toml with `contents` into `dir`; returns its path.
+    fn starship_file(dir: &TempDir, contents: &str) -> std::path::PathBuf {
+        let p = dir.path().join("starship.toml");
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
     #[test]
     fn palette_from_file_and_inline_override() {
-        let pf = write_temp(
+        let dir = TempDir::new("palette");
+        let pf = starship_file(
+            &dir,
             "palette = \"p\"\n[palettes.p]\nbrand = \"#112233\"\nother = \"#445566\"\n\
              [palettes.q]\nbrand = \"#000000\"\n",
         );
         let load = |extra: &str, fmt: &str| {
-            Config::load(&write_temp(&format!(
+            parse(&format!(
                 "[daemon]\npalette_from = '{}'\n{extra}{TWO_BADGES}[groups.r]\nformat = '{fmt}'\n",
                 pf.display()
-            )))
+            ))
         };
         assert!(load("", "[{a}](brand)").is_ok());
         assert!(load("", "[{a}](nope)").unwrap_err().contains("`nope`"));
@@ -1358,9 +1256,9 @@ scope = "repo"
             t.render(Dialect::Ansi, |_| "x".into()),
             "\x1b[38;2;17;34;51mx\x1b[0m"
         );
-        let cfg = Config::load(&write_temp(&format!(
+        let cfg = parse(&format!(
             "{TWO_BADGES}[palette]\nbrand = \"#abcdef\"\n[groups.r]\nformat = '[{{a}}](brand)'\n"
-        )))
+        ))
         .unwrap();
         let t = cfg.groups["r"].template.as_ref().unwrap();
         assert_eq!(
@@ -1371,17 +1269,15 @@ scope = "repo"
 
     #[test]
     fn palette_from_errors_and_override() {
-        let err = Config::load(&write_temp(
-            "[daemon]\npalette_from = '/nonexistent/s.toml'\n",
-        ))
-        .unwrap_err();
-        assert!(err.contains("palette_from"), "{err}");
-        let pf = write_temp("palette = \"p\"\n[palettes.p]\nbrand = \"#112233\"\n");
-        let cfg = Config::load(&write_temp(&format!(
+        let e = err("[daemon]\npalette_from = '/nonexistent/s.toml'\n");
+        assert!(e.contains("palette_from"), "{e}");
+        let dir = TempDir::new("palette");
+        let pf = starship_file(&dir, "palette = \"p\"\n[palettes.p]\nbrand = \"#112233\"\n");
+        let cfg = parse(&format!(
             "[daemon]\npalette_from = '{}'\n[palette]\nbrand = \"#abcdef\"\n{TWO_BADGES}\
              [groups.r]\nformat = '[{{a}}](brand)'\n",
             pf.display()
-        )))
+        ))
         .unwrap();
         let t = cfg.groups["r"].template.as_ref().unwrap();
         assert_eq!(
@@ -1403,12 +1299,10 @@ scope = "repo"
 
     #[test]
     fn palette_from_selection_errors() {
+        let dir = TempDir::new("palette");
         let load = |pf: &str| {
-            let pf = write_temp(pf);
-            Config::load(&write_temp(&format!(
-                "[daemon]\npalette_from = '{}'\n",
-                pf.display()
-            )))
+            let pf = starship_file(&dir, pf);
+            parse(&format!("[daemon]\npalette_from = '{}'\n", pf.display()))
         };
         // No `palette = ".."` selected: valid, empty palette.
         assert!(load("[palettes.p]\nbrand = \"#112233\"\n").is_ok());
@@ -1421,20 +1315,17 @@ scope = "repo"
         assert!(e.contains("palettes.p.brand must be a string"), "{e}");
         let e = load("not [[[ toml").unwrap_err();
         assert!(e.contains("palette_from: parsing"), "{e}");
-        let e = Config::load(&write_temp(
-            "[daemon]\npalette_from = '/nonexistent/s.toml'\n",
-        ))
-        .unwrap_err();
+        let e = err("[daemon]\npalette_from = '/nonexistent/s.toml'\n");
         assert!(e.contains("palette_from: reading"), "{e}");
     }
 
     #[test]
     fn palette_names_are_case_insensitive_and_bad_values_rejected() {
-        let ok = Config::load(&write_temp(&format!(
+        let ok = parse(&format!(
             "{TWO_BADGES}[palette]\nBrand = \"#010203\"\n[groups.r]\nformat = '[{{a}}](BRAND)'\n"
-        )));
+        ));
         assert!(ok.is_ok(), "{:?}", ok.err());
-        let e = group_err(&format!(
+        let e = err(&format!(
             "{TWO_BADGES}[palette]\nbrand = \"zzz\"\n[groups.r]\nformat = '[{{a}}](brand)'\n"
         ));
         assert!(e.contains("palette color `brand`"), "{e}");
@@ -1443,21 +1334,21 @@ scope = "repo"
     #[test]
     fn group_separator_control_chars_rejected() {
         for sep in ["\\r", "\\u001f", "a\\nb"] {
-            let e = group_err(&format!(
+            let e = err(&format!(
                 "{TWO_BADGES}[groups.r]\nbadges = [\"a\"]\nseparator = \"{sep}\"\n"
             ));
             assert!(e.contains("separator must not contain"), "{sep}: {e}");
         }
-        let cfg = Config::load(&write_temp(&format!(
+        let cfg = parse(&format!(
             "{TWO_BADGES}[groups.r]\nbadges = [\"a\", \"b\"]\nseparator = \"\"\n"
-        )))
+        ))
         .unwrap();
         assert_eq!(cfg.groups["r"].separator, "");
     }
 
     #[test]
     fn group_member_unknown_and_group_cannot_be_member() {
-        let e = group_err(&format!(
+        let e = err(&format!(
             "{TWO_BADGES}[groups.g]\nbadges = [\"a\"]\n[groups.r]\nbadges = [\"g\"]\n"
         ));
         assert!(e.contains("`g` is not a defined badge"), "{e}");

@@ -21,9 +21,9 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub struct Request {
     pub v: u8,
     pub cmd: String,
-    /// The client's `CARGO_PKG_VERSION`, so the daemon can notice a binary upgrade (see
-    /// `handle_connection`'s post-`get` shutdown) without the client paying any latency
-    /// for it.
+    /// The client's `CARGO_PKG_VERSION`. Informational only: the daemon's `handle_json` does
+    /// not read it (binary-upgrade detection happens on the text `get`, see
+    /// `handle_text_get`).
     #[serde(default)]
     pub ver: String,
 }
@@ -44,6 +44,13 @@ impl Response {
             ver: env!("CARGO_PKG_VERSION").to_string(),
             ok: true,
             values,
+        }
+    }
+
+    pub fn err() -> Self {
+        Self {
+            ok: false,
+            ..Self::ok(std::collections::BTreeMap::new())
         }
     }
 }
@@ -77,11 +84,22 @@ pub fn config_path() -> PathBuf {
 
 // ---- bounded line reader -----------------------------------------------------
 
-/// Reads one `\n`-terminated line as raw bytes (discarding the newline), erroring if more
-/// than `cap` bytes arrive before one is found. EOF with no newline returns what was read
-/// so far. Byte-oriented (rather than `String`) so callers can dispatch on the first byte
-/// (`{` JSON vs `g` text `get`, see `daemon::handle_connection`) before deciding how to
-/// decode the rest.
+/// Appends `chunk` up to its first `\n` to `buf`; `true` once the newline is seen (anything
+/// after it is dropped). Errors as soon as the line body exceeds `cap` bytes, so a line of
+/// exactly `cap` bytes plus `\n` is accepted and one more byte is not.
+fn feed_line(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> io::Result<bool> {
+    let end = chunk.iter().position(|&b| b == b'\n');
+    buf.extend_from_slice(&chunk[..end.unwrap_or(chunk.len())]);
+    if buf.len() > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+    }
+    Ok(end.is_some())
+}
+
+/// Reads one `\n`-terminated line as raw bytes (discarding the newline), erroring if the
+/// line is longer than `cap` bytes. EOF with no newline returns what was read so far.
+/// Byte-oriented (rather than `String`) so callers can dispatch on the first byte (`{` JSON
+/// vs `g` text `get`, see `daemon::handler::handle_connection`) before deciding how to decode the rest.
 pub async fn read_line_bytes_capped_async<R>(r: &mut R, cap: usize) -> io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -91,51 +109,27 @@ where
     let mut chunk = [0u8; 4096];
     loop {
         let n = r.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        if let Some(pos) = chunk[..n].iter().position(|&b| b == b'\n') {
-            buf.extend_from_slice(&chunk[..pos]);
+        if n == 0 || feed_line(&mut buf, &chunk[..n], cap)? {
             return Ok(buf);
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > cap {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
-        }
     }
-    Ok(buf)
 }
 
-/// Reads one `\n`-terminated line, discarding the newline, erroring if more than `cap`
-/// bytes arrive before one is found. EOF with no newline returns what was read so far.
-/// Used by the JSON admin client to read the daemon's response.
+/// Blocking [`read_line_bytes_capped_async`] returning UTF-8; used by the JSON admin client
+/// to read the daemon's response.
 pub fn read_line_capped<R: io::Read>(r: &mut R, cap: usize) -> io::Result<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         let n = r.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if let Some(pos) = chunk[..n].iter().position(|&b| b == b'\n') {
-            buf.extend_from_slice(&chunk[..pos]);
+        if n == 0 || feed_line(&mut buf, &chunk[..n], cap)? {
             return String::from_utf8(buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8"));
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > cap {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
-        }
     }
-    String::from_utf8(buf).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8"))
 }
 
 // ---- JSON admin client (status/stop/reload) ------------------------------------------
-
-fn remaining(deadline: Instant) -> Option<Duration> {
-    let now = Instant::now();
-    (deadline > now).then(|| deadline - now)
-}
 
 /// Writes the request and reads the response on an already-connected stream, within
 /// `deadline`. `None` on any error or timeout; never touches the connect step, so callers
@@ -153,23 +147,36 @@ fn exchange(
     let mut line = serde_json::to_string(&req).ok()?;
     line.push('\n');
 
-    client::tolerate_shut_socket(stream.set_write_timeout(Some(remaining(deadline)?))).ok()?;
+    client::tolerate_shut_socket(stream.set_write_timeout(Some(client::remaining(deadline)?)))
+        .ok()?;
     stream.write_all(line.as_bytes()).ok()?;
 
-    client::tolerate_shut_socket(stream.set_read_timeout(Some(remaining(deadline)?))).ok()?;
+    client::tolerate_shut_socket(stream.set_read_timeout(Some(client::remaining(deadline)?)))
+        .ok()?;
     let resp_line = read_line_capped(stream, MAX_LINE_BYTES).ok()?;
     serde_json::from_str(&resp_line).ok()
 }
 
+/// Why an admin command got no response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminError {
+    /// Nothing is listening on the socket.
+    NotRunning,
+    /// A daemon may be there, but the exchange failed (busy, timed out, bad reply).
+    NoResponse,
+}
+
 /// `status`/`stop`/`reload`: administrative commands with their own (longer) timeout.
-/// Returns `None` if the daemon isn't reachable; never spawns one. The hot `get` path has
-/// its own client entirely in `client.rs`.
-pub fn client_admin(cmd: &str, timeout: Duration) -> Option<Response> {
+/// Never spawns a daemon. The hot `get` path has its own client entirely in `client.rs`.
+pub fn client_admin(cmd: &str, timeout: Duration) -> Result<Response, AdminError> {
     let deadline = Instant::now() + timeout;
-    let client::Connect::Ok(mut stream) = client::connect_daemon() else {
-        return None;
-    };
-    exchange(&mut stream, cmd, deadline)
+    match client::connect_daemon() {
+        client::Connect::Ok(mut stream) => {
+            exchange(&mut stream, cmd, deadline).ok_or(AdminError::NoResponse)
+        }
+        client::Connect::NotRunning => Err(AdminError::NotRunning),
+        client::Connect::Busy => Err(AdminError::NoResponse),
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +215,35 @@ mod tests {
         assert_eq!(
             read_line_bytes_capped_async(&mut c, 1024).await.unwrap(),
             b"hello"
+        );
+    }
+
+    #[test]
+    fn cap_is_exact_for_both_readers() {
+        let cap = 5000; // spans more than one 4 KiB chunk
+        let mut ok = vec![b'a'; cap];
+        ok.push(b'\n');
+        let mut bad = vec![b'a'; cap + 1];
+        bad.push(b'\n');
+        assert_eq!(
+            read_line_capped(&mut Cursor::new(ok.clone()), cap)
+                .unwrap()
+                .len(),
+            cap
+        );
+        assert!(read_line_capped(&mut Cursor::new(bad.clone()), cap).is_err());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(
+            rt.block_on(read_line_bytes_capped_async(&mut Cursor::new(ok), cap))
+                .unwrap()
+                .len(),
+            cap
+        );
+        assert!(
+            rt.block_on(read_line_bytes_capped_async(&mut Cursor::new(bad), cap))
+                .is_err()
         );
     }
 

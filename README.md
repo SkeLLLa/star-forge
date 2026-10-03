@@ -159,10 +159,13 @@ a per-user singleton); run `stfgd stop` first. For a `cargo install`, see
 ```sh
 stfgd get <badge>... [--cwd <path>]   # hot path: never fails, no stderr
 stfgd daemon                          # foreground (used internally; run instead by `get`)
-stfgd status                          # table of cached badges, scope, age, errors
+stfgd status                          # cached badges, scope, age, errors; last config error
 stfgd stop
 stfgd reload
 ```
+
+If the daemon isn't running, exit codes follow LSB init scripts (as `systemctl` does): `status`
+exits 3, `reload` exits 7, and `stop` succeeds (0). An unresponsive daemon exits 1.
 
 `stfg <badge>... [--cwd <path>]` is a separate, tiny binary that is an exact equivalent to
 `stfgd get` — same implementation, same flags, same behavior, just without the full binary's
@@ -189,9 +192,9 @@ interval = "60s"           # default 60s: fallback refresh period for badges tha
 battery_interval = "60s"   # default: same as `interval`; fallback refresh period while on battery
 active_window = "5m"       # default 5m: a badge is kept refreshed for this long after its last use
 coalesce = "1s"            # default 1s: batch refreshes due within this long of each other; must be < every resolved interval
-retry_min = "2s"           # default 2s: backoff after a failed fetch starts here, doubling on each failure
+retry_min = "2s"           # default 2s: backoff after a failed fetch starts here, doubling on each failure; must be > 0
 retry_max = "5m"           # default 5m: backoff cap
-timeout = "2s"             # default 2s: fallback hard kill for the whole fetch + extract
+timeout = "2s"             # default 2s: fallback hard kill for the whole fetch + extract; must be > 0
 power_check = "60s"        # default 60s: how often AC/battery state is re-checked
 config_check = "2s"        # default 2s: how often the config and palette_from files are stat'ed for an implicit reload
 cold_wait = "20ms"         # default 20ms: how long a cold (no value yet) `get` waits for its own fetch; must be < 40ms
@@ -211,7 +214,11 @@ battery_interval = "5s"         # optional; resolution order below
 active_window = "5m"            # optional; defaults to [daemon] active_window
 timeout = "2s"                  # optional; defaults to [daemon] timeout
 max_output = 65536              # optional; defaults to [daemon] max_output
-scope = "git_root" | "global"   # optional; defaults to git_root for git builtins, global otherwise
+scope = "git_root" | "project_root" | "global"   # optional; defaults to git_root for git builtins, global otherwise
+markers = [".nvmrc"]            # command/tool_version badges; required with (only valid for) scope = "project_root"
+watch = [".nvmrc"]              # command/tool_version badges, path scope only; paths relative to the scope root
+when_file = ["package.json"]    # command/tool_version badges, path scope only; empty unless one exists in the scope root
+env = ["PATH", "NVM_BIN", "MISE_*"]   # command/tool_version badges; variables taken from the requesting client (trailing * = prefix)
 extract = { kind = "trim" | "regex" | "json", ... }   # default: trim
 ```
 
@@ -222,7 +229,7 @@ Every badge-level knob above falls back to its `[daemon]` counterpart when unset
 
 `type = "builtin"` badges (`name = "git_branch" | "git_status" | "git_counts" | "git_commit" |
 "git_state" | "git_stash" | "battery" | "hostname" | "load_avg" | "mem_used_percent" |
-"uptime"`):
+"uptime" | "tool_version"`):
 
 - `git_branch`, `git_commit`, `git_state`, `git_stash` are computed in-process from files
   under `.git` on every request — no subprocess, no cache, so they're always exactly as
@@ -236,13 +243,136 @@ Every badge-level knob above falls back to its `[daemon]` counterpart when unset
   one `git status` subprocess instead of one each.
 - `battery`/`hostname`/`load_avg`/`mem_used_percent`/`uptime` are global (host-wide, not
   per repo).
+- `tool_version` runs a tool's version command per project root; see
+  [`tool_version`](#tool_version).
+
+Overriding builtins: every builtin takes the common knobs (`format`, `interval`, `timeout`,
+`extract`, `scope` where allowed, …), so its output, refresh rate and parsing are yours to
+change. `tool_version` is a preset command badge, so all of its defaults (the version command
+via `command`/`args`, plus `markers`/`watch`/`when_file`/`env`/`extract`/`scope`) can be
+replaced. The other builtins are computed in-process (no command to swap); to replace one
+entirely, define a `command` badge under the same name instead.
 
 All six git builtins require `scope = "git_root"` (also their default): they use the repo
 containing `--cwd`, and render empty outside a repo without running a subprocess.
 `scope = "global"` on a git builtin is rejected at config load rather than silently ignored.
 Everything else defaults to global and can override this with
-`scope = "git_root" | "global"`. A `command` badge scoped to `git_root` is run with
+`scope = "git_root" | "global"` (`project_root` for command and `tool_version` badges).
+A `command` badge scoped to `git_root` is run with
 cwd = the repo root and cached per repo, same as a git builtin.
+
+`command` badges can also use `scope = "project_root"` with a required `markers` list: the
+root is the nearest ancestor of `--cwd` (itself included) containing any marker, searched up
+to and including `$HOME` (or `/` when `--cwd` is outside `$HOME`). The command runs there and
+is cached per root (same `max_paths`/`path_evict` handling as `git_root`); with no match the
+badge renders empty and nothing is spawned. This fixes monorepos (`sub/.nvmrc`) and non-git
+directories.
+
+On `command` badges with a path scope (`git_root` or `project_root`):
+
+- `watch = ["rel/path", ...]` refreshes the cached value on the next request after any listed
+  file changes (inode, size, ctime; a missing file counts, so creating or deleting one also
+  triggers it), like the git index trigger: a cold-value-style refresh that waits up to
+  `cold_wait`, rather than waiting out `interval`.
+- `when_file = ["rel/path", ...]` renders empty, without spawning, unless at least one of the
+  files exists in the scope root. This lets one group hold every language badge.
+
+`watch`/`when_file` are rejected with `scope = "global"`, and `markers` with any scope but
+`project_root`.
+
+```toml
+[badge.node]
+type = "command"
+command = "node --version"
+scope = "project_root"
+markers = [".nvmrc", "package.json", ".tool-versions"]
+watch = [".nvmrc", ".tool-versions", "mise.toml"]   # edit one -> refreshed on the next prompt
+when_file = ["package.json", ".nvmrc"]              # not a node project -> empty, no spawn
+interval = "10m"
+```
+
+`env = ["PATH", "NVM_BIN", "MISE_*"]` on a `command` badge runs it with those variables taken
+from the client that asked (a trailing `*` is a prefix glob, e.g. `MISE_*`); every other
+variable comes from the daemon's environment. The selected `(name, value)` pairs are part of
+the cache key (next to the scope root), so after `nvm use` / `mise use` the next prompt gets
+its own entry and shows the new version immediately. Such entries are evicted like path-scoped
+ones (`max_paths`/`path_evict`) and are refreshed on request only, never by the timer. The
+client always sends its whole environment (a few KB over the socket) and the daemon filters
+per badge, so `stfg` never reads the config. A client that sends none (an older `stfg`) gets
+the daemon's environment. Variables the client lacks do not fall back to the daemon's: for a
+request that carried an environment, matching variables missing from it are unset for the
+command (so `VIRTUAL_ENV` after `deactivate` is really gone). `stfg` skips single variables
+over 4 KiB (exported shell functions, `LS_COLORS`), and drops the whole block only if the
+request would still exceed ~60 KiB. Values are never logged.
+
+### `tool_version`
+
+`type = "builtin"`, `name = "tool_version"` and `tool = "node" | "python" | "rust" | "go" |
+"ruby"` is sugar for the `project_root` command badge above: it runs the tool's version
+command (`node --version`, `python3 --version`, `rustc --version`, `go version`,
+`ruby --version`) in the project root and extracts the first `\d+\.\d+(\.\d+)?`.
+Every default is overridable: `command`/`args` replace the version command (a `command`
+without `args` runs via `sh -c`, as on command badges), `extract`/`scope` work as usual, and
+`markers`/`watch`/`when_file`/`env` replace the lists below:
+
+| tool | `markers` (= `when_file`) | extra `env` |
+| --- | --- | --- |
+| node | `.nvmrc`, `.node-version`, `package.json` | `NVM_BIN`, `VOLTA_HOME` |
+| python | `.python-version`, `pyproject.toml` | `PYENV_VERSION`, `VIRTUAL_ENV` |
+| rust | `rust-toolchain.toml`, `rust-toolchain`, `Cargo.toml` | `RUSTUP_TOOLCHAIN` |
+| go | `go.mod` | `GOROOT` |
+| ruby | `.ruby-version`, `Gemfile` | `RBENV_VERSION` |
+
+`watch` is the markers plus `.tool-versions` and `mise.toml` for every tool, and `env` is
+`PATH`, `MISE_*`, `ASDF_*` plus the extra variables. Version files are not parsed: the shims
+resolve them, and `watch` refreshes the value when one changes.
+
+```toml
+[badge.node]
+type = "builtin"
+name = "tool_version"
+tool = "node"
+format = " {value}"
+interval = "10m"
+
+[badge.python]
+type = "builtin"
+name = "tool_version"
+tool = "python"
+format = " {value}"
+interval = "10m"
+
+[badge.rust]
+type = "builtin"
+name = "tool_version"
+tool = "rust"
+format = " {value}"
+interval = "10m"
+
+# Overriding the version command, e.g. a uv-managed interpreter.
+[badge.uv_python]
+type = "builtin"
+name = "tool_version"
+tool = "python"
+command = "uv"
+args = ["run", "python", "--version"]
+
+# One stfg call (and one starship module) for every language badge; the ones whose
+# `when_file` isn't met render empty and are skipped.
+[groups.langs]
+badges = ["node", "python", "rust"]
+separator = " "
+```
+
+```toml
+# starship.toml
+[custom.sf_langs]
+command = "langs"
+shell = ["stfg"]
+use_stdin = false
+when = true
+format = '$output'
+```
 
 `battery` is the charge percent (no `%` sign). On Linux it reads
 `/sys/class/power_supply/*/capacity`; the optional `device = "BAT0"` picks the entry
@@ -572,5 +702,5 @@ deadline-bounded worker as well.
 The idea behind star-forge — one daemon that computes statusline values once and serves every
 prompt/tmux call from its cache — comes from
 [beachcomber](https://github.com/NavistAu/beachcomber) (MIT, Copyright (c) 2026 Joshua
-Hogendorn). Parts of the in-process git readers in `src/provider.rs` are also adapted from it.
+Hogendorn). Parts of the in-process git readers in `src/provider/git.rs` are also adapted from it.
 See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full list and license text.

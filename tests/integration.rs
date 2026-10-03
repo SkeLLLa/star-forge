@@ -75,7 +75,7 @@ impl TestEnv {
     }
 
     /// Runs the tiny `stfg` binary directly (the real hot path; per
-    /// `design.md` §2/§3, `stfgd get` is the exact same shared `client.rs`
+    /// `design.md` §2/§3, `stfgd get` is the exact same shared `client`
     /// implementation, just with one extra `mod` indirection, so exercising this one
     /// covers both).
     fn get(&self, badges: &[&str]) -> (Vec<String>, bool) {
@@ -338,7 +338,7 @@ type = "command"
 command = "sleep"
 args = ["{marker}"]
 interval = "1s"
-timeout = "200ms"
+timeout = "1s"
 "#
     ));
 
@@ -368,8 +368,8 @@ timeout = "200ms"
         "hanging process with marker {marker} never started"
     );
 
-    // ~300ms after timeout=200ms it must be killed and reaped: bounded-retry, not a flaky
-    // fixed sleep.
+    // Soon after timeout=1s it must be killed and reaped (retry_min=2s keeps it from
+    // respawning before this check): bounded-retry, not a flaky fixed sleep.
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
             proc_cmdline_count(&marker) == 0
@@ -397,7 +397,7 @@ coalesce = "100ms"
 type = "command"
 command = "sleep {marker} | sleep {marker}"
 interval = "1s"
-timeout = "200ms"
+timeout = "1s"
 "#
     ));
 
@@ -419,8 +419,8 @@ timeout = "200ms"
         "both pipeline stages with marker {marker} never started"
     );
 
-    // ~300ms after timeout=200ms every stage must be killed and reaped: bounded-retry,
-    // not a flaky fixed sleep.
+    // Soon after timeout=1s every stage must be killed and reaped (retry_min=2s keeps it
+    // from respawning before this check): bounded-retry, not a flaky fixed sleep.
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
             proc_cmdline_count(&marker) == 0
@@ -658,7 +658,7 @@ interval = "1h"
 }
 
 /// `stfgd get` (the full binary's subcommand) and `stfg` (the tiny
-/// binary) share exactly one `client.rs` implementation (design.md §3): this checks the
+/// binary) share exactly one `client` implementation (design.md §3): this checks the
 /// full binary's entry point also gets a real value, not just the tiny one exercised by
 /// every other test in this file via `TestEnv::get`.
 #[test]
@@ -907,11 +907,15 @@ fn global_scope_is_rejected_for_every_git_builtin_at_startup() {
 
         let (status, ok) = env.run(&["status"]);
         assert!(ok, "status failed while checking {name}");
+        let (errors, table): (Vec<_>, Vec<_>) = status
+            .lines()
+            .partition(|line| line.starts_with("config error: "));
         assert_eq!(
-            status.lines().count(),
+            table.len(),
             1,
             "{name} accepted scope = \"global\" at startup"
         );
+        assert_eq!(errors.len(), 1, "{name}: startup config error not reported");
     }
 }
 

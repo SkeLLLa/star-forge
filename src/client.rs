@@ -1,15 +1,16 @@
 //! Shared `get` hot-path client: socket path resolution, non-blocking connect, detached
 //! daemon spawn, the text wire protocol, and output. **std + libc only** — no
-//! `tokio`/`serde`/`serde_json`/`regex`/`reqwest`/`toml` — so it can be linked into the tiny
-//! `stfg` binary (`src/bin/stfg.rs`, via `#[path = "../client.rs"]`) as well as `stfgd get`
-//! (`main.rs`, via a normal `mod client;`). Exactly one implementation backs both entry
-//! points.
+//! `tokio`/`serde`/`serde_json`/`regex`/`reqwest`/`toml` — so the tiny `stfg` binary
+//! (`src/bin/stfg.rs`, which includes this file via `#[path]`) stays cheap to start and builds
+//! with `--no-default-features`. `stfgd get` calls the same [`run_cli`]: exactly one
+//! implementation backs both entry points.
 //!
 //! Wire protocol (see `docs/design.md` §2): request is one line, fields separated by
-//! 0x1F (ASCII unit separator): `get<0x1F><version><0x1F><cwd>(<0x1F><badge>)*\n`.
+//! 0x1F (ASCII unit separator): `get<0x1F><version><0x1F><cwd>(<0x1F><badge>)*\n`, optionally
+//! followed by `<0x1F>ENV_MARK(<0x1F>NAME=value)*` (the client's environment).
 //! Response is exactly one line per requested badge, in order, then EOF.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
@@ -20,10 +21,30 @@ use std::time::{Duration, Instant};
 /// Cap on the whole response read (matches the daemon's own line caps).
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Field that ends the badge list and starts the env block: `NAME=value` fields, the client's
+/// whole environment (the daemon filters per badge, so the client never reads the config).
+///
+/// A request without it parses as before (daemon env). An older daemon treats the block as
+/// extra badge names: unknown, empty, and cut off by the client's line count.
+pub const ENV_MARK: &str = "\u{1e}env";
+
+/// Per-variable cap (name + value): skips exported shell functions, `LS_COLORS` and the like
+/// so one huge entry doesn't cost the whole env block.
+const MAX_ENV_ENTRY_BYTES: usize = 4 * 1024;
+
+/// Cap on the request line (the daemon's `ipc::MAX_LINE_BYTES`, kept below it); an
+/// environment that wouldn't fit is left out (daemon env used) rather than failing the request.
+const MAX_REQUEST_BYTES: usize = 60 * 1024;
+
 /// Separates fields within the one-line request; also forbidden inside cwd/badge values.
 const FIELD_SEP: char = '\u{1f}';
 
 // ---- paths -----------------------------------------------------------------
+
+fn uid() -> libc::uid_t {
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
 
 /// `$XDG_RUNTIME_DIR/star-forge` or `/tmp/star-forge-$UID`.
 pub fn runtime_dir() -> PathBuf {
@@ -32,9 +53,7 @@ pub fn runtime_dir() -> PathBuf {
     {
         return PathBuf::from(dir).join("star-forge");
     }
-    // SAFETY: getuid(2) has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/star-forge-{uid}"))
+    PathBuf::from(format!("/tmp/star-forge-{}", uid()))
 }
 
 pub fn socket_path() -> PathBuf {
@@ -43,20 +62,22 @@ pub fn socket_path() -> PathBuf {
 
 /// Whether the runtime dir `dir` can be trusted with the socket: a real directory (not a
 /// symlink) owned by this user that no one else can write to, so no one else can have put
-/// a socket (or the lock) in it. The `/tmp/star-forge-$UID` fallback sits in world-writable
+/// a socket (or the lock) in it.
+///
+/// The `/tmp/star-forge-$UID` fallback sits in world-writable
 /// `/tmp`, where anyone can pre-create it — and on macOS, where `XDG_RUNTIME_DIR` is
 /// normally unset, that fallback is the default. `Err` is the `lstat(2)` failure
 /// (`NotFound`: no daemon has created it yet).
 pub fn runtime_dir_is_private(dir: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::symlink_metadata(dir)?;
-    // SAFETY: getuid(2) has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    Ok(meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0)
+    Ok(meta.is_dir() && meta.uid() == uid() && meta.mode() & 0o022 == 0)
 }
 
 /// Connects to the daemon at `socket_path()` without blocking, once its runtime dir passes
-/// [`runtime_dir_is_private`]. A missing dir is `NotRunning` without connecting at all
+/// [`runtime_dir_is_private`].
+///
+/// A missing dir is `NotRunning` without connecting at all
 /// (whatever appears there after the check is unvetted); an untrusted one is `Busy`, so the
 /// client neither talks to it nor spawns a daemon that would refuse it anyway.
 pub fn connect_daemon() -> Connect {
@@ -87,6 +108,40 @@ pub enum Connect {
     Busy,
 }
 
+/// A fresh non-blocking, close-on-exec `AF_UNIX` stream socket (Linux: one `socket(2)`).
+#[cfg(target_os = "linux")]
+fn new_stream_socket() -> Option<OwnedFd> {
+    let kind = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    // SAFETY: AF_UNIX/`kind`/0 are valid, static arguments; the return value is checked
+    // before the fd is used for anything.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    // SAFETY: `fd` was just returned by the successful `socket(2)` call and isn't owned
+    // anywhere else.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A fresh non-blocking, close-on-exec `AF_UNIX` stream socket. No
+/// `SOCK_NONBLOCK`/`SOCK_CLOEXEC` outside Linux: set both after `socket(2)` instead. Plain
+/// `F_SETFL` (no `F_GETFL` to OR into) is exact: a fresh socket has no other status flags.
+#[cfg(not(target_os = "linux"))]
+fn new_stream_socket() -> Option<OwnedFd> {
+    // SAFETY: AF_UNIX/SOCK_STREAM/0 are valid, static arguments; the return value is
+    // checked before the fd is used for anything.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was just returned by the successful `socket(2)` call and isn't owned
+    // anywhere else.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `fd` is valid; F_SETFD/F_SETFL on it are plain flag operations.
+    let failed = unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) < 0
+            || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) < 0
+    };
+    (!failed).then_some(fd)
+}
+
 /// Connects to `path` without ever blocking the caller. A blocking `connect()` to an
 /// `AF_UNIX` socket blocks when the listener's backlog is full (unlike TCP, there's no
 /// handshake to queue behind), which would blow through the client's deadline; a
@@ -114,30 +169,9 @@ fn connect_nonblocking(path: &Path) -> Connect {
         return Connect::Busy;
     };
 
-    #[cfg(target_os = "linux")]
-    let kind = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let kind = libc::SOCK_STREAM;
-    // SAFETY: AF_UNIX/`kind`/0 are valid, static arguments; the return value is checked
-    // before the fd is used for anything.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
-    if fd < 0 {
+    let Some(fd) = new_stream_socket() else {
         return Connect::Busy;
-    }
-    // SAFETY: `fd` was just returned by the successful `socket(2)` call above and isn't
-    // owned anywhere else.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // No SOCK_NONBLOCK/SOCK_CLOEXEC outside Linux: set both before connecting instead.
-    // Plain F_SETFL (no F_GETFL to OR into) is exact here: a fresh socket has no other
-    // file status flags to preserve.
-    // SAFETY: `fd` is valid; F_SETFD/F_SETFL on it are plain flag operations.
-    #[cfg(not(target_os = "linux"))]
-    if unsafe {
-        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) < 0
-            || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) < 0
-    } {
-        return Connect::Busy;
-    }
+    };
 
     // SAFETY: `fd` is a valid, just-created socket; `addr` is a fully initialized
     // `sockaddr_un` and `addr_len` is exactly its used length.
@@ -202,7 +236,12 @@ fn valid_field(s: &str) -> bool {
 
 /// Encodes the one-line `get` request. `None` if `cwd` or any badge contains `\n` or the
 /// field separator — the caller must print empty lines without connecting in that case.
-fn encode_request(version: &str, cwd: &str, badges: &[String]) -> Option<String> {
+fn encode_request(
+    version: &str,
+    cwd: &str,
+    badges: &[String],
+    env: &[(String, String)],
+) -> Option<String> {
     if !valid_field(cwd) || badges.iter().any(|b| !valid_field(b)) {
         return None;
     }
@@ -217,6 +256,29 @@ fn encode_request(version: &str, cwd: &str, badges: &[String]) -> Option<String>
     for b in badges {
         req.push(FIELD_SEP);
         req.push_str(b);
+    }
+    let base = req.len();
+    let mut marked = false;
+    for (k, v) in env {
+        if k.contains('=')
+            || k.len() + v.len() > MAX_ENV_ENTRY_BYTES
+            || !valid_field(k)
+            || !valid_field(v)
+        {
+            continue;
+        }
+        if !marked {
+            req.push(FIELD_SEP);
+            req.push_str(ENV_MARK);
+            marked = true;
+        }
+        req.push(FIELD_SEP);
+        req.push_str(k);
+        req.push('=');
+        req.push_str(v);
+    }
+    if req.len() > MAX_REQUEST_BYTES {
+        req.truncate(base);
     }
     req.push('\n');
     Some(req)
@@ -253,11 +315,11 @@ impl DeadlineStream for UnixStream {
 /// nor receive, which is the normal state right after the daemon writes its reply and
 /// closes. Such a socket cannot block: reads return what's buffered and then EOF, writes
 /// fail at once, so there is nothing left to bound. Linux never reports this.
+#[doc(hidden)]
 pub fn tolerate_shut_socket(result: io::Result<()>) -> io::Result<()> {
+    const TOLERATE_EINVAL: bool = cfg!(not(target_os = "linux"));
     match result {
-        Err(err) if cfg!(not(target_os = "linux")) && err.raw_os_error() == Some(libc::EINVAL) => {
-            Ok(())
-        }
+        Err(err) if TOLERATE_EINVAL && err.raw_os_error() == Some(libc::EINVAL) => Ok(()),
         other => other,
     }
 }
@@ -275,9 +337,6 @@ fn write_all_before_deadline<S: DeadlineStream>(
     while !bytes.is_empty() {
         let timeout = remaining(deadline).ok_or_else(deadline_error)?;
         stream.set_write_timeout(timeout)?;
-        if remaining(deadline).is_none() {
-            return Err(deadline_error());
-        }
         let result = stream.write(bytes);
         if remaining(deadline).is_none() {
             return Err(deadline_error());
@@ -297,20 +356,25 @@ fn write_all_before_deadline<S: DeadlineStream>(
     Ok(())
 }
 
-/// Reads until EOF, capped at `cap` bytes and bounded by one absolute deadline.
+/// Reads until EOF or `lines` newlines have been seen (the daemon's reply is exactly one
+/// `\n`-terminated line per badge, embedded newlines replaced, so the last `\n` ends it and
+/// waiting for EOF costs an extra `read`/`setsockopt`), capped at `cap` bytes and bounded by
+/// one absolute deadline.
 fn read_all_capped_before_deadline<S: DeadlineStream>(
     stream: &mut S,
+    lines: usize,
     cap: usize,
     deadline: Instant,
 ) -> io::Result<Vec<u8>> {
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
+    let mut seen = 0;
     loop {
         let timeout = remaining(deadline).ok_or_else(deadline_error)?;
         stream.set_read_timeout(timeout)?;
-        if remaining(deadline).is_none() {
-            return Err(deadline_error());
-        }
         let result = stream.read(&mut chunk);
         if remaining(deadline).is_none() {
             return Err(deadline_error());
@@ -330,11 +394,19 @@ fn read_all_capped_before_deadline<S: DeadlineStream>(
                 "response too long",
             ));
         }
+        seen += chunk[..n]
+            .iter()
+            .map(|&b| usize::from(b == b'\n'))
+            .sum::<usize>();
+        if seen >= lines {
+            break;
+        }
     }
     Ok(buf)
 }
 
-fn remaining(deadline: Instant) -> Option<Duration> {
+#[doc(hidden)]
+pub fn remaining(deadline: Instant) -> Option<Duration> {
     let now = Instant::now();
     (deadline > now).then(|| deadline - now)
 }
@@ -368,8 +440,16 @@ fn current_dir_string() -> String {
         .unwrap_or_default()
 }
 
+/// The process environment (UTF-8 entries only), sent so the daemon can run `env`-forwarding
+/// badges with it.
+fn current_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 /// Parses `get`'s argv (`<badge>... [--cwd <path>]`), shared by `stfg` and `stfgd get`.
-pub fn parse_get_args(mut args: impl Iterator<Item = String>) -> (Vec<String>, Option<String>) {
+fn parse_get_args(mut args: impl Iterator<Item = String>) -> (Vec<String>, Option<String>) {
     let mut badges = Vec::new();
     let mut cwd = None;
     while let Some(arg) = args.next() {
@@ -382,12 +462,35 @@ pub fn parse_get_args(mut args: impl Iterator<Item = String>) -> (Vec<String>, O
     (badges, cwd)
 }
 
+/// The cwd to send: `cwd` if given, else the process cwd so path-scoped (git) badges work
+/// without an explicit `--cwd`, matching how starship invokes `get <badge>` in the prompt's
+/// dir. No canonicalize. Inline on Linux: `getcwd(2)` reads the dentry cache, not the
+/// filesystem, so it can't hang on a dead mount.
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the non-Linux body"
+)]
+fn initial_cwd(cwd: Option<&str>, _deadline: Instant) -> Option<String> {
+    Some(cwd.map_or_else(current_dir_string, str::to_string))
+}
+
+/// Elsewhere (macOS `getcwd(3)` may `open(".")` and ask the filesystem) the process cwd is
+/// read under the deadline instead.
+#[cfg(not(target_os = "linux"))]
+fn initial_cwd(cwd: Option<&str>, deadline: Instant) -> Option<String> {
+    cwd.map_or_else(
+        || run_before_deadline(deadline, current_dir_string),
+        |cwd| Some(cwd.to_string()),
+    )
+}
+
 /// `stfgd get`/`stfg` hot path: always returns exactly `badges.len()`
 /// strings, empty on any failure, never panics, never writes to stderr. Only a missing
 /// runtime dir or `ENOENT`/`ECONNREFUSED` (no daemon, stale socket) spawns a new one; a
 /// busy (full backlog on Linux) or unresponsive daemon, or an untrusted runtime dir, does
 /// not, per the design.
-pub fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
+fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
     let timeout_ms: u64 = std::env::var("STAR_FORGE_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -395,21 +498,10 @@ pub fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let empty = || vec![String::new(); badges.len()];
 
-    // Default to the process cwd so path-scoped (git) badges work without an explicit
-    // --cwd, matching how starship invokes `get <badge>` in the prompt's dir. No
-    // canonicalize. Inline on Linux: `getcwd(2)` reads the dentry cache, not the filesystem,
-    // so it can't hang on a dead mount. Elsewhere (macOS `getcwd(3)` may `open(".")` and
-    // ask the filesystem) it runs under the deadline instead.
-    #[cfg(target_os = "linux")]
-    let cwd = cwd.map_or_else(current_dir_string, str::to_string);
-    #[cfg(not(target_os = "linux"))]
-    let Some(cwd) = cwd.map_or_else(
-        || run_before_deadline(deadline, current_dir_string),
-        |cwd| Some(cwd.to_string()),
-    ) else {
+    let Some(cwd) = initial_cwd(cwd, deadline) else {
         return empty();
     };
-    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges) else {
+    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, &current_env()) else {
         return empty();
     };
 
@@ -427,30 +519,34 @@ pub fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
         return empty();
     }
 
-    read_all_capped_before_deadline(&mut stream, MAX_RESPONSE_BYTES, deadline).map_or_else(
-        |_| empty(),
-        |buf| {
-            String::from_utf8(buf)
-                .map_or_else(|_| empty(), |body| parse_response(&body, badges.len()))
-        },
-    )
+    read_all_capped_before_deadline(&mut stream, badges.len(), MAX_RESPONSE_BYTES, deadline)
+        .map_or_else(
+            |_| empty(),
+            |buf| {
+                String::from_utf8(buf)
+                    .map_or_else(|_| empty(), |body| parse_response(&body, badges.len()))
+            },
+        )
 }
 
-/// Writes one line per value to stdout in a single `write(2)`, ignoring errors (e.g.
-/// `EPIPE` from a closed pipe) — the hot path always exits 0 and never touches stderr.
-pub fn print_values(values: &[String]) {
+/// Writes one line per value to stdout in a single `write_all`, ignoring errors (e.g.
+/// `EPIPE` from a closed pipe: Rust ignores `SIGPIPE`) — the hot path always exits 0 and
+/// never touches stderr.
+fn print_values(values: &[String]) {
     let mut buf = String::new();
     for v in values {
         buf.push_str(v);
         buf.push('\n');
     }
-    let bytes = buf.as_bytes();
-    // SAFETY: fd 1 (stdout) is always a valid fd for a normal process; `bytes` is a live
-    // slice for the duration of the call. The return value (short write/error, e.g.
-    // EPIPE) is deliberately ignored.
-    unsafe {
-        libc::write(1, bytes.as_ptr().cast(), bytes.len());
-    }
+    let _ = io::stdout().lock().write_all(buf.as_bytes());
+}
+
+/// CLI entry shared by `stfg` and `stfgd get`: `<badge>... [--cwd <path>]`, prints one line
+/// per badge, always succeeds.
+pub fn run_cli(args: impl Iterator<Item = String>) {
+    let (badges, cwd) = parse_get_args(args);
+    let values = client_get(&badges, cwd.as_deref());
+    print_values(&values);
 }
 
 #[cfg(test)]
@@ -561,7 +657,7 @@ mod tests {
     #[test]
     fn encode_request_joins_fields_with_unit_separator() {
         let badges = vec!["git_branch".to_string(), "git_status".to_string()];
-        let req = encode_request("0.1.0", "/home/u/proj", &badges).unwrap();
+        let req = encode_request("0.1.0", "/home/u/proj", &badges, &[]).unwrap();
         assert_eq!(
             req,
             "get\u{1f}0.1.0\u{1f}/home/u/proj\u{1f}git_branch\u{1f}git_status\n"
@@ -570,25 +666,61 @@ mod tests {
 
     #[test]
     fn encode_request_handles_no_badges() {
-        let req = encode_request("0.1.0", "/tmp", &[]).unwrap();
+        let req = encode_request("0.1.0", "/tmp", &[], &[]).unwrap();
+        assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\n");
+    }
+
+    #[test]
+    fn encode_request_appends_env_block_after_badges() {
+        let env = [
+            ("PATH".to_string(), "/a:/b".to_string()),
+            ("BAD".to_string(), "x\ny".to_string()),
+            ("A=B".to_string(), "v".to_string()),
+            ("FOO".to_string(), "bar=baz".to_string()),
+        ];
+        let req = encode_request("0.1.0", "/tmp", &["n".to_string()], &env).unwrap();
+        assert_eq!(
+            req,
+            "get\u{1f}0.1.0\u{1f}/tmp\u{1f}n\u{1f}\u{1e}env\u{1f}PATH=/a:/b\u{1f}FOO=bar=baz\n"
+        );
+    }
+
+    #[test]
+    fn encode_request_skips_oversized_entries_and_drops_an_oversized_block() {
+        let big = "x".repeat(MAX_ENV_ENTRY_BYTES);
+        let env = [
+            ("BIG".to_string(), big),
+            ("PATH".to_string(), "/a".to_string()),
+        ];
+        let req = encode_request("0.1.0", "/tmp", &[], &env).unwrap();
+        assert_eq!(
+            req,
+            "get\u{1f}0.1.0\u{1f}/tmp\u{1f}\u{1e}env\u{1f}PATH=/a\n"
+        );
+
+        // Many individually fine entries that together exceed the line cap: block dropped.
+        let many: Vec<_> = (0..40)
+            .map(|i| (format!("V{i}"), "y".repeat(MAX_ENV_ENTRY_BYTES - 8)))
+            .collect();
+        let req = encode_request("0.1.0", "/tmp", &[], &many).unwrap();
         assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\n");
     }
 
     #[test]
     fn encode_request_rejects_newline_in_cwd() {
-        assert!(encode_request("0.1.0", "/tmp/evil\ninjected", &[]).is_none());
+        assert!(encode_request("0.1.0", "/tmp/evil\ninjected", &[], &[]).is_none());
     }
 
     #[test]
     fn encode_request_rejects_field_separator_in_badge() {
         let badges = vec!["a\u{1f}b".to_string()];
-        assert!(encode_request("0.1.0", "/tmp", &badges).is_none());
+        assert!(encode_request("0.1.0", "/tmp", &badges, &[]).is_none());
     }
 
     #[test]
     fn encode_request_rejects_newline_in_badge() {
         let badges = vec!["a\nb".to_string()];
-        assert!(encode_request("0.1.0", "/tmp", &badges).is_none());
+        assert!(encode_request("0.1.0", "/tmp", &badges, &[]).is_none());
     }
 
     #[test]
@@ -638,6 +770,7 @@ mod tests {
 
         let err = read_all_capped_before_deadline(
             &mut stream,
+            usize::MAX,
             MAX_RESPONSE_BYTES,
             Instant::now() + Duration::from_millis(40),
         )
@@ -664,6 +797,7 @@ mod tests {
 
         let body = read_all_capped_before_deadline(
             &mut client,
+            usize::MAX,
             MAX_RESPONSE_BYTES,
             Instant::now() + Duration::from_secs(1),
         )
@@ -673,11 +807,30 @@ mod tests {
     }
 
     #[test]
+    fn reply_returns_after_the_expected_lines_without_waiting_for_eof() {
+        let (mut daemon, mut client) = UnixStream::pair().unwrap();
+        io::Write::write_all(&mut daemon, b"main\nok\n").unwrap();
+
+        // `daemon` stays open: only the line count can end this read.
+        let body = read_all_capped_before_deadline(
+            &mut client,
+            2,
+            MAX_RESPONSE_BYTES,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(body, b"main\nok\n");
+        drop(daemon);
+    }
+
+    #[test]
     fn stalled_response_times_out() {
         let mut stream = FakeDeadlineStream::with_reads([ReadAction::Stall]);
 
         let err = read_all_capped_before_deadline(
             &mut stream,
+            usize::MAX,
             MAX_RESPONSE_BYTES,
             Instant::now() + Duration::from_millis(20),
         )
@@ -702,6 +855,7 @@ mod tests {
 
         let response = read_all_capped_before_deadline(
             &mut stream,
+            usize::MAX,
             MAX_RESPONSE_BYTES,
             Instant::now() + Duration::from_secs(1),
         )
@@ -780,9 +934,8 @@ mod tests {
 
     #[test]
     fn nonblocking_connect_reports_notrunning_on_missing_socket() {
-        let dir = std::env::temp_dir().join(format!("sf-client-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sock = dir.join("does-not-exist");
+        let dir = crate::test_support::TempDir::new("client-missing");
+        let sock = dir.path().join("does-not-exist");
         assert!(matches!(connect_nonblocking(&sock), Connect::NotRunning));
     }
 
@@ -792,8 +945,8 @@ mod tests {
         let set_mode = |path: &Path, mode| {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         };
-        let root = std::env::temp_dir().join(format!("sf-client-private-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root_tmp = crate::test_support::TempDir::new("client-private");
+        let root = root_tmp.path().to_path_buf();
         let dir = root.join("star-forge");
         let missing = runtime_dir_is_private(&dir).unwrap_err().kind();
 
@@ -807,7 +960,6 @@ mod tests {
         let readable = runtime_dir_is_private(&dir).unwrap();
         set_mode(&dir, 0o777);
         let writable = runtime_dir_is_private(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(missing, io::ErrorKind::NotFound);
         assert!(private, "an owned 0700 dir is trusted");
@@ -836,11 +988,8 @@ mod tests {
     #[allow(clippy::collection_is_never_read)]
     #[test]
     fn nonblocking_connect_fails_fast_without_blocking_on_full_backlog() {
-        let dir = std::env::temp_dir().join(format!("sf-client-backlog-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("sock");
-        // A panicked earlier run with the same pid may have left its socket behind.
-        let _ = std::fs::remove_file(&sock);
+        let dir = crate::test_support::TempDir::new("client-backlog");
+        let sock = dir.path().join("sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         // std listens with a large backlog (`net.core.somaxconn` on Linux), which can exceed
         // the fd limit; `EMFILE` would then masquerade as a full backlog. Shrink it to 1 so a
@@ -872,7 +1021,6 @@ mod tests {
         let outcome = connect_nonblocking(&sock);
         let elapsed = deadline_start.elapsed();
         drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
             elapsed < Duration::from_millis(100),

@@ -1,9 +1,8 @@
-//! CLI parsing and dispatch for `stfgd` (daemon + admin commands, plus a `get` that
-//! delegates to the shared client); client-side commands are synchronous, the daemon is
-//! not started here directly (see `daemon::run`).
+//! Entry point for `stfgd`: `daemon` runs the server (`daemon::run`); `status`/`stop`/`reload`
+//! are admin clients over the socket, with LSB exit codes when the daemon isn't running (see
+//! `NOT_RUNNING_*`); `get` delegates to the shared client.
 
 mod blocking;
-mod cache;
 mod client;
 mod config;
 mod daemon;
@@ -12,8 +11,16 @@ mod extract;
 mod ipc;
 mod provider;
 mod template;
+#[cfg(test)]
+mod test_support;
 
 use std::time::Duration;
+
+/// LSB init-script exit codes (also used by `systemctl`) for a daemon that isn't running:
+/// `status` → 3, `reload` → 7; `stop` of a stopped daemon is a success (0). A daemon that's
+/// there but doesn't answer is a generic failure (1).
+const NOT_RUNNING_STATUS: i32 = 3;
+const NOT_RUNNING_RELOAD: i32 = 7;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -26,8 +33,8 @@ fn main() {
         "get" => cmd_get(args),
         "daemon" => daemon::run(),
         "status" => cmd_status(),
-        "stop" => cmd_admin("stop"),
-        "reload" => cmd_admin("reload"),
+        "stop" => cmd_admin("stop", 0),
+        "reload" => cmd_admin("reload", NOT_RUNNING_RELOAD),
         other => {
             eprintln!("stfgd: unknown command {other:?}");
             std::process::exit(1);
@@ -38,26 +45,39 @@ fn main() {
 /// The hot path: always exits 0, one line per requested badge, never writes to stderr.
 /// Same implementation as `stfg` (see `client.rs`).
 fn cmd_get(args: impl Iterator<Item = String>) {
-    let (badges, cwd) = client::parse_get_args(args);
-    let values = client::client_get(&badges, cwd.as_deref());
-    client::print_values(&values);
+    client::run_cli(args);
 }
 
 fn cmd_status() {
     match ipc::client_admin("status", Duration::from_secs(1)) {
-        Some(resp) => println!(
+        Ok(resp) => println!(
             "{}",
             resp.values
                 .get("status")
                 .map_or("(no badges queried yet)", String::as_str)
         ),
-        None => eprintln!("stfgd: daemon not running"),
+        Err(e) => admin_failed(e, NOT_RUNNING_STATUS),
     }
 }
 
-fn cmd_admin(cmd: &str) {
+/// Exits with `not_running_code` if no daemon is listening, else with 1 (generic failure,
+/// e.g. a hung daemon): a `stop` that couldn't reach a live daemon must not report success.
+fn admin_failed(err: ipc::AdminError, not_running_code: i32) {
+    match err {
+        ipc::AdminError::NotRunning => {
+            eprintln!("stfgd: daemon not running");
+            std::process::exit(not_running_code);
+        }
+        ipc::AdminError::NoResponse => {
+            eprintln!("stfgd: daemon not responding");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_admin(cmd: &str, not_running_code: i32) {
     match ipc::client_admin(cmd, Duration::from_secs(1)) {
-        Some(_) => println!("stfgd: {cmd} ok"),
-        None => eprintln!("stfgd: daemon not running"),
+        Ok(_) => println!("stfgd: {cmd} ok"),
+        Err(e) => admin_failed(e, not_running_code),
     }
 }

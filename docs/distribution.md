@@ -22,7 +22,10 @@ archives contain:
 - `COPYING`
 - `THIRD_PARTY_NOTICES.md`
 
-The `x86_64-unknown-linux-musl` archive is the same layout with statically linked binaries (no
+The `stfg` in the gnu tarball, `deb` and `rpm` is itself a static musl build (the release job
+builds it with `--no-default-features --bin stfg --target x86_64-unknown-linux-musl` right after
+the main build and installs it over the gnu one), so it never loads libc. The
+`x86_64-unknown-linux-musl` archive is the same layout with statically linked binaries (no
 libc or `libgcc_s` to load). It is published only as a `tar.gz`; there is no `deb`/`rpm`. Choose it
 when you want the fastest `stfg` startup (a dynamic binary spends roughly 200 µs per call on
 loading and runtime init), or on a distro without a compatible glibc (Alpine, old LTS). Otherwise
@@ -97,7 +100,8 @@ The release flow:
 2. `release-plz update` edits the next version and `CHANGELOG.md` in the workflow checkout.
 3. The workflow commits that release bump directly back to `master` (`[skip ci]`).
 4. `release-plz release` creates the tag, publishes to crates.io, and creates the GitHub release.
-5. The same workflow builds the optimized Linux binaries once.
+5. The same workflow builds the optimized Linux binaries once, then replaces `stfg` with the
+   static musl build of `stfg`.
 6. It assembles the Linux binary tarball.
 7. It builds `deb` via `cargo-deb` and `rpm` via `cargo-generate-rpm`.
 8. It verifies both packages contain the binaries, docs, notices, and the user unit.
@@ -123,6 +127,10 @@ on a PAT to trigger a second workflow.
 OIDC. That token is passed to release-plz through `CARGO_REGISTRY_TOKEN`; no long-lived Cargo
 registry secret is stored in the repository.
 
+The repository is a single `star-forge` crate (the daemon shuts itself down when a client
+reports a different version). The `daemon` feature (default) gates the daemon's dependencies, so
+`--no-default-features --bin stfg` builds a client that compiles only `libc`.
+
 Trusted publishing cannot create a brand-new crate. Publish the first version manually, then
 configure trusted publishing on crates.io for subsequent releases:
 
@@ -132,7 +140,7 @@ configure trusted publishing on crates.io for subsequent releases:
    cargo publish --locked
    ```
 
-2. Open the `star-forge` crate settings on crates.io.
+2. Open the crate's settings on crates.io.
 3. Add a trusted publisher with:
    - Publisher: `GitHub`
    - Repository owner: `SkeLLLa`

@@ -36,6 +36,7 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy --no-default-features --all-targets -- -D warnings
           cargo test
           RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 
@@ -62,7 +63,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -70,10 +70,8 @@ jobs:
         with:
           key: musl
       - name: Build
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
-          cargo build --locked --target x86_64-unknown-linux-musl
+          cargo build --locked --no-default-features --bin stfg --target x86_64-unknown-linux-musl
           file target/x86_64-unknown-linux-musl/debug/stfg | grep -q static
 
   nix:

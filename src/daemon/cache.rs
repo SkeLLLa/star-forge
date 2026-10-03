@@ -1,6 +1,6 @@
 //! Cache key/entry types and the pure scheduling math (activity window, backoff,
 //! coalescing, eviction). The `HashMap<Key, Entry>` itself lives in a `std::sync::Mutex`
-//! owned by `daemon.rs`, never held across `.await`.
+//! owned by `daemon/mod.rs`, never held across `.await`.
 //!
 //! The idea of serving prompt/statusline calls from a daemon-held cache instead of
 //! recomputing them per call comes from [beachcomber](https://github.com/NavistAu/beachcomber);
@@ -18,8 +18,43 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::BadgeConfig;
 use crate::provider::GitFingerprint;
 
-/// `None` path = a global badge; `Some(root)` = a git-root-scoped badge.
-pub type Key = (String, Option<PathBuf>);
+/// Combined `daemon::file_id` of a badge's `watch` paths (a missing file is `None`).
+pub type WatchFp = Vec<Option<super::reload::FileId>>;
+
+/// The `env` variables (name, value) a command badge was run with, sorted by name. `None` =
+/// no env from the client (old client, or a badge without `env`): the daemon's env. `Some`
+/// (even empty) = the client sent its env: matching daemon variables it lacks are unset.
+pub type EnvKey = Option<Vec<(String, String)>>;
+
+/// Cache key. `root: None` = a global badge; `Some(root)` = a git-/project-root-scoped
+/// badge. An env selection makes the key per-env-value (see [`Key::is_scoped`]).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct Key {
+    pub badge: String,
+    pub root: Option<PathBuf>,
+    pub env: EnvKey,
+}
+
+impl Key {
+    pub fn new(badge: impl Into<String>, root: Option<PathBuf>, env: EnvKey) -> Self {
+        Self {
+            badge: badge.into(),
+            root,
+            env,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn global(name: &str) -> Self {
+        Self::new(name, None, None)
+    }
+
+    /// Scoped keys are only refreshed on request and LRU-evicted: path-scoped or env-keyed
+    /// ones (env values come from clients, so their number is unbounded like paths).
+    pub const fn is_scoped(&self) -> bool {
+        self.root.is_some() || self.env.is_some()
+    }
+}
 
 #[derive(Debug)]
 pub struct Entry {
@@ -34,11 +69,13 @@ pub struct Entry {
     pub next_attempt: Instant,
     pub in_flight: bool,
     /// `.git/HEAD` + `.git/index` mtimes as of the last fetch this entry *started* (set when
-    /// `should_spawn` fires, see `daemon::handle_get`); `None` for badges that don't use
+    /// [`plan`] decides to spawn); `None` for badges that don't use
     /// fingerprint invalidation (everything but `git_status`/`git_counts`). A later `get`
     /// whose freshly-read fingerprint differs forces the entry stale+cold, so the fetch that
     /// picks up the repo change lands in the same prompt instead of waiting out `interval`.
     pub fingerprint: Option<GitFingerprint>,
+    /// Same idea for a badge's `watch` files, taken when the last fetch started.
+    pub watch: Option<WatchFp>,
 }
 
 impl Entry {
@@ -52,6 +89,7 @@ impl Entry {
             next_attempt: now,
             in_flight: false,
             fingerprint: None,
+            watch: None,
         }
     }
 }
@@ -82,9 +120,9 @@ pub fn is_active(last_access: Instant, active_window: Duration, now: Instant) ->
     now.saturating_duration_since(last_access) < active_window
 }
 
-/// `pub(crate)`: also used by `daemon::handle_get`'s request-time staleness check, which
-/// must use the same AC-aware interval the timer path uses (not always `cfg.interval`).
-pub(crate) const fn effective_interval(cfg: &BadgeConfig, on_ac: bool) -> Duration {
+/// The AC-aware interval, shared by the timer path (`due_at`) and the request-time
+/// staleness check in `handler::handle_get` (not always `cfg.interval`).
+pub const fn effective_interval(cfg: &BadgeConfig, on_ac: bool) -> Duration {
     if on_ac {
         cfg.interval
     } else {
@@ -101,10 +139,10 @@ fn due_at(
     on_ac: bool,
     now: Instant,
 ) -> Option<Instant> {
-    if key.1.is_some() || entry.in_flight {
+    if key.is_scoped() || entry.in_flight {
         return None;
     }
-    let cfg = badges.get(&key.0)?;
+    let cfg = badges.get(&key.badge)?;
     let interval = effective_interval(cfg, on_ac);
     if !is_active(entry.last_access, cfg.active_window, now) {
         return None;
@@ -146,12 +184,60 @@ pub fn due_keys(
         .collect()
 }
 
+/// What `handle_get` must do after [`plan`] for one requested badge.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FetchPlan {
+    /// Start a fetch (the entry is already marked `in_flight`).
+    pub spawn: bool,
+    /// The caller should wait (bounded) for that fetch: there is no value yet, or the
+    /// fingerprint/watch changed.
+    pub cold: bool,
+}
+
+/// Request-time state machine for one badge (pure: no I/O, no spawning). Marks the entry
+/// accessed, decides whether a fetch is due and, if so, flags it `in_flight` and records the
+/// fingerprint/watch the fetch will see.
+///
+/// A fingerprint/watch change since the fetch that produced the current value started forces
+/// both stale and cold, so the refresh lands in the same prompt instead of waiting out
+/// `interval` (unstaged worktree edits touch neither `.git/HEAD` nor `.git/index`, so they
+/// still only surface on `interval`; `watch` files work the same way, e.g. `.nvmrc`).
+pub fn plan(
+    entry: &mut Entry,
+    now: Instant,
+    interval: Duration,
+    fingerprint: Option<GitFingerprint>,
+    watch: Option<&WatchFp>,
+) -> FetchPlan {
+    entry.last_access = now;
+    let changed = fingerprint.is_some_and(|fp| entry.fingerprint.is_some_and(|prev| prev != fp))
+        || watch.is_some_and(|w| entry.watch.as_ref().is_some_and(|prev| prev != w));
+    let stale = changed
+        || entry
+            .fetched_at
+            .is_none_or(|t| now.duration_since(t) >= interval);
+    let spawn = stale && !entry.in_flight && now >= entry.next_attempt;
+    if spawn {
+        entry.in_flight = true;
+        if let Some(fp) = fingerprint {
+            entry.fingerprint = Some(fp);
+        }
+        if let Some(w) = watch {
+            entry.watch = Some(w.clone());
+        }
+    }
+    FetchPlan {
+        spawn,
+        cold: changed || entry.value.is_none(),
+    }
+}
+
 /// Drops path-scoped keys idle for `path_evict`. Global keys are never evicted. Split out
 /// from `evict` so the request path can run just this half, throttled (see
 /// `daemon::maybe_evict_idle`), without repeating the LRU cap scan done on every insert.
 pub fn evict_idle(cache: &mut HashMap<Key, Entry>, path_evict: Duration, now: Instant) {
     cache.retain(|key, entry| {
-        key.1.is_none() || now.saturating_duration_since(entry.last_access) < path_evict
+        !key.is_scoped() || now.saturating_duration_since(entry.last_access) < path_evict
     });
 }
 
@@ -161,7 +247,7 @@ pub fn evict_idle(cache: &mut HashMap<Key, Entry>, path_evict: Duration, now: In
 pub fn enforce_path_scoped_cap(cache: &mut HashMap<Key, Entry>, max_paths: usize) {
     let mut path_scoped: Vec<(Key, Instant)> = cache
         .iter()
-        .filter(|(key, _)| key.1.is_some())
+        .filter(|(key, _)| key.is_scoped())
         .map(|(k, e)| (k.clone(), e.last_access))
         .collect();
     if path_scoped.len() <= max_paths {
@@ -192,7 +278,7 @@ pub fn evict(
 #[allow(clippy::unchecked_time_subtraction)]
 mod tests {
     use super::*;
-    use crate::config::Source;
+    use std::path::Path;
 
     const MAX_PATH_SCOPED_KEYS: usize = 256;
     const PATH_SCOPED_IDLE_EVICT: Duration = Duration::from_secs(30 * 60);
@@ -201,18 +287,10 @@ mod tests {
 
     fn cfg(interval: Duration, battery_interval: Duration, active_window: Duration) -> BadgeConfig {
         BadgeConfig {
-            source: Source::Command {
-                command: "true".into(),
-                args: None,
-            },
-            extract: None,
-            format: "{value}".into(),
             interval,
             battery_interval,
             active_window,
-            timeout: Duration::from_secs(2),
-            max_output: 1024,
-            scope: crate::config::Scope::Global,
+            ..crate::config::test_badge()
         }
     }
 
@@ -279,16 +357,16 @@ mod tests {
         let mut cache = HashMap::new();
         let mut e_a = Entry::new(now - Duration::from_secs(100));
         e_a.fetched_at = Some(now - Duration::from_secs(100));
-        cache.insert(("a".to_string(), None), e_a);
+        cache.insert(Key::global("a"), e_a);
 
         let mut e_b_inflight = Entry::new(now);
         e_b_inflight.fetched_at = Some(now);
         e_b_inflight.in_flight = true;
-        cache.insert(("b".to_string(), None), e_b_inflight);
+        cache.insert(Key::global("b"), e_b_inflight);
 
         let mut e_path = Entry::new(now);
         e_path.fetched_at = Some(now - Duration::from_secs(1000));
-        cache.insert(("a".to_string(), Some(PathBuf::from("/repo"))), e_path);
+        cache.insert(Key::new("a", Some(PathBuf::from("/repo")), None), e_path);
 
         let due = next_due(&cache, &badges, true, now);
         assert_eq!(
@@ -312,7 +390,7 @@ mod tests {
         let mut cache = HashMap::new();
         let mut e = Entry::new(now);
         e.fetched_at = Some(now);
-        cache.insert(("a".to_string(), None), e);
+        cache.insert(Key::global("a"), e);
 
         let on_ac = next_due(&cache, &badges, true, now).unwrap();
         let on_batt = next_due(&cache, &badges, false, now).unwrap();
@@ -327,15 +405,12 @@ mod tests {
         let mut entry = Entry::new(now);
         entry.errors = 1;
         entry.next_attempt = now + Duration::from_secs(2);
-        let mut cache = HashMap::from([(("a".to_string(), None), entry)]);
+        let mut cache = HashMap::from([(Key::global("a"), entry)]);
         assert_eq!(
             next_due(&cache, &badges, true, now),
             Some(now + Duration::from_secs(2))
         );
-        cache
-            .get_mut(&("a".to_string(), None))
-            .unwrap()
-            .next_attempt = now;
+        cache.get_mut(&Key::global("a")).unwrap().next_attempt = now;
         assert_eq!(next_due(&cache, &badges, true, now), Some(now));
     }
 
@@ -348,11 +423,11 @@ mod tests {
         let mut cache = HashMap::new();
         let mut e_a = Entry::new(now - Duration::from_secs(10));
         e_a.fetched_at = Some(now - Duration::from_secs(10));
-        cache.insert(("a".to_string(), None), e_a);
+        cache.insert(Key::global("a"), e_a);
         // b becomes due half a second after a -- within the 1s coalescing window.
         let mut e_b = Entry::new(now - Duration::from_secs(10));
         e_b.fetched_at = Some(now - Duration::from_millis(9500));
-        cache.insert(("b".to_string(), None), e_b);
+        cache.insert(Key::global("b"), e_b);
 
         let due = due_keys(&cache, &badges, true, Duration::from_secs(1), now);
         assert_eq!(due.len(), 2);
@@ -367,28 +442,147 @@ mod tests {
         let mut cache = HashMap::new();
         let mut e_a = Entry::new(now - Duration::from_secs(10));
         e_a.fetched_at = Some(now - Duration::from_secs(10));
-        cache.insert(("a".to_string(), None), e_a);
+        cache.insert(Key::global("a"), e_a);
         let mut e_b = Entry::new(now - Duration::from_secs(10));
         e_b.fetched_at = Some(now - Duration::from_millis(9500));
-        cache.insert(("b".to_string(), None), e_b);
+        cache.insert(Key::global("b"), e_b);
 
         // A tighter-than-default coalesce window (500ms) no longer catches the 500ms gap.
         let due = due_keys(&cache, &badges, true, Duration::from_millis(100), now);
         assert_eq!(due.len(), 1);
     }
 
+    fn warm_entry(now: Instant) -> Entry {
+        let mut e = Entry::new(now);
+        e.value = Some("v".into());
+        e.fetched_at = Some(now);
+        e
+    }
+
+    const IV: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn plan_fresh_entry_does_nothing_but_touch() {
+        let now = Instant::now();
+        let mut e = warm_entry(now - Duration::from_secs(5));
+        e.last_access = now - Duration::from_secs(100);
+        assert_eq!(
+            plan(&mut e, now, IV, None, None),
+            FetchPlan {
+                spawn: false,
+                cold: false
+            }
+        );
+        assert_eq!(e.last_access, now);
+        assert!(!e.in_flight);
+    }
+
+    #[test]
+    fn plan_stale_warm_spawns_without_cold_wait() {
+        let now = Instant::now();
+        let mut e = warm_entry(now - IV);
+        assert_eq!(
+            plan(&mut e, now, IV, None, None),
+            FetchPlan {
+                spawn: true,
+                cold: false
+            }
+        );
+        assert!(e.in_flight);
+        // Same entry, shorter (battery-style) interval vs. a longer one.
+        let mut e = warm_entry(now - Duration::from_secs(5));
+        assert!(!plan(&mut e, now, IV, None, None).spawn);
+        assert!(plan(&mut e, now, Duration::from_secs(1), None, None).spawn);
+    }
+
+    #[test]
+    fn plan_new_entry_is_cold_and_spawns() {
+        let now = Instant::now();
+        let mut e = Entry::new(now);
+        assert_eq!(
+            plan(&mut e, now, IV, None, None),
+            FetchPlan {
+                spawn: true,
+                cold: true
+            }
+        );
+    }
+
+    #[test]
+    fn plan_in_flight_or_backing_off_does_not_spawn() {
+        let now = Instant::now();
+        let mut e = Entry::new(now);
+        e.in_flight = true;
+        assert_eq!(
+            plan(&mut e, now, IV, None, None),
+            FetchPlan {
+                spawn: false,
+                cold: true
+            }
+        );
+        let mut e = Entry::new(now);
+        e.next_attempt = now + Duration::from_secs(2);
+        assert!(!plan(&mut e, now, IV, None, None).spawn);
+        assert!(!e.in_flight);
+        assert!(plan(&mut e, now + Duration::from_secs(2), IV, None, None).spawn);
+    }
+
+    #[test]
+    fn plan_fingerprint_change_forces_cold_refresh() {
+        let now = Instant::now();
+        let tmp = crate::test_support::TempDir::new("plan-fp");
+        std::fs::write(tmp.path().join("HEAD"), "x").unwrap();
+        let fp = crate::provider::git_fingerprint(tmp.path());
+        std::fs::write(tmp.path().join("index"), "x").unwrap();
+        let other = crate::provider::git_fingerprint(tmp.path());
+        assert_ne!(fp, other);
+        let mut e = warm_entry(now);
+        // First sight: nothing to compare against; fresh, so no spawn, nothing recorded.
+        assert!(!plan(&mut e, now, IV, Some(fp), None).spawn);
+        e.fingerprint = Some(fp);
+        assert!(!plan(&mut e, now, IV, Some(fp), None).spawn);
+        assert_eq!(
+            plan(&mut e, now, IV, Some(other), None),
+            FetchPlan {
+                spawn: true,
+                cold: true
+            }
+        );
+        assert_eq!(e.fingerprint, Some(other));
+    }
+
+    #[test]
+    fn plan_watch_change_forces_cold_refresh() {
+        let now = Instant::now();
+        let w1: WatchFp = vec![None];
+        let w2: WatchFp = vec![Some(
+            crate::daemon::reload::file_id(Path::new("/")).unwrap(),
+        )];
+        let mut e = warm_entry(now);
+        e.watch = Some(w1.clone());
+        assert!(!plan(&mut e, now, IV, None, Some(&w1)).spawn);
+        assert_eq!(
+            plan(&mut e, now, IV, None, Some(&w2)),
+            FetchPlan {
+                spawn: true,
+                cold: true
+            }
+        );
+        assert_eq!(e.watch, Some(w2));
+    }
+
     #[test]
     fn evict_drops_idle_path_scoped_and_caps_lru() {
         let now = Instant::now();
         let mut cache: HashMap<Key, Entry> = HashMap::new();
-        cache.insert(("g".to_string(), None), Entry::new(now));
+        cache.insert(Key::global("g"), Entry::new(now));
         cache.insert(
-            ("g".to_string(), Some(PathBuf::from("/stale"))),
+            Key::new("g", Some(PathBuf::from("/stale")), None),
             Entry::new(now - Duration::from_secs(31 * 60)),
         );
         for i in 0..300 {
             cache.insert(
-                ("g".to_string(), Some(PathBuf::from(format!("/r{i}")))),
+                Key::new("g", Some(PathBuf::from(format!("/r{i}"))), None),
                 Entry::new(now - Duration::from_secs(i)),
             );
         }
@@ -398,12 +592,12 @@ mod tests {
             MAX_PATH_SCOPED_KEYS,
             now,
         );
-        assert!(cache.contains_key(&("g".to_string(), None)));
-        assert!(!cache.contains_key(&("g".to_string(), Some(PathBuf::from("/stale")))));
-        let path_scoped = cache.keys().filter(|k| k.1.is_some()).count();
+        assert!(cache.contains_key(&Key::global("g")));
+        assert!(!cache.contains_key(&Key::new("g", Some(PathBuf::from("/stale")), None)));
+        let path_scoped = cache.keys().filter(|k| k.root.is_some()).count();
         assert_eq!(path_scoped, MAX_PATH_SCOPED_KEYS);
         // The most recently accessed (smallest i) survive.
-        assert!(cache.contains_key(&("g".to_string(), Some(PathBuf::from("/r0")))));
+        assert!(cache.contains_key(&Key::new("g", Some(PathBuf::from("/r0")), None)));
     }
 
     /// Mirrors what `handle_get` does on every new path-scoped key insert (design.md §4):
@@ -413,10 +607,10 @@ mod tests {
     fn enforce_path_scoped_cap_evicts_lru_immediately() {
         let now = Instant::now();
         let mut cache: HashMap<Key, Entry> = HashMap::new();
-        cache.insert(("g".to_string(), None), Entry::new(now));
+        cache.insert(Key::global("g"), Entry::new(now));
         for i in 0..MAX_PATH_SCOPED_KEYS {
             cache.insert(
-                ("g".to_string(), Some(PathBuf::from(format!("/r{i}")))),
+                Key::new("g", Some(PathBuf::from(format!("/r{i}"))), None),
                 Entry::new(now - Duration::from_secs(i as u64)),
             );
         }
@@ -425,20 +619,21 @@ mod tests {
         // One more path-scoped key inserted (simulating `handle_get`'s
         // `cache.entry(key).or_insert_with(...)`), over the cap by one.
         cache.insert(
-            ("g".to_string(), Some(PathBuf::from("/new"))),
+            Key::new("g", Some(PathBuf::from("/new")), None),
             Entry::new(now),
         );
         enforce_path_scoped_cap(&mut cache, MAX_PATH_SCOPED_KEYS);
 
-        let path_scoped = cache.keys().filter(|k| k.1.is_some()).count();
+        let path_scoped = cache.keys().filter(|k| k.root.is_some()).count();
         assert_eq!(path_scoped, MAX_PATH_SCOPED_KEYS);
         // The global key and the just-inserted (freshest) path-scoped key both survive;
         // the single least-recently-accessed one (largest i, oldest last_access) is gone.
-        assert!(cache.contains_key(&("g".to_string(), None)));
-        assert!(cache.contains_key(&("g".to_string(), Some(PathBuf::from("/new")))));
-        assert!(!cache.contains_key(&(
-            "g".to_string(),
-            Some(PathBuf::from(format!("/r{}", MAX_PATH_SCOPED_KEYS - 1)))
+        assert!(cache.contains_key(&Key::global("g")));
+        assert!(cache.contains_key(&Key::new("g", Some(PathBuf::from("/new")), None)));
+        assert!(!cache.contains_key(&Key::new(
+            "g",
+            Some(PathBuf::from(format!("/r{}", MAX_PATH_SCOPED_KEYS - 1))),
+            None
         )));
     }
 
@@ -448,7 +643,7 @@ mod tests {
         let mut cache: HashMap<Key, Entry> = HashMap::new();
         for i in 0..10u64 {
             cache.insert(
-                ("g".to_string(), Some(PathBuf::from(format!("/r{i}")))),
+                Key::new("g", Some(PathBuf::from(format!("/r{i}"))), None),
                 Entry::new(now - Duration::from_secs(i)),
             );
         }
@@ -460,19 +655,19 @@ mod tests {
     fn evict_idle_leaves_global_and_active_path_scoped_alone() {
         let now = Instant::now();
         let mut cache: HashMap<Key, Entry> = HashMap::new();
-        cache.insert(("g".to_string(), None), Entry::new(now));
+        cache.insert(Key::global("g"), Entry::new(now));
         cache.insert(
-            ("g".to_string(), Some(PathBuf::from("/fresh"))),
+            Key::new("g", Some(PathBuf::from("/fresh")), None),
             Entry::new(now),
         );
         cache.insert(
-            ("g".to_string(), Some(PathBuf::from("/stale"))),
+            Key::new("g", Some(PathBuf::from("/stale")), None),
             Entry::new(now - Duration::from_secs(31 * 60)),
         );
         evict_idle(&mut cache, PATH_SCOPED_IDLE_EVICT, now);
-        assert!(cache.contains_key(&("g".to_string(), None)));
-        assert!(cache.contains_key(&("g".to_string(), Some(PathBuf::from("/fresh")))));
-        assert!(!cache.contains_key(&("g".to_string(), Some(PathBuf::from("/stale")))));
+        assert!(cache.contains_key(&Key::global("g")));
+        assert!(cache.contains_key(&Key::new("g", Some(PathBuf::from("/fresh")), None)));
+        assert!(!cache.contains_key(&Key::new("g", Some(PathBuf::from("/stale")), None)));
     }
 
     #[test]
@@ -480,7 +675,7 @@ mod tests {
         let now = Instant::now();
         let mut cache: HashMap<Key, Entry> = HashMap::new();
         cache.insert(
-            ("g".to_string(), Some(PathBuf::from("/r"))),
+            Key::new("g", Some(PathBuf::from("/r")), None),
             Entry::new(now - Duration::from_secs(5)),
         );
         // A tight path_evict (1s) drops a key idle for 5s, unlike the 30-min default.

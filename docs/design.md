@@ -24,7 +24,7 @@ described in [`distribution.md`](distribution.md).
 | Platforms | Linux and macOS (aarch64, x86_64); `cfg(target_os)` picks the host-builtin backend, everything else is shared |
 | Builtins | `git_branch`, `git_status`, `git_counts` (`git status --porcelain=v2`, deduped per repo); `git_commit`/`git_state`/`git_stash` (in-process, no subprocess); `battery` (Linux `/sys/class/power_supply`; macOS `pmset -g batt` subprocess, bounded by `timeout`); `hostname` (`gethostname(3)`); `load_avg` (`getloadavg(3)`); `uptime` (Linux `CLOCK_BOOTTIME`; macOS `kern.boottime`); `mem_used_percent` (Linux `/proc/meminfo`; macOS `host_statistics64` + `hw.memsize`) |
 | Git freshness | `git_branch`/`git_commit`/`git_state`/`git_stash` computed in-process per request (no cache, no stale window); `git_status`/`git_counts` invalidate their cache entry on a `.git/HEAD`/`.git/index` mtime change instead of waiting out `interval` (see §5/§6) |
-| Cache scope | explicit `Scope { Global, GitRoot }` on every badge; git builtins require `GitRoot`, other sources can override their default |
+| Cache scope | explicit `Scope { Global, GitRoot, ProjectRoot }` on every badge; git builtins require `GitRoot`, other sources can override their default (`ProjectRoot` needs `markers`) |
 | Scheduling | demand-driven, one coalesced timer, dormant when unused (see §6) |
 
 ## 1. Process model & IPC
@@ -46,14 +46,14 @@ and shared by both binaries — see §3):
 1. Compute a deadline `now + 40ms` (`STAR_FORGE_TIMEOUT_MS` override).
 2. `lstat()` the runtime dir first: missing → spawn without connecting; anything but a real
    directory (not a symlink) owned by `getuid()` with no group/other write bits → print empty
-   lines, exit 0, never spawn (`status`/`stop`/`reload` report "daemon not running"). Then
-   connect via a non-blocking `socket(2)`/`connect(2)` (not `UnixStream::connect`): on Linux a
-   blocking `connect()` to an `AF_UNIX` socket blocks the caller when the listener's backlog is
-   full, which could blow through the 40 ms deadline; a non-blocking socket reports a full backlog
-   as an immediate `EAGAIN` instead (no `EINPROGRESS` — `AF_UNIX` has no handshake to wait out).
-   macOS reports a full backlog as `ECONNREFUSED`, so there it reads as "not running": the
-   spawned daemon loses the `flock` race and exits — one wasted spawn under overload, still
-   inside the deadline.
+   lines, exit 0, never spawn (`status`/`stop`/`reload` report "daemon not running"; LSB exit
+   codes 3/0/7, or 1 if a daemon is there but silent). Then connect via a non-blocking
+   `socket(2)`/`connect(2)` (not `UnixStream::connect`): on Linux a blocking `connect()` to an
+   `AF_UNIX` socket blocks the caller when the listener's backlog is full, which could blow
+   through the 40 ms deadline; a non-blocking socket reports a full backlog as an immediate
+   `EAGAIN` instead (no `EINPROGRESS` — `AF_UNIX` has no handshake to wait out). macOS reports a
+   full backlog as `ECONNREFUSED`, so there it reads as "not running": the spawned daemon loses
+   the `flock` race and exits — one wasted spawn under overload, still inside the deadline.
    `ENOENT`/`ECONNREFUSED` → spawn the daemon detached (below), print empty lines, exit 0. Any
    other error, including a full backlog → print empty lines, exit 0, **do not** spawn (a busy
    daemon doesn't need a second one racing it). On success, `O_NONBLOCK` is cleared and the fd is
@@ -120,6 +120,21 @@ get\x1f0.1.0\x1f/home/u/proj\x1fgit_branch\x1fgit_status\n
 ```
 
 fields: literal `get`, the client's `CARGO_PKG_VERSION`, cwd, then one field per badge name.
+Optionally the badges are followed by a `\x1eenv` field and the client's whole environment, one
+`NAME=value` field each (entries with `\n`/`\x1f`, or over 4 KiB, are skipped; if the block still
+would push the line past ~60 KiB it is omitted):
+
+```text
+get\x1f0.1.0\x1f/home/u/proj\x1fnode\x1f\x1eenv\x1fPATH=/a:/b\x1fMISE_SHELL=zsh\n
+```
+
+The client doesn't read the config (latency), so it can't know which variables a badge wants;
+the daemon filters per badge by its `env` allowlist (`select_env`). No block (an older client)
+means the daemon's own env (`Key::env = None`); a block, even one where nothing matches a badge's
+allowlist, is `Some(selection)` and makes `provider` `env_remove` every daemon variable matching
+the allowlist but absent from the selection, so an unset client variable doesn't leak.
+An older daemon reads the block as unknown badge names, whose
+lines the client drops (it keeps only as many lines as it asked for).
 If cwd or any badge name contains `\n`, `\r`, or `\x1f`, the client refuses to encode the request
 at all and prints empty lines without connecting (see `client::encode_request`). The daemon
 answers with exactly one line per requested badge, in the same order, then closes; a rendered
@@ -183,36 +198,64 @@ cost dominates a call) is covered in the README's "Batching calls" section.
 
 ## 3. Module layout
 
-- `src/main.rs` — CLI parsing and dispatch for the `stfgd` binary; `mod client;` for `get`.
-- `src/client.rs` — the entire `get` hot path (std + `libc` only: socket path resolution,
-  non-blocking connect, detached daemon spawn with sibling-binary/`PATH` lookup, the text wire
-  protocol's request encoding/response parsing, single buffered stdout write). Compiled into
-  `stfgd` via `main.rs`'s `mod client;`, and into `src/bin/stfg.rs` via
-  `#[path = "../client.rs"] mod client;` — one implementation, two binaries, no shared lib target.
-- `src/bin/stfg.rs` — the `stfg` binary: CLI parsing only, delegates
-  everything to `client.rs`. Links only std + `libc` (no tokio/serde/serde_json/regex/reqwest/toml);
+- `src/main.rs` — CLI parsing and dispatch for the `stfgd` binary; `get` calls `client::run_cli`.
+- `src/client.rs` — the module holding the
+  entire `get` hot path (std + `libc` only: socket path resolution, non-blocking connect,
+  detached daemon spawn with sibling-binary/`PATH` lookup, the text wire protocol's request
+  encoding/response parsing, single buffered stdout write). Its `run_cli` is the shared entry
+  point: `src/main.rs` declares it as a module (so `stfgd get` calls it) and `src/bin/stfg.rs`
+  includes it via `#[path]` — one implementation, one crate version (which the daemon's upgrade
+  check relies on).
+- `src/bin/stfg.rs` — the `stfg` binary (also provides `CARGO_BIN_EXE_stfg` to integration
+  tests): a `fn main()` that forwards argv to `run_cli`. Built with `--no-default-features`
+  (the `daemon` feature gates tokio/serde/serde_json/regex/reqwest/toml), it links only std + `libc`;
   see §9 for the size/latency payoff.
-- `src/config.rs` — `Config`, `DaemonConfig`, `BadgeConfig`, `Builtin`, `Source`, `Scope`,
+- `src/config/mod.rs` — `Config`, `DaemonConfig`, `BadgeConfig`, `Builtin`, `Source`, `Scope`,
   `Extract`; `load(path)`. Deserializes into `RawDaemonConfig`/`RawBadgeConfig` first (every
   timing field an `Option<String>` duration, `deny_unknown_fields`), then resolves each
   against its `[daemon]`/fixed default and parses durations via `duration::parse` (see §4).
   `Scope` resolves to its default (`GitRoot` for path-scoped builtins, `Global` otherwise)
   unless a non-git source sets `scope = "..."` explicitly. Git builtins reject `Global`.
+  `markers` is required with (and only valid for) `project_root`; `watch`/`when_file` reject
+  `Global`. All three are `command`-only (`PathOpts`), as is `env` (variable allowlist, trailing
+  `*` = prefix glob). `Builtin::ToolVersion` (`tool = node|python|rust|go|ruby`) never becomes
+  a `Source`: `RawBadgeConfig::into_parts` expands it to a `project_root` command badge
+  (`<tool> --version`, regex extract, per-tool `markers`/`watch`/`when_file`/`env` defaults,
+  each overridable). `command`/`args` (`tool_version`-only; rejected on other builtins)
+  override the version command; a custom `command` without `args` keeps command-badge
+  semantics (`sh -c`) rather than inheriting the default `--version` arg.
+  Version files aren't parsed: shims resolve them, `watch` invalidates.
+- `src/config/raw.rs` — `RawBadgeConfig` (serde-facing variants), `RawCommon`, the
+  `tool_version` expansion (`ToolOpts`, `expand_tool_version`), and
+  `into_parts`.
+- `src/config/builtin.rs` — pure types: `Builtin`, `BuiltinName`, `GitField`, and `Tool` with its
+  per-tool defaults.
 - `src/duration.rs` — hand-rolled `<integer><unit>` (`ms|s|m|h`) duration parser used for every
   timing knob; no derived formulas or multipliers anywhere in the crate.
-- `src/ipc.rs` — daemon-side wire types, paths (re-exported from `client.rs`), bounded line
+- `src/ipc.rs` — daemon-side wire types, paths (re-exported from `client`), bounded line
   readers, and the JSON admin (`status`/`stop`/`reload`) client. The `get` client lives entirely
-  in `client.rs`; nothing here duplicates it.
-- `src/daemon.rs` — setsid/chdir, flock, accept loop, request handling (dispatches JSON vs text
-  `get` by first byte, see §2), reload/stop, idle exit. `handle_get` intercepts the four
+  in `client`; nothing here duplicates it.
+- `src/daemon/mod.rs` — setsid/chdir, flock, accept loop, `Daemon` state, refresh scheduling
+  (`refresh_due`, `spawn_fetch`), stop, idle exit.
+- `src/daemon/reload.rs` — `FileId` stamps and the throttled config/palette reload check.
+- `src/daemon/handler.rs` — request handling (dispatches JSON vs text
+  `get` by first byte, see §2). `handle_get` intercepts the four
   in-process git builtins before they ever touch the cache (see §5/§6), and applies
-  request-time fingerprint invalidation for `git_status`/`git_counts`.
-- `src/cache.rs` — `Key`, `Entry` (incl. the `git_status`/`git_counts` fingerprint, see §4),
+  request-time fingerprint invalidation for `git_status`/`git_counts`. Also owns the `status`
+  output and config-error reporting.
+- `src/daemon/cache.rs` — `Key`, `Entry` (incl. the `git_status`/`git_counts` fingerprint, see §4),
   backoff, scheduling state (next-due computation, eviction), `effective_interval`
   (AC-aware; shared by the timer path and `handle_get`'s staleness check).
-- `src/provider.rs` — `run_with_timeout`, HTTP fetch, builtins, git root discovery,
-  in-process git file reads (`run_in_process_git`), `.git/HEAD`+`.git/index` fingerprinting
-  (`git_fingerprint`), and in-flight `git_counts` sharing (`porcelain_fetch`, see §5).
+- `src/provider/mod.rs` — `Shared`, `ProviderError`, `fetch`/`fetch_raw`, and the builtin
+  dispatch (`run_builtin`).
+- `src/provider/exec.rs` — `run_with_timeout` (process groups, byte cap) and HTTP fetch.
+- `src/provider/git.rs` — git root discovery, in-process git file reads
+  (`run_in_process_git`), `.git/HEAD`+`.git/index` fingerprinting (`git_fingerprint`), and
+  in-flight `git_counts` sharing (`porcelain_fetch`, see §5).
+- `src/provider/system/` — `mod.rs` (hostname, `load_avg`, per-OS dispatch via `use … as os`),
+  `linux.rs`, `macos.rs`, and `pmset.rs` (pure parsers, compiled on macOS and in tests).
+- `src/template.rs` — group `format` template parsing and tmux/ANSI rendering.
+- `src/test_support.rs` — test-only `TempDir`.
 - `src/blocking.rs` — four-slot admission for blocking work, absolute deadlines, and
   permits held until actual completion rather than released on waiter timeout.
 - `src/extract.rs` — trim/regex/json extraction + `{value}` template rendering.
@@ -256,11 +299,13 @@ struct BadgeConfig {
     timeout: Duration,           // badge value -> daemon.timeout
     max_output: usize,           // badge value -> daemon.max_output
     scope: Scope,                // badge `scope = "..."` -> default_scope(source), see below
+    path: PathOpts,              // command badges: markers (project_root), watch, when_file, env
 }
 
 // Default is GitRoot for a path-scoped builtin (`Builtin::is_path_scoped`), Global otherwise;
-// git builtins require GitRoot; other sources can override with "git_root" | "global".
-enum Scope { Global, GitRoot }
+// git builtins require GitRoot; other sources can override with "git_root" | "project_root" |
+// "global". ProjectRoot = nearest ancestor of cwd holding any of `path.markers`.
+enum Scope { Global, GitRoot, ProjectRoot }
 
 enum Builtin {
     GitBranch, GitStatus,
@@ -291,13 +336,20 @@ combine in serde, so each `Builtin`/`Command`/`Http` variant repeats the shared 
 (`format`, `interval`, `battery_interval`, `active_window`, `timeout`, `max_output`,
 `extract`) instead. `Config::load` then resolves every `Option<String>` against its
 `[daemon]` value or fixed default and parses it with `duration::parse`, and validates the
-result (`validate`, e.g. `retry_min <= retry_max`, `coalesce` below every resolved interval,
+result (`validate`, e.g. `retry_min > 0` and `<= retry_max`, non-zero `timeout`s,
+`max_paths >= 1`, `coalesce` below every resolved interval,
 `cold_wait` below the 40 ms client deadline) before returning — a config that fails to parse
 or validate is rejected wholesale; the caller (`daemon::check_reload`) keeps the previous
-config running.
+config running. The failure is also kept in `ConfigMeta` (logged once per distinct message) and
+shown as a trailing `config error: …` line in `stfgd status` until a later load succeeds. A
+duration that is empty or malformed is reported with the offending text (`invalid duration "": …`).
 
 ```rust
-type Key = (String /* badge */, Option<PathBuf> /* git root; None = global */);
+type Key = (
+    String,                  // badge
+    Option<PathBuf>,         // scope root; None = global
+    Option<Vec<(String, String)>>, // `env` selection from the client, sorted; None = daemon env
+);
 
 struct Entry {
     value: Option<String>,     // last GOOD rendered value; never cleared by a failure
@@ -392,7 +444,7 @@ no fetch. Regular git directories, directory symlinks, and worktree `gitdir:` fi
 refs/heads/<name>` line or lack thereof, check for `MERGE_HEAD`/`rebase-merge`/etc., count
 the stash reflog's lines via `commondir`-resolved shared git dir). Normally cheap enough to
 recompute from scratch on *every* `get`, but file reads can hang on remote mounts, so
-`daemon::handle_get` takes one worker snapshot of the requested git values and fingerprint
+`daemon::handler::handle_get` takes one worker snapshot of the requested git values and fingerprint
 before touching the cache or `provider::fetch`. These four badges never get a `cache::Entry`
 and have no stale-while-revalidate window or fs watcher. On timeout/saturation they render
 empty. `run_builtin`'s match arm for the same
@@ -433,6 +485,21 @@ Goal: near-zero wakeups when the user isn't looking at a prompt.
   "stale" means) and not backing off/in flight spawns a background refresh task and returns
   immediately. For path-scoped keys this is the only trigger — git state only needs
   refreshing when someone renders a prompt.
+- **`project_root`, `when_file`, `watch`.** All resolved in the same bounded blocking job as the
+  git root (`git_snapshot`/`resolve_scope`): `provider::project_root` walks up from cwd with
+  plain `stat`s (ending at `$HOME` or `/`; not cached, like `git_root`), then `when_file` is
+  checked in the root, then each `watch` path is reduced to `daemon::file_id` (the config-reload
+  fingerprint; a missing file is `None`). No root or unmet `when_file` renders empty and
+  creates no entry. The key is `(badge, root)`, so the `max_paths`/`path_evict` handling is the
+  one `git_root` uses. The watch fingerprint is stored in `Entry::watch` when a fetch starts; a
+  differing one on a later `get` forces stale+cold exactly like the git fingerprint, so the
+  refresh waits up to `cold_wait`.
+- **`env` forwarding.** `handle_get` selects, per badge, the client's variables matching its
+  `env` allowlist and puts them in the key (`Key::env`); `spawn_fetch` runs the command with them
+  added on top of the daemon's env. A key with a non-empty env counts as path-scoped for
+  `cache::Key::is_scoped`: timer-refresh is skipped, and it falls under `evict_idle` and the
+  `max_paths` LRU cap. Values are never logged or shown in `status`. On reload, scoped
+  entries (path- or env-keyed) of a badge whose source, scope or `PathOpts` changed are dropped.
 - **In-process git builtins skip this entirely.** `git_branch`/`git_commit`/`git_state`/
   `git_stash` are recomputed on a bounded blocking worker per request (see §5) — no `Entry`, no
   staleness check, no background task; every `get` sees the current on-disk state.
@@ -561,7 +628,7 @@ stfgd reload
 ```
 
 `stfg <badge>... [--cwd <path>]` is a separate, tiny binary that is an exact equivalent
-to `stfgd get`: same `client.rs` implementation, same flags, same behavior, just without the
+to `stfgd get`: same `client` implementation, same flags, same behavior, just without the
 full binary's dependency weight. Prefer it for the hot path (starship/tmux); use `stfgd get`
 only where installing a second binary isn't convenient. There is no `stfg daemon` /
 `status` / etc. — admin commands stay on the full binary.
@@ -601,7 +668,11 @@ clap/anyhow/thiserror/git2/gix/notify.
 
 Unit: config parse (all variants, invalid → error; `scope` default/override/rejection),
 extract (regex/json/trim/template empty), backoff monotonic/capped, bounded line reader,
-scheduling `next_due`/coalescing, git root discovery, `HEAD` parsing (branch/detached/
+scheduling `next_due`/coalescing, git root and project root discovery, config validation of
+`markers`/`watch`/`env`/`when_file`, `tool_version` expansion, env glob matching, `get` request
+parsing with and without an env block, the cache key following env values, a command seeing the
+forwarded value, `watch` change refresh and `when_file` gating in `handle_get`,
+`HEAD` parsing (branch/detached/
 worktree `gitdir:`), git fingerprint change detection, `git_counts` dedupe (an in-flight
 memo cell is reused, not replaced), and `handle_get` picking the battery-aware interval.
 
@@ -619,7 +690,7 @@ Integration (`tests/integration.rs`): run the real `stfgd`/`stfg` binaries with 
 5. `stfgd reload` re-resolves the config: a 1s-interval badge stops changing once the config is
    rewritten with a 1h interval and reloaded.
 6. `stfgd get` (the full binary's subcommand) converges to a real value exactly like `stfg`,
-   proving both entry points share the one `client.rs` implementation.
+   proving both entry points share the one `client` implementation.
 7. A real temp repo: after `git checkout -b <new>`, `get git_branch` reports it, and after
    `git add` on a tracked file `get git_status` shows the new count, both well inside the 5s
    `interval` (fingerprint invalidation, not waiting it out).
