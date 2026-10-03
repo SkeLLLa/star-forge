@@ -5,22 +5,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A unique scratch directory under the system temp dir, removed on drop.
+///
+/// Names stay short on purpose: tests bind `AF_UNIX` sockets inside, and `sun_path` is
+/// only 104 bytes on macOS, whose `$TMPDIR` already takes ~49 of them.
 pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Self {
-        // The counter keeps paths distinct when parallel tests read the same clock tick.
+        // pid + counter is unique among live processes; a leftover from a crashed run
+        // with a recycled pid is cleared first.
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "sf-{tag}-{}-{nanos}-{}",
+            "sf-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
         Self(path)
     }
 
