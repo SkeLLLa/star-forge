@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2](https://github.com/SkeLLLa/star-forge/compare/v1.2.1...v1.2.2) - 2026-10-03
+
+### Fixed
+
+- *(test)* keep TempDir socket paths short for macOS sun_path
+
 ## [1.2.1](https://github.com/SkeLLLa/star-forge/compare/v1.2.0...v1.2.1) - 2026-10-03
 
 ### Fixed
