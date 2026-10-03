@@ -570,7 +570,8 @@ jobs:
           test -f public/rpm/x86_64/repodata/repomd.xml
           test -f public/deb/dists/stable/Release
           test -f public/deb/dists/stable/main/binary-amd64/Packages.gz
-          gzip -cd public/deb/dists/stable/main/binary-amd64/Packages.gz | grep -q '^Package: star-forge$'
+          # No `grep -q`: it exits on the first match, gzip dies of SIGPIPE, pipefail fails.
+          gzip -cd public/deb/dists/stable/main/binary-amd64/Packages.gz | grep '^Package: star-forge$' >/dev/null
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
