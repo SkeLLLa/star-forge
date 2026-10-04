@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1280" height="640" viewBox="0 0 1280 640">
+  <!-- Source for social-preview.png (GitHub: Settings → General → Social preview).
+       Re-render: inkscape social-preview.svg -w 1280 -o social-preview.png
+       Needs the JetBrainsMono Nerd Font installed. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#232a38"/>
+      <stop offset="1" stop-color="#0d1017"/>
+    </linearGradient>
+    <radialGradient id="warm" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff7a1a" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ff7a1a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffc94d"/>
+      <stop offset="1" stop-color="#ff7a1a"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <circle cx="270" cy="300" r="330" fill="url(#warm)"/>
+
+  <image href="logo.svg" xlink:href="logo.svg" x="100" y="150" width="340" height="340"/>
+
+  <g font-family="JetBrainsMono Nerd Font Propo, JetBrainsMono Nerd Font, monospace">
+    <text x="510" y="250" font-size="100" font-weight="800" fill="#f4f6fa" letter-spacing="-2">star<tspan fill="url(#accent)">-</tspan>forge</text>
+    <rect x="514" y="282" width="120" height="6" rx="3" fill="url(#accent)"/>
+    <text font-size="32" fill="#c3cbd8">
+      <tspan x="512" y="350">Fast, cached badges for your</tspan>
+      <tspan x="512" y="392">shell prompt and tmux status line.</tspan>
+    </text>
+
+    <!-- mock prompt line -->
+    <rect x="510" y="440" width="660" height="72" rx="14" fill="#0a0d13" stroke="#353d4d" stroke-width="2"/>
+    <text x="536" y="486" font-size="26" font-weight="500">
+      <tspan fill="#81a1c1">~/app</tspan>
+      <tspan fill="#a3be8c" dx="22">&#xE0A0; main</tspan>
+      <tspan fill="#8fbc8f" dx="22">&#xE718; 22</tspan>
+      <tspan fill="#ebcb8b" dx="22">&#xE73C; 3.13</tspan>
+      <tspan fill="#ff9e64" dx="22">&#xE7A8; 1.88</tspan>
+      <tspan fill="#ffc94d" dx="22">&#x276F;</tspan>
+    </text>
+    <text x="1170" y="552" font-size="22" fill="#7d889b" text-anchor="end">served from cache in &lt; 1 ms</text>
+  </g>
+</svg>

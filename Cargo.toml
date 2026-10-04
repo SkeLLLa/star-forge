@@ -17,6 +17,8 @@ include = [
   "/CHANGELOG.md",
   "/COPYING",
   "/THIRD_PARTY_NOTICES.md",
+  "/docs/assets/logo.svg",
+  "/docs/assets/badges/*.svg",
 ]
 autobins = false
 

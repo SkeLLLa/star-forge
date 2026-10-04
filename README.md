@@ -1,5 +1,7 @@
 # star-forge
 
+![star-forge logo](docs/assets/logo.svg)
+
 [![CI](https://github.com/SkeLLLa/star-forge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/SkeLLLa/star-forge/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/SkeLLLa/star-forge)](https://github.com/SkeLLLa/star-forge/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/star-forge)](https://crates.io/crates/star-forge)
@@ -704,3 +706,12 @@ prompt/tmux call from its cache — comes from
 [beachcomber](https://github.com/NavistAu/beachcomber) (MIT, Copyright (c) 2026 Joshua
 Hogendorn). Parts of the in-process git readers in `src/provider/git.rs` are also adapted from it.
 See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full list and license text.
+
+## Support
+
+If `star-forge` is useful to you and you want to say thanks, please consider supporting Ukrainian
+defenders instead of sending money to the author.
+
+[![Come Back Alive](docs/assets/badges/donate-come-back-alive.svg)](https://savelife.in.ua/en/donate-en/)
+[![Sternenko Fund](docs/assets/badges/donate-sternenko-fund.svg)](https://www.sternenkofund.org/en/donate)
+[![Prytula Foundation](docs/assets/badges/donate-prytula-foundation.svg)](https://prytulafoundation.org/en/donation)
