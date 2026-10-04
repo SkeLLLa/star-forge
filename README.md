@@ -85,9 +85,9 @@ a badge is requested. If you're curious how it works inside, see
 cargo install star-forge        # or: cargo install --path .
 ```
 
-Each GitHub release also ships Linux (`x86_64`) and macOS (`aarch64`, `x86_64`) tarballs plus
-`.deb`/`.rpm` packages. The packages are also published as APT/DNF repositories on GitHub Pages
-(<https://skellla.github.io/star-forge>).
+Each GitHub release also ships Linux (`x86_64` glibc, plus a fully static `x86_64` musl build)
+and macOS (`aarch64`, `x86_64`) tarballs plus `.deb`/`.rpm` packages. The packages are also
+published as APT/DNF repositories on GitHub Pages (<https://skellla.github.io/star-forge>).
 
 For Fedora, openSUSE, and other RPM-based systems:
 
