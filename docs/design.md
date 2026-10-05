@@ -194,7 +194,7 @@ strings (`"..."`, `"""..."""`) process backslashes first, so a literal `\[` must
 there, or use literal strings (`'...'`, `'''...'''`). A trailing `\` at a line end in a basic
 multi-line string is TOML's line-continuation (newline and following whitespace trimmed), which
 the examples rely on. Why batching matters (spawn
-cost dominates a call) is covered in the README's "Batching calls" section.
+cost dominates a call) is covered in the "Batching calls" section of [`configuration.md`](configuration.md#batching-calls).
 
 ## 3. Module layout
 

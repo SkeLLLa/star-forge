@@ -89,9 +89,9 @@ pub(crate) fn git_dir(repo_root: &Path) -> Option<PathBuf> {
 /// `interval`.
 ///
 /// Limitation: doesn't see unstaged worktree edits (they touch neither `HEAD` nor `index`), so
-/// those still only surface on `interval` — documented in README; the upgrade path if that
-/// ever matters enough is inotify on the worktree, at the cost of a watcher thread this
-/// design otherwise avoids entirely.
+/// those still only surface on `interval` — documented in `docs/configuration.md`; the upgrade
+/// path if that ever matters enough is inotify on the worktree, at the cost of a watcher thread
+/// this design otherwise avoids entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GitFingerprint {
     head: Option<SystemTime>,
