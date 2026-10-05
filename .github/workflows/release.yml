@@ -368,25 +368,106 @@ jobs:
             target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz.sha256
 
   packslip:
-    name: Publish packslip manifest
-    needs: [release, macos-assets]
+    name: Sign packslip manifest
+    needs: [release, macos-assets, linux-musl-assets]
     if: ${{ needs.release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
+    # Signing never holds release-write access; publish-packslip uploads the bundle.
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
-      # Runs after the glibc Linux and macOS tarballs are on the release, so one
-      # manifest covers them. The musl tarball is deliberately left out: packslip has no
-      # libc selector, so a second linux-x64 asset would make installs ambiguous.
-      - name: Publish packslip manifest
+      # The tag sits on release-plz's version-bump commit, not on github.sha (the push
+      # that triggered this run), so record the commit the tag actually names.
+      - name: Resolve tagged commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          echo "commit=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG_NAME}" --jq .sha)" >> "${GITHUB_OUTPUT}"
+
+      # Runs after every tarball is on the release, so one manifest covers them. The gnu
+      # and musl Linux tarballs share linux/x86_64 but differ in libc, so consumers pick
+      # by host libc.
+      - name: Sign packslip manifest
+        id: packslip
         uses: jdx/packslip@v1
         with:
-          download: star-forge-*-unknown-linux-gnu.tar.gz star-forge-*-apple-darwin.tar.gz
+          download: star-forge-*-unknown-linux-*.tar.gz star-forge-*-apple-darwin.tar.gz
           bin: stfgd stfg
           tag: ${{ needs.release.outputs.tag_name }}
           version: ${{ needs.release.outputs.version }}
+          commit: ${{ steps.source.outputs.commit }}
           attest: link
+          upload: false
+
+      - name: Keep signed bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: packslip-bundle
+          retention-days: 1
+          path: ${{ steps.packslip.outputs.bundle }}
+          if-no-files-found: error
+
+  publish-packslip:
+    name: Publish packslip manifest
+    needs: [release, packslip]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch signed bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: packslip-bundle
+          path: packslip
+
+      - name: Upload signed bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          test -f packslip/packslip.sigstore.json
+          gh release upload "${TAG_NAME}" packslip/packslip.sigstore.json --repo "${GITHUB_REPOSITORY}" --clobber
+
+  verify-packslip:
+    name: Verify published packslip manifest
+    needs: [release, publish-packslip]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Signer fingerprint published in README.md; constant across releases.
+      PACKSLIP_PIN: ps1_iqg6ch676syauz3nb3hluddyku
+    steps:
+      - name: Install packslip
+        uses: taiki-e/install-action@v2
+        with:
+          tool: packslip@1.6.0
+
+      # Check what users download: the public release URLs, not this run's local files.
+      - name: Verify manifest against published tarballs
+        env:
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
+          args=()
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
+            asset="star-forge-${VERSION}-${target}.tar.gz"
+            curl -fsSLO --retry 3 "${base}/${asset}"
+            args+=(--artifact "${asset}")
+          done
+          curl -fsSLO --retry 3 "${base}/packslip.sigstore.json"
+          packslip verify packslip.sigstore.json \
+            --identity-prefix "https://github.com/${GITHUB_REPOSITORY}/" \
+            --issuer https://token.actions.githubusercontent.com \
+            --pin "${PACKSLIP_PIN}" \
+            "${args[@]}"
 
   checksums:
     name: Publish SHA256SUMS

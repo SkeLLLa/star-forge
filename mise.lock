@@ -71,38 +71,78 @@ url = "https://github.com/dmtrKovalenko/fff/releases/download/v0.11.0/fff-mcp-x8
 url_api = "https://api.github.com/repos/dmtrKovalenko/fff/releases/assets/578309693"
 
 [[tools."github:jdx/packslip"]]
-version = "1.2.0"
+version = "1.6.0"
 backend = "github:jdx/packslip"
-specifiers = ["1.2.0"]
+specifiers = ["1.6.0"]
+
+[tools."github:jdx/packslip"."platforms.linux-arm64"]
+checksum = "sha256:2037c3a4c7c4b66f67decb8ea17ae0571894cbe98dd351d69fb5c0020ef96acd"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip-v1.6.0-linux-arm64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611372030"
+provenance = "github-attestations"
+
+[tools."github:jdx/packslip"."platforms.linux-arm64-musl"]
+checksum = "sha256:2037c3a4c7c4b66f67decb8ea17ae0571894cbe98dd351d69fb5c0020ef96acd"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip-v1.6.0-linux-arm64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611372030"
+provenance = "github-attestations"
+
+[tools."github:jdx/packslip"."platforms.linux-x64"]
+checksum = "sha256:b57bc18667039138fd23ada4a6b650a6e1d8c4b8c3a6e3695dafc010f8e25537"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip-v1.6.0-linux-x64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611372061"
+provenance = "github-attestations"
+
+[tools."github:jdx/packslip"."platforms.linux-x64-musl"]
+checksum = "sha256:b57bc18667039138fd23ada4a6b650a6e1d8c4b8c3a6e3695dafc010f8e25537"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip-v1.6.0-linux-x64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611372061"
+provenance = "github-attestations"
+
+[tools."github:jdx/packslip"."platforms.macos-arm64"]
+checksum = "sha256:b6175f62648584127bb59c136f482de65d96644fd3e9274930c347d81538e39a"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip-v1.6.0-darwin-arm64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611371985"
+provenance = "github-attestations"
+
+[tools."github:jdx/packslip"."platforms.macos-x64"]
+checksum = "sha256:fc9f7664a8703f6895775bf25b316444dd24ad3e87b31549a5e1c423e2560a82"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip.1"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611372183"
+provenance = "github-attestations"
+
+[tools."github:jdx/packslip"."platforms.windows-x64"]
+checksum = "sha256:30fb9998b6c2de65ec54593a8be0923501ace1fc8db468f143919bb3b79fd9df"
+url = "https://github.com/jdx/packslip/releases/download/v1.6.0/packslip-v1.6.0-windows-x64.zip"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/611372165"
+provenance = "github-attestations"
 
 [[tools."github:redhat-et/ripwire"]]
-version = "0.6.2"
+version = "0.6.5"
 backend = "github:redhat-et/ripwire"
-specifiers = ["0.6.2"]
+
+[tools."github:redhat-et/ripwire"."platforms.windows-x64"]
+checksum = "sha256:1492f352218d912f7adab69651e74981de0532e5907472db6eae755e97bc389f"
+url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-windows-x64.zip"
+url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872064"
+
+[[tools."github:redhat-et/ripwire"]]
+version = "0.6.5"
+backend = "github:redhat-et/ripwire"
+specifiers = ["0.6.5"]
 
 [tools."github:redhat-et/ripwire".options]
 asset_pattern = "ripwire-*-linux-x64.tar.gz"
 
 [tools."github:redhat-et/ripwire"."platforms.linux-x64"]
-checksum = "sha256:62ca4bf6dda09a23fe5829489232e64445ac80f42e51017614e31e201cc92b5a"
-url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.2/ripwire-0.6.2-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/579085389"
+checksum = "sha256:5c5794612f5f06632ada7c27a0f5c8f400748a70f707b64ec4d238c4fba2f7ea"
+url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872059"
 
 [tools."github:redhat-et/ripwire"."platforms.linux-x64-musl"]
-checksum = "sha256:62ca4bf6dda09a23fe5829489232e64445ac80f42e51017614e31e201cc92b5a"
-url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.2/ripwire-0.6.2-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/579085389"
-
-[[tools."github:redhat-et/ripwire"]]
-version = "0.6.2"
-backend = "github:redhat-et/ripwire"
-
-[tools."github:redhat-et/ripwire".options]
-asset_pattern = "ripwire-*-macos-x64.tar.gz"
-
-[[tools."github:redhat-et/ripwire"]]
-version = "0.6.2"
-backend = "github:redhat-et/ripwire"
+checksum = "sha256:5c5794612f5f06632ada7c27a0f5c8f400748a70f707b64ec4d238c4fba2f7ea"
+url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872059"
 
 [[tools.jq]]
 version = "1.8.2"
@@ -152,38 +192,38 @@ url_api = "https://api.github.com/repos/jqlang/jq/releases/assets/453012788"
 provenance = "github-attestations"
 
 [[tools.mr-boxington]]
-version = "1.21.0"
+version = "1.22.0"
 backend = "packslip:github.com/jdx/mr-boxington"
-specifiers = ["1.21.0"]
+specifiers = ["1.22.0"]
 
 [tools.mr-boxington."platforms.linux-arm64"]
-checksum = "sha256:8a29bf0682d31767405cd606e7153385d8d3ec8b498bf089e554375a8842de3c"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:b7a23503d9efcb31941e1e68b78f8b33643a056f22d39cff745dab6f17edb652"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-arm64-musl"]
-checksum = "sha256:107f86955f8323ea96ca90ca2d06d49b9b1b99789dd8007f71f9c59bb17bb6d7"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:ae4d66308c706ffbf912beb45b3166cf1cfda4d3efd23273262791235d0accf5"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-aarch64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64"]
-checksum = "sha256:1ed3fd18da0decc106a6242d1b724e6a4b8d0f6173b8abe4d4d68c929ed47120"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:eb3e8c74277dcc8314227ba2cd32ef00a9a362ec8a90cd06ef6580eb48a6b375"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.linux-x64-musl"]
-checksum = "sha256:5225a3b77f90e1cd3d1ef0d1054ccd4593ae19b2c98b815af1b82a4dfed0f97b"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:c375135e2a3916f58da1b47537b6a954159eeacd55523d9a618b42259bd89014"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.macos-arm64"]
-checksum = "sha256:4aa9da108e90c6c269819fed8e822a42f5101260961cd511999facd5726cf9d9"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:e548b5758498cf822a180b6328597e6aded8fe9bb3046cd918399172ae30dde2"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-aarch64-apple-darwin.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [tools.mr-boxington."platforms.windows-x64"]
-checksum = "sha256:132ed32ef37c7fd3d4253fcd307e914f5668e37048242420314b51eb600a7077"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.21.0/mbx-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:09500d06c0230b9cda1e051c5795b08804d93fbbcb41ba8e18c1f56454b80e00"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.22.0/mbx-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
 
 [[tools.rg]]
@@ -227,39 +267,39 @@ url = "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15
 url_api = "https://api.github.com/repos/BurntSushi/ripgrep/releases/assets/478119643"
 
 [[tools.rtk]]
-version = "0.49.0"
+version = "0.51.0"
 backend = "aqua:rtk-ai/rtk"
-specifiers = ["0.49.0"]
+specifiers = ["0.51.0"]
 
 [tools.rtk."platforms.linux-arm64"]
-checksum = "sha256:c8ea4b6560841e73157c134fd4a3293914c6ede42e786ee985cf491fde691ba7"
-url = "https://github.com/rtk-ai/rtk/releases/download/v0.49.0/rtk-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/556881345"
+checksum = "sha256:8d6d1aad9e69b42481eda7039507d1f7ee93698f87713cecd873d287c1931632"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695144"
 
 [tools.rtk."platforms.linux-x64"]
-checksum = "sha256:7278231dfd7e6a730a4ab7f847b195bcf02289c2d57622b0dab75a6411100c8f"
-url = "https://github.com/rtk-ai/rtk/releases/download/v0.49.0/rtk-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/556881350"
+checksum = "sha256:5028d3b19a8f0990d30fec9fbb07e32782bc5698e618fb1861aad8a9ccba4eb5"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695141"
 
 [tools.rtk."platforms.linux-x64-musl"]
-checksum = "sha256:7278231dfd7e6a730a4ab7f847b195bcf02289c2d57622b0dab75a6411100c8f"
-url = "https://github.com/rtk-ai/rtk/releases/download/v0.49.0/rtk-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/556881350"
+checksum = "sha256:5028d3b19a8f0990d30fec9fbb07e32782bc5698e618fb1861aad8a9ccba4eb5"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695141"
 
 [tools.rtk."platforms.macos-arm64"]
-checksum = "sha256:bbbfebabb22686993a80da731aa4d5d35116fb8ae24abb00608efa028e13ae01"
-url = "https://github.com/rtk-ai/rtk/releases/download/v0.49.0/rtk-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/556881349"
+checksum = "sha256:8817d8b71afc02ac8bf06eb24bcc41c306592ab735b68e8fee9db1ba0de7cb59"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695140"
 
 [tools.rtk."platforms.macos-x64"]
-checksum = "sha256:d297388f4a8a786e79abe5f55b80451725bfe8c5835b4736c05d7cff4d68f627"
-url = "https://github.com/rtk-ai/rtk/releases/download/v0.49.0/rtk-x86_64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/556881348"
+checksum = "sha256:bd39c8153f4147358360c7dc51665a8131cc9ee16f81f69a9402ffa500be3cc2"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695138"
 
 [tools.rtk."platforms.windows-x64"]
-checksum = "sha256:cb971046598f0e8bd51f6c27780fcdd2c39a4c459a811bd95b0d77ba8c0d7c9f"
-url = "https://github.com/rtk-ai/rtk/releases/download/v0.49.0/rtk-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/556881347"
+checksum = "sha256:1623e9b45d28b15122d69e7314776e1123a804224885ce07e7182fb40080f05c"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695127"
 
 [[tools.rumdl]]
 version = "0.2.78"

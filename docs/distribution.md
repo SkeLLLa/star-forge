@@ -31,7 +31,8 @@ when you want the fastest `stfg` startup (a dynamic binary spends roughly 200 µ
 loading and runtime init), or on a distro without a compatible glibc (Alpine, old LTS). Otherwise
 prefer the `gnu` archive or a native package. musl's allocator is slower than glibc's: `stfg`
 barely allocates, but the `stfgd` daemon (tokio) may be marginally slower under load. The musl
-archive is not in the packslip manifest, so `mise` keeps installing the `gnu` build.
+archive is in the packslip manifest beside the `gnu` one; packslip and `mise` pick between them by
+the host's libc.
 
 ### `deb` / `rpm`
 
@@ -111,10 +112,11 @@ The release flow:
 11. A matrix job builds and attaches the macOS tarballs and their `.sha256` sidecars.
 12. `linux-musl-assets` builds the static `x86_64-unknown-linux-musl` tarball with `musl-tools`,
     checks the binaries are static, smoke-tests them, and attaches the tarball and its `.sha256`.
-13. Once the gnu and macOS tarballs are attached, `jdx/packslip` publishes a signed
-    `packslip.sigstore.json` manifest covering them (used by the `mise` packslip backend). Its
-    `download` globs exclude the musl tarball, since packslip cannot pick between two linux-x64
-    assets.
+13. Once every tarball is attached, `jdx/packslip` signs a `packslip.sigstore.json` manifest
+    covering the gnu, musl, and macOS tarballs (used by `packslip install` and the `mise`
+    packslip backend), recording the commit the tag points to. The signing job has read-only
+    access; a separate job uploads the bundle, and a third verifies it against the published
+    tarballs and the signer fingerprint in `README.md`.
 14. It builds and deploys RPM/APT repository metadata to GitHub Pages.
 
 The release workflow uses the default `GITHUB_TOKEN` for repository operations. It does not depend

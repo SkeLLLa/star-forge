@@ -128,9 +128,21 @@ For [`mise`](https://mise.jdx.dev), on Linux and macOS:
 mise use -g github:SkeLLLa/star-forge
 ```
 
-To pin a specific release: `mise use -g github:SkeLLLa/star-forge@1.0.0`. Releases from 1.1.0
-on also publish a signed `packslip.sigstore.json` manifest. This installs both binaries but no
-systemd unit; see the first-run notes below.
+Append `@<version>` to pin a release. Releases from 1.1.0 on also publish a signed
+`packslip.sigstore.json` manifest. This installs both binaries but no systemd unit; see the
+first-run notes below.
+
+With [packslip](https://packslip.dev), which verifies the signed manifest before installing, on
+Linux (`x86_64`) and macOS:
+
+```sh
+packslip install github.com/SkeLLLa/star-forge --pin ps1_iqg6ch676syauz3nb3hluddyku
+```
+
+This installs the latest release into `~/.local/bin`; add `--version <version>` to pin one. The
+`--pin` fingerprint identifies this repository's release workflow and stays the same across
+releases; check it against this README rather than trusting it on first use.
+`mise use -g packslip:github.com/SkeLLLa/star-forge` uses the same manifest.
 
 The repositories are unsigned. See [`docs/distribution.md`](docs/distribution.md) for artifact
 contents, the release pipeline, and first-run steps per install method.
