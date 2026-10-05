@@ -19,7 +19,7 @@ doesn't show and a warning goes to the log.
 
 star-forge takes the slow work out of the prompt. A small background daemon runs your
 commands on their own schedule and keeps the latest results. Your prompt reads the cached value
-with `stfg`, which usually answers in under a millisecond and never takes longer than 40 ms.
+with `stfg`, which usually answers in under a millisecond and never takes longer than 30 ms.
 Anything that can run a command can use it: starship, tmux, or your own statusline script.
 
 ## What you get
@@ -199,7 +199,7 @@ retry_max = "5m"           # default 5m: backoff cap
 timeout = "2s"             # default 2s: fallback hard kill for the whole fetch + extract; must be > 0
 power_check = "60s"        # default 60s: how often AC/battery state is re-checked
 config_check = "2s"        # default 2s: how often the config and palette_from files are stat'ed for an implicit reload
-cold_wait = "20ms"         # default 20ms: how long a cold (no value yet) `get` waits for its own fetch; must be < 40ms
+cold_wait = "20ms"         # default 20ms: how long a cold (no value yet) `get` waits for its own fetch; must be < 30ms
 path_evict = "30m"         # default 30m: idle git-scoped badges are dropped after this long
 max_paths = 256            # default 256: LRU cap on git-scoped (per-repo) cache entries
 max_output = 65536         # default 64 KiB: fallback cap on command stdout / HTTP body
@@ -671,7 +671,7 @@ Git discovery/file reads, host builtins, configuration reads, process spawning, 
 extraction run on a bounded blocking pool, not on the daemon's single-threaded async
 event loop. Global-only requests do not inspect the client's repository. Request-time git reads
 and cold fetch waits share a budget of at least 20 ms (or `cold_wait` if larger), inside the
-client's 40 ms deadline; configuration/power maintenance has a 500 ms budget and implicit checks
+client's 30 ms deadline; configuration/power maintenance has a 500 ms budget and implicit checks
 run in the background.
 
 A filesystem syscall already blocked on NFS/FUSE cannot be cancelled by a timeout.
@@ -684,7 +684,7 @@ Restart the daemon after fixing the mount if its worker capacity does not recove
 The runtime directory should be on a healthy local filesystem: startup must create/lock
 the socket directory before it can serve requests.
 
-The client bounds its daemon launch with a worker thread under the same 40 ms deadline. A
+The client bounds its daemon launch with a worker thread under the same 30 ms deadline. A
 stuck syscall is abandoned, not cancelled; the client exits without joining it. The implicit
 `current_dir()` lookup (skipped with `--cwd`) runs inline on Linux, where `getcwd(2)` reads
 the dentry cache, not the filesystem, so it can't hang on a dead mount; on macOS it runs on a
@@ -693,7 +693,7 @@ deadline-bounded worker as well.
 ## Environment variables
 
 - `STAR_FORGE_CONFIG` — config file path override.
-- `STAR_FORGE_TIMEOUT_MS` — override the client's 40 ms deadline (mostly for testing).
+- `STAR_FORGE_TIMEOUT_MS` — override the client's 30 ms deadline (mostly for testing).
 - `XDG_RUNTIME_DIR` / `XDG_CONFIG_HOME` — standard XDG dirs; fall back to `/tmp/star-forge-$UID`
   (the usual case on macOS, which doesn't set `XDG_RUNTIME_DIR`) and `~/.config` respectively.
   The runtime dir must be a real directory owned by you and not group/other-writable; anything

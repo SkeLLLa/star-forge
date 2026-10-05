@@ -53,8 +53,8 @@ impl TestEnv {
     }
 
     /// `stfgd`/`stfg` with this env's runtime dir/config. The client deadline is raised from
-    /// the 40 ms default: these tests check behavior, and a loaded CI runner (notably macOS)
-    /// regularly spends more than 40 ms just starting the client or spawning the daemon.
+    /// the 30 ms default: these tests check behavior, and a loaded CI runner (notably macOS)
+    /// regularly spends more than 30 ms just starting the client or spawning the daemon.
     /// Daemon-side budgets (`cold_wait`, request-time git reads) are unchanged.
     fn command(&self, bin: &str) -> Command {
         let mut command = Command::new(bin);

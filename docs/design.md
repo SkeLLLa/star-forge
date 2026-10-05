@@ -15,7 +15,7 @@ described in [`distribution.md`](distribution.md).
 | Question | Decision |
 |---|---|
 | IPC | Unix domain socket; admin (`status`/`stop`/`reload`) is one NDJSON request/response per connection, `get` is a plain-text line protocol (see §2) |
-| Client | plain `std` + `libc` only (no tokio runtime, no serde), hard 40 ms total deadline, always exit 0 for `get` |
+| Client | plain `std` + `libc` only (no tokio runtime, no serde), hard 30 ms total deadline, always exit 0 for `get` |
 | Daemon runtime | tokio `current_thread` |
 | Singleton | `flock(LOCK_EX\|LOCK_NB)` on a lock file held for process lifetime; no pidfile |
 | HTTP | `reqwest`, `default-features = false`, `rustls` |
@@ -43,14 +43,14 @@ query time, and the daemon needs query activity to drive demand-based scheduling
 **Client `get` path** (sync, `std::os::unix::net::UnixStream`, implemented once in `src/client.rs`
 and shared by both binaries — see §3):
 
-1. Compute a deadline `now + 40ms` (`STAR_FORGE_TIMEOUT_MS` override).
+1. Compute a deadline `now + 30ms` (`STAR_FORGE_TIMEOUT_MS` override).
 2. `lstat()` the runtime dir first: missing → spawn without connecting; anything but a real
    directory (not a symlink) owned by `getuid()` with no group/other write bits → print empty
    lines, exit 0, never spawn (`status`/`stop`/`reload` report "daemon not running"; LSB exit
    codes 3/0/7, or 1 if a daemon is there but silent). Then connect via a non-blocking
    `socket(2)`/`connect(2)` (not `UnixStream::connect`): on Linux a blocking `connect()` to an
    `AF_UNIX` socket blocks the caller when the listener's backlog is full, which could blow
-   through the 40 ms deadline; a non-blocking socket reports a full backlog as an immediate
+   through the 30 ms deadline; a non-blocking socket reports a full backlog as an immediate
    `EAGAIN` instead (no `EINPROGRESS` — `AF_UNIX` has no handshake to wait out). macOS reports a
    full backlog as `ECONNREFUSED`, so there it reads as "not running": the spawned daemon loses
    the `flock` race and exits — one wasted spawn under overload, still inside the deadline.
@@ -282,7 +282,7 @@ struct DaemonConfig {
     timeout: Duration,           // default 2s: fallback hard kill for the whole fetch + extract
     power_check: Duration,       // default 60s: how often on_ac() is re-checked
     config_check: Duration,      // default 2s: how often the config and palette_from files are stat'ed
-    cold_wait: Duration,         // default 20ms: must stay < the client's 40ms deadline
+    cold_wait: Duration,         // default 20ms: must stay < the client's 30ms deadline
     idle_exit: Duration,         // default 30m: exit after no client requests for this long
     path_evict: Duration,        // default 30m: idle path-scoped keys are dropped after this
     max_paths: usize,            // default 256: LRU cap on path-scoped (git) cache entries
@@ -338,7 +338,7 @@ combine in serde, so each `Builtin`/`Command`/`Http` variant repeats the shared 
 `[daemon]` value or fixed default and parses it with `duration::parse`, and validates the
 result (`validate`, e.g. `retry_min > 0` and `<= retry_max`, non-zero `timeout`s,
 `max_paths >= 1`, `coalesce` below every resolved interval,
-`cold_wait` below the 40 ms client deadline) before returning — a config that fails to parse
+`cold_wait` below the 30 ms client deadline) before returning — a config that fails to parse
 or validate is rejected wholesale; the caller (`daemon::check_reload`) keeps the previous
 config running. The failure is also kept in `ConfigMeta` (logged once per distinct message) and
 shown as a trailing `config error: …` line in `stfgd status` until a later load succeeds. A
@@ -542,7 +542,7 @@ Goal: near-zero wakeups when the user isn't looking at a prompt.
 - **Cold-miss wait.** A `get` on a key with *no value at all* (first `cd` into a repo) waits up
   to the configured `cold_wait` (default 20 ms) for the fetch it just started, then answers with
   whatever it has. The fetch keeps running in the background either way. Config validation
-  rejects a `cold_wait` at or above the client's 40 ms deadline. Request-time git reads and
+  rejects a `cold_wait` at or above the client's 30 ms deadline. Request-time git reads and
   cold fetch waits share a single budget of `max(20ms, cold_wait)`, rather than adding
   independent waits for each badge.
 
@@ -647,7 +647,7 @@ clap/anyhow/thiserror/git2/gix/notify.
 | Daemon not running | client spawns detached, returns empty now |
 | Stale socket file | connect refused → spawn; the new daemon unlinks it after taking the lock |
 | Runtime dir is a symlink, foreign-owned, or group/other-writable | client prints empty lines and never spawns; a daemon started anyway exits without binding unless the dir is a real one owned by `getuid()` |
-| Daemon wedged/slow | client deadline (40 ms) → empty, exit 0 |
+| Daemon wedged/slow | client deadline (30 ms) → empty, exit 0 |
 | Two clients race to spawn | loser daemon fails flock, exits 0 |
 | Command hangs | killpg at `timeout` (default 2s), reaped, error counted, backoff, stale value kept |
 | Command reads stdin | gets EOF from /dev/null |

@@ -485,17 +485,20 @@ fn initial_cwd(cwd: Option<&str>, deadline: Instant) -> Option<String> {
     )
 }
 
+/// Client deadline unless `STAR_FORGE_TIMEOUT_MS` overrides it; `daemon.cold_wait` must stay under it.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30);
+
 /// `stfgd get`/`stfg` hot path: always returns exactly `badges.len()`
 /// strings, empty on any failure, never panics, never writes to stderr. Only a missing
 /// runtime dir or `ENOENT`/`ECONNREFUSED` (no daemon, stale socket) spawns a new one; a
 /// busy (full backlog on Linux) or unresponsive daemon, or an untrusted runtime dir, does
 /// not, per the design.
 fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
-    let timeout_ms: u64 = std::env::var("STAR_FORGE_TIMEOUT_MS")
+    let timeout = std::env::var("STAR_FORGE_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(40);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
+    let deadline = Instant::now() + timeout;
     let empty = || vec![String::new(); badges.len()];
 
     let Some(cwd) = initial_cwd(cwd, deadline) else {

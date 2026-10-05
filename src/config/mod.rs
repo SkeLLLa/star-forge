@@ -144,8 +144,6 @@ const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_PATH_EVICT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_MAX_PATHS: usize = 256;
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
-/// Minimum client deadline (see `client.rs`); `cold_wait` must stay under this.
-const CLIENT_DEADLINE: Duration = Duration::from_millis(40);
 
 /// `[daemon]`, fully resolved: every field is a concrete value, defaulted per the schema in
 /// design.md §7 (no derived formulas — `battery_interval`'s only fallback is `interval`
@@ -531,10 +529,10 @@ fn validate(daemon: &DaemonConfig, badge: &BTreeMap<String, BadgeConfig>) -> Res
     if daemon.retry_min > daemon.retry_max {
         return Err("daemon.retry_min must be <= daemon.retry_max".to_string());
     }
-    if daemon.cold_wait >= CLIENT_DEADLINE {
+    if daemon.cold_wait >= crate::client::DEFAULT_TIMEOUT {
         return Err(format!(
             "daemon.cold_wait must be < {}ms (the client deadline)",
-            CLIENT_DEADLINE.as_millis()
+            crate::client::DEFAULT_TIMEOUT.as_millis()
         ));
     }
     if daemon.timeout == Duration::ZERO {
@@ -1025,10 +1023,10 @@ retry_max = "5m"
     }
 
     #[test]
-    fn validation_rejects_cold_wait_at_or_above_40ms() {
+    fn validation_rejects_cold_wait_at_or_above_client_deadline() {
         let src = r#"
 [daemon]
-cold_wait = "40ms"
+cold_wait = "30ms"
 "#;
         assert!(parse(src).is_err());
     }
