@@ -19,6 +19,7 @@ rtk = { version = "0.51.0", postinstall = "rtk init -g --auto-patch" }
 "github:redhat-et/ripwire" = { version = "0.6.5", exe = "ripwire", platforms = { linux-x64 = { asset_pattern = "ripwire-*-linux-x64.tar.gz" }, linux-arm64 = { asset_pattern = "ripwire-*-linux-arm64.tar.gz" }, macos-x64 = { asset_pattern = "ripwire-*-macos-x64.tar.gz" }, macos-arm64 = { asset_pattern = "ripwire-*-macos-arm64.tar.gz" } } }
 rumdl = "0.2.78"
 "github:jdx/packslip" = "1.6.0"
+hyperfine = "1.20.0"
 
 [tasks.build]
 description = "Build the Rust project"
@@ -58,3 +59,7 @@ run = "rumdl check ."
 [tasks.check]
 description = "Run the full quality suite"
 depends = ["fmt-check", "lint", "test", "doc", "md-check"]
+
+[tasks.bench]
+description = "Benchmark stfg against running the same commands directly"
+run = "bash scripts/bench.sh"

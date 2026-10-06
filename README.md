@@ -18,6 +18,8 @@ star-forge moves that work into a small background daemon that refreshes each va
 schedule. Your prompt reads the cached value with `stfg`, which usually answers in under a
 millisecond and never takes longer than 30 ms.
 
+![Starship prompt with public IP and weather badges cached by star-forge](docs/assets/prompt-demo.png)
+
 > **Setting up with an AI assistant?** Point it at [`README.ai.md`](README.ai.md). It
 > contains step-by-step instructions written for agents.
 
@@ -168,6 +170,34 @@ segment; see [styled groups](docs/configuration.md#styled-groups).
 
 Other builtins: `battery`, `hostname`, `load_avg`, `mem_used_percent`, `uptime`, `git_commit`,
 `git_state`, `git_stash`, `git_status`.
+
+## Benchmarks
+
+`stfg` with a warm cache against running the same work directly, as a starship `[custom.*]`
+module would. Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on an Intel Core
+Ultra 7 165H (Linux, release build), in the star-forge repository itself:
+
+| Work | `stfg` | Bare command | Speedup |
+| --- | ---: | ---: | ---: |
+| Branch name (`git branch --show-current`) | 0.79 ms | 1.06 ms | 1.3× |
+| Modified count (`git status --porcelain=v2 --branch`) | 0.78 ms | 1.63 ms | 2.1× |
+| 300 ms command (`sh -c 'sleep 0.3; echo ok'`) | 0.76 ms | 302.7 ms | 399× |
+| All three in one group vs. all three commands | 0.80 ms | 305.9 ms | 380× |
+
+Most of an `stfg` call is starting the process; the daemon's share is about 0.14 ms, measured
+separately (see [batching calls](docs/configuration.md#batching-calls)). The `sleep` stands in
+for a network call or slow CLI, so it shows the real difference. `git status` gets slower as
+the repository grows, but a cached `stfg` read doesn't run it: the daemon refreshes it in the
+background, so unstaged edits can show up to one `interval` late. A bare command also blocks
+the prompt for its whole run, while `stfg` waits at most 30 ms for the daemon.
+
+The last row adds up the work. Starship runs `[custom.*]` modules in parallel, so the prompt
+delay you would actually see from the bare commands is that of the slowest one (here the
+300 ms command), not their sum.
+
+Run it on your machine with `mise run bench` from a checkout. It uses a throwaway config and
+daemon, so your own setup is untouched. Set `SLOW_SECS` to change the stand-in delay. Results
+are also written to `bench/results.md` under Cargo's target directory.
 
 ## Troubleshooting
 
