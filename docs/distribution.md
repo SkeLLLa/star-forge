@@ -222,14 +222,7 @@ systemctl --user enable --now star-forge.service
 ### RPM repository
 
 ```bash
-sudo tee /etc/yum.repos.d/star-forge.repo >/dev/null <<'EOF'
-[star-forge]
-name=star-forge
-baseurl=https://skellla.github.io/star-forge/rpm/x86_64
-enabled=1
-gpgcheck=0
-repo_gpgcheck=0
-EOF
+sudo curl -fsSLo /etc/yum.repos.d/star-forge.repo https://skellla.github.io/star-forge/rpm/star-forge.repo
 sudo dnf install star-forge
 ```
 

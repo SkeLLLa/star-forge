@@ -58,8 +58,8 @@ method that applies and that the user is happy with:
 | `mise` present | `mise use -g github:SkeLLLa/star-forge` |
 | `packslip` present | `packslip install github.com/SkeLLLa/star-forge --pin ps1_iqg6ch676syauz3nb3hluddyku` |
 | Nix with flakes | `nix profile install github:SkeLLLa/star-forge` |
-| Fedora / RPM (`dnf`) | add the DNF repository from [README.md](README.md#rpm-and-apt-repositories), then `sudo dnf install star-forge` |
-| Debian / Ubuntu (`apt-get`) | add the APT repository from [README.md](README.md#rpm-and-apt-repositories), then `sudo apt install star-forge` |
+| Fedora / RPM (`dnf`) | add the DNF repository from [README.md](README.md#fedora-dnf-repository), then `sudo dnf install star-forge` |
+| Debian / Ubuntu (`apt-get`) | add the APT repository from [README.md](README.md#debian-and-ubuntu-apt-repository), then `sudo apt install star-forge` |
 | Rust toolchain | `cargo install star-forge` |
 
 - Always install the latest release. Don't pin a version unless the user asks for one.

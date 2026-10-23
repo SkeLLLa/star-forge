@@ -70,6 +70,47 @@ checksum = "sha256:d1e8671f40c89c445aaa1728a21ec04b74be2e5f99091485caeabcc97f99a
 url = "https://github.com/dmtrKovalenko/fff/releases/download/v0.11.0/fff-mcp-x86_64-unknown-linux-musl"
 url_api = "https://api.github.com/repos/dmtrKovalenko/fff/releases/assets/578309693"
 
+[[tools."github:dmtrKovalenko/fff.nvim"]]
+version = "0.11.0"
+backend = "github:dmtrKovalenko/fff.nvim"
+
+[tools."github:dmtrKovalenko/fff.nvim".options]
+asset_pattern = "fff-mcp-aarch64-unknown-linux-musl"
+
+[tools."github:dmtrKovalenko/fff.nvim"."platforms.linux-arm64"]
+checksum = "sha256:35f8e05d6c865266bf451d13bfa5e1b0d98438fda7dc1c9bdbc1c6a83484577d"
+url = "https://github.com/dmtrKovalenko/fff.nvim/releases/download/v0.11.0/fff-mcp-aarch64-unknown-linux-musl"
+url_api = "https://api.github.com/repos/dmtrKovalenko/fff.nvim/releases/assets/578309707"
+
+[tools."github:dmtrKovalenko/fff.nvim"."platforms.linux-arm64-musl"]
+checksum = "sha256:35f8e05d6c865266bf451d13bfa5e1b0d98438fda7dc1c9bdbc1c6a83484577d"
+url = "https://github.com/dmtrKovalenko/fff.nvim/releases/download/v0.11.0/fff-mcp-aarch64-unknown-linux-musl"
+url_api = "https://api.github.com/repos/dmtrKovalenko/fff.nvim/releases/assets/578309707"
+
+[[tools."github:dmtrKovalenko/fff.nvim"]]
+version = "0.11.0"
+backend = "github:dmtrKovalenko/fff.nvim"
+
+[tools."github:dmtrKovalenko/fff.nvim".options]
+asset_pattern = "fff-mcp-aarch64-apple-darwin"
+
+[tools."github:dmtrKovalenko/fff.nvim"."platforms.macos-arm64"]
+checksum = "sha256:cc606d9418cfa7764376dcd7b32a33e6459a6cb9a4718be366b024dca6e9fead"
+url = "https://github.com/dmtrKovalenko/fff.nvim/releases/download/v0.11.0/fff-mcp-aarch64-apple-darwin"
+url_api = "https://api.github.com/repos/dmtrKovalenko/fff.nvim/releases/assets/578309710"
+
+[[tools."github:dmtrKovalenko/fff.nvim"]]
+version = "0.11.0"
+backend = "github:dmtrKovalenko/fff.nvim"
+
+[tools."github:dmtrKovalenko/fff.nvim".options]
+asset_pattern = "fff-mcp-x86_64-apple-darwin"
+
+[tools."github:dmtrKovalenko/fff.nvim"."platforms.macos-x64"]
+checksum = "sha256:33377a8f96442ebc8b06d3bd2863cf66a520f97a33700e0fb85a09dd7988e862"
+url = "https://github.com/dmtrKovalenko/fff.nvim/releases/download/v0.11.0/fff-mcp-x86_64-apple-darwin"
+url_api = "https://api.github.com/repos/dmtrKovalenko/fff.nvim/releases/assets/578309709"
+
 [[tools."github:jdx/packslip"]]
 version = "1.6.0"
 backend = "github:jdx/packslip"
@@ -144,12 +185,53 @@ checksum = "sha256:5c5794612f5f06632ada7c27a0f5c8f400748a70f707b64ec4d238c4fba2f
 url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-linux-x64.tar.gz"
 url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872059"
 
+[[tools."github:redhat-et/ripwire"]]
+version = "0.6.5"
+backend = "github:redhat-et/ripwire"
+
+[tools."github:redhat-et/ripwire".options]
+asset_pattern = "ripwire-*-macos-x64.tar.gz"
+
+[[tools."github:redhat-et/ripwire"]]
+version = "0.6.5"
+backend = "github:redhat-et/ripwire"
+
+[tools."github:redhat-et/ripwire".options]
+asset_pattern = "ripwire-*-linux-arm64.tar.gz"
+
+[tools."github:redhat-et/ripwire"."platforms.linux-arm64"]
+checksum = "sha256:25e5f37e2985830bbff189879797988b862e36521413a6e3654630a0e1f0b108"
+url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872063"
+
+[tools."github:redhat-et/ripwire"."platforms.linux-arm64-musl"]
+checksum = "sha256:25e5f37e2985830bbff189879797988b862e36521413a6e3654630a0e1f0b108"
+url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872063"
+
+[[tools."github:redhat-et/ripwire"]]
+version = "0.6.5"
+backend = "github:redhat-et/ripwire"
+
+[tools."github:redhat-et/ripwire".options]
+asset_pattern = "ripwire-*-macos-arm64.tar.gz"
+
+[tools."github:redhat-et/ripwire"."platforms.macos-arm64"]
+checksum = "sha256:17a68cfba3f0d6e1390686829239a3753b454aae9fe4ecaf52e0f365d890afc0"
+url = "https://github.com/redhat-et/ripwire/releases/download/v0.6.5/ripwire-0.6.5-macos-arm64.tar.gz"
+url_api = "https://api.github.com/repos/redhat-et/ripwire/releases/assets/592872056"
+
 [[tools.hyperfine]]
 version = "1.20.0"
 backend = "aqua:sharkdp/hyperfine"
 specifiers = ["1.20.0"]
 
 [tools.hyperfine."platforms.linux-arm64"]
+checksum = "sha256:90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c"
+url = "https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/317832112"
+
+[tools.hyperfine."platforms.linux-arm64-musl"]
 checksum = "sha256:90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-aarch64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/317832112"
@@ -307,6 +389,11 @@ backend = "aqua:rtk-ai/rtk"
 specifiers = ["0.51.0"]
 
 [tools.rtk."platforms.linux-arm64"]
+checksum = "sha256:8d6d1aad9e69b42481eda7039507d1f7ee93698f87713cecd873d287c1931632"
+url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695144"
+
+[tools.rtk."platforms.linux-arm64-musl"]
 checksum = "sha256:8d6d1aad9e69b42481eda7039507d1f7ee93698f87713cecd873d287c1931632"
 url = "https://github.com/rtk-ai/rtk/releases/download/v0.51.0/rtk-aarch64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/rtk-ai/rtk/releases/assets/605695144"

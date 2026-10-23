@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Read-only by default; jobs that need more declare their own permissions.
+permissions:
+  contents: read
+
 jobs:
   conventional-commits:
     name: Conventional commit messages

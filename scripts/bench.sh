@@ -21,7 +21,8 @@ done
 export GIT_OPTIONAL_LOCKS=0
 unset STAR_FORGE_TIMEOUT_MS
 
-cargo build --release --bins --quiet
+# `mise run bench` sets CARGO_BIN=mbx to build through the shared compile cache.
+"${CARGO_BIN:-cargo}" build --release --bins --quiet
 target_dir=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
 bin="$target_dir/release"
 stfg="$bin/stfg"

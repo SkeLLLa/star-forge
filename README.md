@@ -45,47 +45,120 @@ star-forge.
 
 ## Install
 
-| Platform | Command |
+star-forge runs on Linux and macOS. You get two binaries: `stfg`, the tiny client your prompt
+calls, and `stfgd`, the daemon and admin CLI. There is nothing to start: the daemon launches
+itself on first use.
+
+| Platform | How to install |
 | --- | --- |
-| Any (Rust) | `cargo install star-forge` |
-| mise | `mise use -g github:SkeLLLa/star-forge` |
-| packslip | `packslip install github.com/SkeLLLa/star-forge --pin ps1_iqg6ch676syauz3nb3hluddyku` |
-| Nix | `nix profile install github:SkeLLLa/star-forge` |
-| Fedora / RPM | [DNF repository](#rpm-and-apt-repositories) |
-| Debian / Ubuntu | [APT repository](#rpm-and-apt-repositories) |
+| Fedora and other DNF-based systems | [DNF repository](#fedora-dnf-repository), [.rpm](#a-single-deb-or-rpm-file), [tarball](#any-platform-tarball) |
+| Debian, Ubuntu and other APT-based systems | [APT repository](#debian-and-ubuntu-apt-repository), [.deb](#a-single-deb-or-rpm-file), [tarball](#any-platform-tarball) |
+| macOS | [mise, packslip, Nix or cargo](#mise-packslip-nix-or-cargo), [tarball](#any-platform-tarball) |
+| Any platform | [mise, packslip, Nix or cargo](#mise-packslip-nix-or-cargo), [tarball](#any-platform-tarball) |
 
-Prebuilt tarballs for Linux (`x86_64` glibc and static musl) and macOS (`aarch64`, `x86_64`) are
-on the [releases page](https://github.com/SkeLLLa/star-forge/releases/latest). packslip
-verifies the signed release before installing; the `--pin` fingerprint identifies this
-repository's release workflow and stays the same for every release.
+All downloads are on the [latest release](https://github.com/SkeLLLa/star-forge/releases/latest)
+page. Native packages and repositories are x86_64 only.
 
-You get two binaries: `stfg`, the tiny client your prompt calls, and `stfgd`, the daemon and
-admin CLI. There is nothing to start: the daemon launches itself on first use.
+### Fedora: DNF repository
 
-### RPM and APT repositories
+This is the recommended method on Fedora: `dnf upgrade` then keeps `star-forge` up to date.
 
 ```sh
-# Fedora, openSUSE, other RPM-based systems
-sudo tee /etc/yum.repos.d/star-forge.repo >/dev/null <<'EOF'
-[star-forge]
-name=star-forge
-baseurl=https://skellla.github.io/star-forge/rpm/x86_64
-enabled=1
-gpgcheck=0
-repo_gpgcheck=0
-EOF
+sudo curl -fsSLo /etc/yum.repos.d/star-forge.repo https://skellla.github.io/star-forge/rpm/star-forge.repo
 sudo dnf install star-forge
 ```
 
+### Debian and Ubuntu: APT repository
+
+This is the recommended method on Debian and Ubuntu: `apt upgrade` then keeps `star-forge` up to
+date.
+
 ```sh
-# Debian, Ubuntu, other APT-based systems
 echo 'deb [trusted=yes] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
-sudo apt update && sudo apt install star-forge
+sudo apt update
+sudo apt install star-forge
 ```
 
-The repositories are unsigned. The packages include a systemd user unit if you'd rather start
-the daemon with your session: `systemctl --user enable --now star-forge.service`. See
-[`docs/distribution.md`](docs/distribution.md) for details on every install method.
+The repositories are unsigned (`trusted=yes`, `repo_gpgcheck=0`), so their integrity depends on
+HTTPS to GitHub Pages. They track every release.
+
+### A single .deb or .rpm file
+
+You get no automatic updates with this method. Download the file from the
+[latest release](https://github.com/SkeLLLa/star-forge/releases/latest), then run:
+
+```sh
+sudo apt install ./star-forge_<version>_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./star-forge-<version>-1.x86_64.rpm   # Fedora
+```
+
+Packages install `/usr/bin/stfg`, `/usr/bin/stfgd` and the user service
+`/usr/lib/systemd/user/star-forge.service`.
+
+### Any platform: tarball
+
+Tarballs exist for Linux (`x86_64` glibc and static musl) and macOS (`aarch64`, `x86_64`). This
+method installs for your user only and doesn't need root:
+
+```sh
+tar -xzf star-forge-<version>-<target>.tar.gz
+install -m 755 star-forge-<version>-<target>/bin/* ~/.local/bin/
+```
+
+Each tarball has a `.sha256` sidecar, and the release has a combined `SHA256SUMS`. Pick the musl
+tarball for the fastest `stfg` startup or on a distro without a compatible glibc.
+
+### mise, packslip, Nix or cargo
+
+These put `stfg` and `stfgd` on your `PATH`. Pick one:
+
+```sh
+# mise. Append @<version> to pin a release.
+mise use -g github:SkeLLLa/star-forge
+
+# packslip. Checks the signed release manifest before it installs into ~/.local/bin.
+packslip install github.com/SkeLLLa/star-forge --pin ps1_iqg6ch676syauz3nb3hluddyku
+
+# Nix. Builds from source; on Linux it also installs the user service.
+nix profile install github:SkeLLLa/star-forge
+
+# cargo. Builds from crates.io.
+cargo install star-forge --locked
+```
+
+The packslip `--pin` fingerprint identifies this repository's release workflow and stays the same
+across releases. Check it against this README rather than trusting it on first use. With mise,
+`mise use -g packslip:github.com/SkeLLLa/star-forge` also checks the signed manifest.
+
+### After installing (optional)
+
+The daemon starts on the first prompt and exits after `daemon.idle_exit` (30 minutes by default)
+of inactivity, so no service is needed. On Linux you can start it with your session instead. The
+packages and Nix ship the unit; for other methods see
+[`docs/distribution.md`](docs/distribution.md#cargo-install) for a unit to copy.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now star-forge.service
+```
+
+Next, see [Quick start](#quick-start).
+
+### Uninstall
+
+First run `stfgd stop` (or `systemctl --user disable --now star-forge.service` if you enabled the
+unit), then:
+
+| Installed with | Remove with |
+| --- | --- |
+| DNF | `sudo dnf remove star-forge`, then `sudo rm /etc/yum.repos.d/star-forge.repo` |
+| APT | `sudo apt remove star-forge`, then `sudo rm /etc/apt/sources.list.d/star-forge.list` |
+| Tarball or packslip | `rm ~/.local/bin/stfg ~/.local/bin/stfgd` |
+| mise | `mise unuse -g github:SkeLLLa/star-forge` |
+| Nix | `nix profile remove star-forge` |
+| cargo | `cargo uninstall star-forge` |
+
+Your config in `~/.config/star-forge` stays in place until you delete it.
 
 ## Quick start
 
@@ -198,6 +271,19 @@ delay you would actually see from the bare commands is that of the slowest one (
 Run it on your machine with `mise run bench` from a checkout. It uses a throwaway config and
 daemon, so your own setup is untouched. Set `SLOW_SECS` to change the stand-in delay. Results
 are also written to `bench/results.md` under Cargo's target directory.
+
+## Development
+
+```sh
+mise install          # Rust toolchain, mr-boxington, linters
+mise run build        # debug build; `mise run build-release` for target/release/{stfg,stfgd}
+mise run check        # fmt-check, clippy, tests, docs, Markdown lint
+```
+
+The mise tasks run Cargo through [Mr Boxington](https://mr-boxington.jdx.dev) (`mbx`), which
+reuses compiled Rust work across builds and checkouts on this machine. The first build fills the
+cache; later matching builds reuse it. Plain `cargo` still works and skips the cache, which is
+what CI uses. Run `mise tasks` for the full list.
 
 ## Troubleshooting
 

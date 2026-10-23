@@ -1,4 +1,3 @@
-wrappers = { cargo = { command = "mbx", env = { MBX_CARGO_SHIM_MODE = "1" } } }
 [settings]
 lockfile = true
 http_retries = 3
@@ -21,9 +20,15 @@ rumdl = "0.2.78"
 "github:jdx/packslip" = "1.6.0"
 hyperfine = "1.20.0"
 
+# Tasks that compile run Cargo through mbx (mr-boxington): compiled crates are cached and shared
+# across checkouts. Plain `cargo` keeps working without it; CI uses plain Cargo.
 [tasks.build]
 description = "Build the Rust project"
-run = "cargo build"
+run = "mbx build"
+
+[tasks.build-release]
+description = "Build the optimized release binaries"
+run = "mbx build --release --locked"
 
 [tasks.fmt]
 description = "Format Rust sources"
@@ -36,17 +41,17 @@ run = "cargo fmt --all -- --check"
 [tasks.lint]
 description = "Run Clippy with warnings denied"
 run = [
-  "cargo clippy --all-targets --all-features -- -D warnings",
-  "cargo clippy --no-default-features --all-targets -- -D warnings",
+  "mbx clippy --all-targets --all-features -- -D warnings",
+  "mbx clippy --no-default-features --all-targets -- -D warnings",
 ]
 
 [tasks.test]
 description = "Run the test suite"
-run = "cargo test"
+run = "mbx test"
 
 [tasks.doc]
 description = "Build crate docs with warnings denied"
-run = 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items'
+run = 'RUSTDOCFLAGS="-D warnings" mbx doc --no-deps --document-private-items'
 
 [tasks.md-fmt]
 description = "Format Markdown files"
@@ -62,4 +67,5 @@ depends = ["fmt-check", "lint", "test", "doc", "md-check"]
 
 [tasks.bench]
 description = "Benchmark stfg against running the same commands directly"
+env = { CARGO_BIN = "mbx" }
 run = "bash scripts/bench.sh"

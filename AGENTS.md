@@ -8,7 +8,9 @@ Rust 2024 binary crate. MSRV 1.88 (`clippy.toml`, `Cargo.toml`).
 ## Setup
 
 `mise install` installs the toolchain plus the fff and ripwire MCP servers (see `.mcp.json`) and
-mr-boxington (`mbx`), which routes plain `cargo` through a shared compile cache.
+mr-boxington (`mbx`), a Cargo wrapper with a shared compile cache. The mise tasks that compile
+call `mbx` directly; plain `cargo` bypasses the cache. Prefer the mise tasks, or prefix ad-hoc
+Cargo commands with `mbx` (`mbx build --no-default-features --bin stfg`). CI uses plain Cargo.
 
 ## Layout
 
@@ -20,7 +22,7 @@ Single `star-forge` crate: the `stfgd` daemon and the `stfg` bin (std + libc `ge
 
 - `mise run check` — fmt-check, clippy (`-D warnings`), tests, docs, Markdown lint
   (`rumdl`). Run before declaring work done.
-- `mise run fmt` / `md-fmt` / `lint` / `md-check` / `test` / `build`.
+- `mise run fmt` / `md-fmt` / `lint` / `md-check` / `test` / `build` / `build-release` / `bench`.
 
 ## Conventions
 

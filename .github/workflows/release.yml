@@ -14,6 +14,8 @@ jobs:
     name: Quality gate
     if: ${{ github.repository_owner == 'SkeLLLa' && !contains(github.event.head_commit.message, '[skip ci]') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -66,10 +68,18 @@ jobs:
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@v1
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.26.0
+
+      # Install via cargo-binstall like release-plz/action does: it picks the gnu build, while
+      # install-action only ships musl builds, which fail parsing the changelog template since
+      # 0.3.172 ("stack limit reached").
       - name: Install release-plz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: release-plz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo binstall release-plz@0.4.0 --strategies crate-meta-data --no-confirm
+          release-plz --version
 
       - name: Bump version and changelog
         env:
@@ -105,17 +115,21 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
 
-      - name: Install packaging tools
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        run: cargo install --locked cargo-deb cargo-generate-rpm
+      # Independent: tool compiles use cargo install's own temp target dir, so they don't
+      # contend with the release build for the target/ lock. The static stfg build below
+      # overwrites the gnu stfg, so it stays after this group.
+      - parallel:
+          - name: Install packaging tools
+            if: ${{ steps.release-plz.outputs.released == 'true' }}
+            run: cargo install --locked cargo-deb cargo-generate-rpm
 
-      - name: Install package verification tools
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        run: sudo apt-get update && sudo apt-get install -y rpm
+          - name: Install package verification tools
+            if: ${{ steps.release-plz.outputs.released == 'true' }}
+            run: sudo apt-get update && sudo apt-get install -y rpm
 
-      - name: Build release binary
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        run: cargo build --release --locked --target "${RUST_TARGET}"
+          - name: Build release binary
+            if: ${{ steps.release-plz.outputs.released == 'true' }}
+            run: cargo build --release --locked --target "${RUST_TARGET}"
 
       - name: Build static stfg
         if: ${{ steps.release-plz.outputs.released == 'true' }}
@@ -627,14 +641,7 @@ jobs:
             <body>
               <h1>star-forge package repositories</h1>
               <h2>RPM / DNF / YUM</h2>
-              <pre>sudo tee /etc/yum.repos.d/star-forge.repo &gt;/dev/null &lt;&lt;'REPO'
-          [star-forge]
-          name=star-forge
-          baseurl=${PAGES_URL}/rpm/x86_64
-          enabled=1
-          gpgcheck=0
-          repo_gpgcheck=0
-          REPO
+              <pre>sudo curl -fsSLo /etc/yum.repos.d/star-forge.repo ${PAGES_URL}/rpm/star-forge.repo
           sudo dnf install star-forge</pre>
               <h2>APT</h2>
               <pre>echo 'deb [trusted=yes] ${PAGES_URL}/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
