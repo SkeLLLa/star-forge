@@ -270,7 +270,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --bins --target "${TARGET}"
-          packaging/macos/sign.sh "target/${TARGET}/debug"
+          sh packaging/macos/sign.sh "target/${TARGET}/debug"
           codesign -dv "target/${TARGET}/debug/stfgd"
 
   audit:

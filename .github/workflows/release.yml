@@ -430,7 +430,7 @@ jobs:
       # CODESIGN_IDENTITY is the pin when signing (set above), unset otherwise: sign.sh then
       # signs ad hoc. With a pin it also verifies the designated requirement.
       - name: Sign the binaries
-        run: packaging/macos/sign.sh "target/${TARGET}/release"
+        run: sh packaging/macos/sign.sh "target/${TARGET}/release"
 
       - name: Remove signing keychain and certificate
         if: ${{ env.SIGNING_CONFIGURED == 'true' }}
