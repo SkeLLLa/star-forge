@@ -74,13 +74,19 @@ This is the recommended method on Debian and Ubuntu: `apt upgrade` then keeps `s
 date.
 
 ```sh
-echo 'deb [trusted=yes] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/star-forge.asc https://skellla.github.io/star-forge/star-forge.asc
+echo 'deb [signed-by=/etc/apt/keyrings/star-forge.asc] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
 sudo apt update
 sudo apt install star-forge
 ```
 
-The repositories are unsigned (`trusted=yes`, `repo_gpgcheck=0`), so their integrity depends on
-HTTPS to GitHub Pages. They track every release.
+The packages and the repository metadata are signed with the star-forge packages key,
+[star-forge.asc](https://skellla.github.io/star-forge/star-forge.asc) (the same as
+[packaging/signing/repo.asc](packaging/signing/repo.asc)); APT and DNF refuse anything it didn't
+sign. DNF asks you to confirm the key's fingerprint on the first install. The repositories keep
+the 10 most recent releases, so you can also pin or downgrade a version
+([details](docs/distribution.md#linux-signing)).
 
 ### A single .deb or .rpm file
 
@@ -157,7 +163,7 @@ unit), then:
 | Installed with | Remove with |
 | --- | --- |
 | DNF | `sudo dnf remove star-forge`, then `sudo rm /etc/yum.repos.d/star-forge.repo` |
-| APT | `sudo apt remove star-forge`, then `sudo rm /etc/apt/sources.list.d/star-forge.list` |
+| APT | `sudo apt remove star-forge`, then `sudo rm /etc/apt/sources.list.d/star-forge.list /etc/apt/keyrings/star-forge.asc` |
 | Tarball or packslip | `rm ~/.local/bin/stfg ~/.local/bin/stfgd` |
 | mise | `mise unuse -g github:SkeLLLa/star-forge` |
 | Nix | `nix profile remove star-forge` |

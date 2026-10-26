@@ -60,15 +60,16 @@ The unit does not change the daemon's lifecycle:
 
 ### GitHub Pages repositories
 
-Release CI publishes unsigned package repositories at:
+Release CI publishes signed package repositories (see [Linux signing](#linux-signing)) at:
 
 - `https://skellla.github.io/star-forge/rpm/x86_64`
 - `https://skellla.github.io/star-forge/deb`
 
-The RPM repository is generated with `createrepo_c --compatibility`. The APT repository uses a
-`stable` suite and `main` component generated from the published `.deb` packages. GitHub Releases
-remain the long-term artifact archive; Pages keeps the current release plus up to nine previous
-ones.
+and the public key at `https://skellla.github.io/star-forge/star-forge.asc`.
+`packaging/ci/pages-repo.sh` builds them: the RPM repository with `createrepo_c --compatibility`,
+the APT repository (a `stable` suite and `main` component) with `apt-ftparchive`, and an
+`index.html` listing in every directory, since Pages serves none. GitHub Releases remain the
+long-term artifact archive; Pages keeps the current release plus up to nine previous ones.
 
 One-time repository setup: GitHub Pages must use **GitHub Actions** as its source (Settings →
 Pages → Build and deployment), or equivalently:
@@ -111,6 +112,10 @@ GitHub Actions keeps source verification separate from release automation:
 - Release artifacts are built by jobs with `contents: read` only. One `checksums` job hashes and
   attests every asset, and only `publish-assets` can write to the release (with `gh`, not a
   third-party release action).
+- Every container image is pinned by digest, and `scripts/check-action-pins.sh` also fails on an
+  image not listed in `packaging/ci/images.env` (the pin gate fetches that file at the triggering
+  commit too). Dependabot bumps action SHAs only, never these digests: update `images.env` and
+  the workflows by hand.
 - Dependabot waits seven days after a release before proposing it (`cooldown`), so a compromised
   version has time to be pulled.
 - `mise run check` runs the same pin check, jactionlint and shellcheck locally.
@@ -126,21 +131,24 @@ The release flow:
    - `linux-assets` builds the optimized gnu binaries, replaces `stfg` with the static musl build
      of `stfg`, assembles the tarball, builds `deb` via `cargo-deb` and `rpm` via
      `cargo-generate-rpm`, and verifies both packages contain the binaries, docs, notices, and
-     the user unit.
+     the user unit. The tarball, `.deb` and `.rpm` are separate artifacts.
    - `linux-musl-assets` builds the static `x86_64-unknown-linux-musl` tarball with `musl-tools`,
      checks the binaries are static, and smoke-tests them.
    - `macos-assets` builds both macOS targets, signs them (see [Signing](#signing)), and
      smoke-tests the native one.
-7. `checksums` writes one `.sha256` sidecar per artifact plus `SHA256SUMS`, and attests the build
+7. `sign-linux` signs the `.rpm` (see [Linux signing](#linux-signing)), and `verify-linux`
+   checks its signature and installs the `.rpm` on Fedora 44 and the `.deb` on Debian trixie and
+   Ubuntu 26.04, then smoke-tests `stfg`.
+8. `checksums` writes one `.sha256` sidecar per artifact plus `SHA256SUMS`, and attests the build
    provenance of every artifact.
-8. `publish-assets` attaches the artifacts and checksums to the GitHub release and appends the
+9. `publish-assets` attaches the artifacts and checksums to the GitHub release and appends the
    macOS signing note to the release notes.
-9. `jdx/packslip` then signs a `packslip.sigstore.json` manifest covering the gnu, musl, and macOS
-   tarballs (used by `packslip install` and the `mise` packslip backend), recording the commit
-   the tag points to. The signing job has read-only access; a separate job uploads the bundle,
-   and a third verifies it against the published tarballs and the signer fingerprint in
-   `README.md`.
-10. It builds and deploys RPM/APT repository metadata to GitHub Pages.
+10. `jdx/packslip` then signs a `packslip.sigstore.json` manifest covering the gnu, musl, and macOS
+    tarballs (used by `packslip install` and the `mise` packslip backend), recording the commit
+    the tag points to. The signing job has read-only access; a separate job uploads the bundle,
+    and a third verifies it against the published tarballs and the signer fingerprint in
+    `README.md`.
+11. `repo` builds the signed APT and DNF repositories, and `pages` deploys them to GitHub Pages.
 
 The release workflow uses the default `GITHUB_TOKEN` for repository operations. It does not depend
 on a PAT to trigger a second workflow.
@@ -220,6 +228,98 @@ CODESIGN_IDENTITY="$(cat ~/.local/share/macos-signing/ua.SkeLLLa.star-forge.dev/
   packaging/macos/sign.sh target/release
 codesign -d -r- target/release/stfgd
 ```
+
+## Linux signing
+
+The .rpm files and the APT and DNF repository metadata are signed with an OpenPGP key: a
+committed pin, a key that lives only in a `master`-only environment, and a release that fails
+rather than ship unsigned or with another key once the pin exists. The key's primary part, which
+users trust, stays offline with a passphrase; CI holds only a signing subkey, without the
+primary's secret. The key is star-forge's own and signs no other project's packages.
+
+| Signed                                | Checked by                                                |
+| ------------------------------------- | --------------------------------------------------------- |
+| each .rpm (release page and DNF repo) | dnf (`gpgcheck=1`), `rpm -K`                              |
+| `rpm/x86_64/repodata/repomd.xml`      | dnf (`repo_gpgcheck=1`)                                   |
+| APT `InRelease` and `Release.gpg`     | apt (`signed-by`); `InRelease` lists every .deb's SHA-256 |
+
+The .deb files carry no signature of their own: APT never checks one (`dpkg-sig` and `debsigs`
+are off by default), so the signed `InRelease` is what covers them. A .deb downloaded from the
+release page is covered by the checksums and attestations instead.
+
+**Pin.** `packaging/signing/repo.asc` holds the public key (the primary, its subkeys and their
+revocations), armored, and only it. While it is absent, `sign-linux` passes the packages through
+unsigned and `repo` builds unsigned repositories, with a notice. Once it is committed,
+`packaging/ci/linux-signing.sh import` fails the release when the `REPO_SIGNING_KEY` secret is
+missing, belongs to another primary key, or can't sign (passphrase, expiry, or a subkey the pin
+revokes); setting the secret without committing the pin fails too. `import` also merges the pin
+into CI's keyring, so the published `star-forge.asc` is the committed certificate.
+`verify-linux` checks the .rpm against the pin before installing it, and `repo` checks every .rpm
+it publishes.
+
+**Where it signs.** `sign-linux` runs after `linux-assets`, in the Fedora 44 container with
+`rpm-sign`, and replaces the `release-linux-rpm` artifact with the signed file, so
+`verify-linux`, `checksums` and the release page see only that. No build runs in a job that holds
+the key. `repo` (in the Debian trixie container: the runner's rpm 4.18 can't read a pin with a
+revoked subkey) signs the metadata and also signs the .rpm files of the earlier releases it
+republishes. The release's own is already signed and stays byte-identical, while those from
+before the key, or signed by a since-revoked subkey, differ from their release page copies (and
+checksums) by the signature. `pages` only deploys the site, so the key and the Pages deploy token
+never share a job.
+
+**Secret.** The subkey lives only in the `linux-signing` GitHub environment, used by
+`sign-linux` and `repo`:
+
+| Secret             | Value                                                                         |
+| ------------------ | ----------------------------------------------------------------------------- |
+| `REPO_SIGNING_KEY` | one signing subkey, armored, without a passphrase (`linux-signing.sh ci-key`) |
+
+Settings → Environments → New environment `linux-signing`, deployment branches: only `master`
+(optionally required reviewers), or:
+
+```sh
+gh api -X PUT repos/SkeLLLa/star-forge/environments/linux-signing \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/SkeLLLa/star-forge/environments/linux-signing/deployment-branch-policies \
+  -f name=master
+```
+
+Don't keep it as a repository secret.
+
+**Making the key.** On the maintainer's machine, not in CI, in a keyring kept for it (`gpg`
+asks for the passphrase). RSA 4096 is what every supported rpm, dnf and apt (sqv) accepts. The
+primary can only certify; the subkey can only sign:
+
+```sh
+export GNUPGHOME=~/.local/share/package-signing/gnupg   # any private directory
+install -d -m 700 "$GNUPGHOME"
+gpg --quick-gen-key 'star-forge packages <you@example.com>' rsa4096 cert never
+FPR=<the primary's fingerprint, from gpg -K>
+gpg --quick-add-key "$FPR" rsa4096 sign 3y
+SUB=<the new subkey's fingerprint, from gpg -K --with-subkey-fingerprints>
+gpg --armor --export "$FPR" > packaging/signing/repo.asc
+packaging/ci/linux-signing.sh ci-key "$SUB" | gh secret set REPO_SIGNING_KEY --env linux-signing
+```
+
+`ci-key` exports that one subkey with the primary's secret left out and the passphrase removed.
+Keep offline, apart from each other: the keyring (the primary's secret is passphrase-protected)
+and the revocation certificate gpg wrote to `$GNUPGHOME/openpgp-revocs.d/<fingerprint>.rev`,
+which revokes the whole key even if the keyring is lost. Commit `repo.asc` in the same change
+that updates the README's install commands to the signed ones (the index page shows them); the
+next release is the first signed one.
+
+**Rotating or revoking the subkey.** Users trust the primary, so a subkey change needs no action
+from them beyond the `star-forge.asc` they fetch. Before the subkey expires, or if the secret
+leaks: with the offline keyring, revoke the old subkey if it leaked (`gpg --edit-key "$FPR"`,
+`key N`, `revkey`, `save`), add a new one with `--quick-add-key`, export `repo.asc` again and set
+the secret from `ci-key` for the new one. Commit `repo.asc`: until then, `import` refuses a
+subkey the pin doesn't know, and once a revocation is committed it refuses the revoked one. Users
+then get the revocation with the next `star-forge.asc` they fetch; dnf refuses packages signed
+by the revoked subkey, and `repo` re-signs the earlier releases' with the new one. If the primary
+itself leaks, import the revocation certificate (remove the `:` before `-----BEGIN` first),
+commit the revoked `repo.asc` (every release fails from then on), and start over with a new key;
+users have to fetch it again.
 
 ## Crates.io Trusted Publishing
 
@@ -328,7 +428,9 @@ sudo dnf install star-forge
 ### APT repository
 
 ```bash
-echo 'deb [trusted=yes] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/star-forge.asc https://skellla.github.io/star-forge/star-forge.asc
+echo 'deb [signed-by=/etc/apt/keyrings/star-forge.asc] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
 sudo apt update
 sudo apt install star-forge
 ```

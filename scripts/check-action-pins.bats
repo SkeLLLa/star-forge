@@ -244,3 +244,23 @@ on:
     run "${checker}" "${BATS_TEST_TMPDIR}/missing.yml"
     [ "${status}" -ne 0 ]
 }
+
+# Container images: a digest is required, and it must be listed in images.env.
+job_container() { printf 'jobs:\n  a:\n    container: %s\n    steps:\n      - run: "true"\n' "$1"; }
+@test "container listed in images.env" {
+    printf 'DEBIAN_IMAGE=debian:trixie@sha256:%s\n' "${digest}" >"${BATS_TEST_TMPDIR}/images.env"
+    IMAGES="${BATS_TEST_TMPDIR}/images.env" accepts "$(job_container "debian:trixie@sha256:${digest}")"
+}
+@test "matrix image listed in images.env" {
+    printf 'FEDORA_IMAGE=fedora:44@sha256:%s\n' "${digest}" >"${BATS_TEST_TMPDIR}/images.env"
+    # shellcheck disable=SC2016 # ${{ }} is the workflow's expression, not the shell's.
+    IMAGES="${BATS_TEST_TMPDIR}/images.env" accepts "$(printf 'jobs:\n  a:\n    strategy:\n      matrix:\n        include:\n          - { image: "fedora:44@sha256:%s" }\n    container: ${{ matrix.image }}\n    steps:\n      - run: "true"\n' "${digest}")"
+}
+@test "container not in images.env" {
+    printf 'DEBIAN_IMAGE=debian:trixie@sha256:%s\n' "${digest}" >"${BATS_TEST_TMPDIR}/images.env"
+    IMAGES="${BATS_TEST_TMPDIR}/images.env" rejects "$(job_container "debian:bookworm@sha256:${digest}")"
+}
+@test "container tag" {
+    printf 'DEBIAN_IMAGE=debian:trixie@sha256:%s\n' "${digest}" >"${BATS_TEST_TMPDIR}/images.env"
+    IMAGES="${BATS_TEST_TMPDIR}/images.env" rejects "$(job_container "debian:trixie")"
+}

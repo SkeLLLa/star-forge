@@ -101,7 +101,7 @@ jobs:
       - name: jactionlint
         run: jactionlint
       - name: shellcheck
-        run: shellcheck scripts/*.sh scripts/*.bats packaging/macos/*.sh
+        run: shellcheck -S info scripts/*.sh scripts/*.bats packaging/macos/*.sh packaging/ci/*.sh
 
   rust-quality:
     name: Rust quality (stable)

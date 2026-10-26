@@ -77,7 +77,7 @@ run = ["bats scripts/check-action-pins.bats", "sh scripts/check-action-pins.sh .
 
 [tasks."lint:shell"]
 description = "shellcheck the repository's shell scripts"
-run = "shellcheck scripts/*.sh scripts/*.bats packaging/macos/*.sh"
+run = "shellcheck -S info scripts/*.sh scripts/*.bats packaging/macos/*.sh packaging/ci/*.sh"
 
 [tasks.check]
 description = "Run the full quality suite"
