@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0](https://github.com/SkeLLLa/star-forge/compare/v1.4.2...v1.5.0) - 2026-10-26
+
+### Added
+
+- *(linux)* repo signing
+
 ## [1.4.2](https://github.com/SkeLLLa/star-forge/compare/v1.4.1...v1.4.2) - 2026-10-26
 
 ### Other
