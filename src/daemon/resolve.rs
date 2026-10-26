@@ -16,8 +16,26 @@ use super::{Daemon, maybe_evict_idle, refresh_power_if_due, spawn_fetch};
 use crate::config::{Config, Scope, Source};
 use crate::provider;
 
-/// The client's variables, borrowed from the request line.
-pub(super) type ClientEnv<'a> = Option<Vec<(&'a str, &'a str)>>;
+/// A request's env block, borrowed from the request line.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ClientEnv<'a> {
+    pub vars: Vec<(&'a str, &'a str)>,
+    /// `client::env_patterns_tag` of the patterns the client filtered by (`None`: it sent its
+    /// whole environment).
+    pub tag: Option<&'a str>,
+}
+
+impl<'a> ClientEnv<'a> {
+    /// The variables, if the block can be trusted under `cfg`: a client that filtered by a
+    /// stale pattern file may have left out a variable a badge forwards, which would then
+    /// read as unset. Such a request gets the daemon's own env instead, like an older client,
+    /// under a separate cache key.
+    fn vars_for(&self, cfg: &Config) -> Option<&[(&'a str, &'a str)]> {
+        self.tag
+            .is_none_or(|tag| tag == crate::client::env_patterns_tag(&cfg.env_patterns()))
+            .then_some(&self.vars[..])
+    }
+}
 
 /// The client's variables a badge's `env` allowlist selects, sorted: part of the cache key.
 /// `None` when the badge has no `env` or the client sent none (the daemon's env is used).
@@ -243,7 +261,7 @@ const MAX_ATTEMPTS: usize = 3;
 pub(super) async fn handle_get(
     state: &Arc<Daemon>,
     cwd: Option<&str>,
-    env: Option<&[(&str, &str)]>,
+    env: Option<&ClientEnv<'_>>,
     requested: &[String],
 ) -> Answer {
     let mut cfg = state.config();
@@ -254,7 +272,8 @@ pub(super) async fn handle_get(
     let mut attempt = 1;
     loop {
         let badges = fetch_names(&cfg, requested);
-        match resolve(state, &cfg, cwd, env, &badges, deadline).await {
+        let vars = env.and_then(|e| e.vars_for(&cfg));
+        match resolve(state, &cfg, cwd, vars, &badges, deadline).await {
             Outcome::Reloaded(_) if attempt < MAX_ATTEMPTS => {
                 attempt += 1;
                 cfg = state.config();
@@ -427,23 +446,31 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// A reload landing while the snapshot runs (the swap below is spawned, so it runs at the
-    /// snapshot's `.await`) used to answer blank; now the request restarts under the new
-    /// config.
+    /// A reload landing while the snapshot runs used to answer blank. `resolve` under the
+    /// replaced config (what a request sees once the reload lands at the snapshot's `.await`)
+    /// reports it without creating an old-config entry, and `handle_get` then answers under
+    /// the new config. Driven directly: whether a spawned swap runs at that `.await` depends on
+    /// the blocking thread's timing.
     #[tokio::test]
     async fn reload_during_snapshot_retries_instead_of_answering_blank() {
         let tmp = TempDir::new("reload-race");
         let dir = tmp.path();
         std::fs::write(dir.join(".nvmrc"), "v18").unwrap();
         let state = test_daemon(cache::Power::Ac);
-        state.set_config(&project_cfg(&[]));
+        let stale = project_cfg(&[]);
         let reloaded = project_cfg(&[]);
-        let swap = {
-            let (state, reloaded) = (Arc::clone(&state), Arc::clone(&reloaded));
-            tokio::spawn(async move { state.set_config(&reloaded) })
-        };
-        let answer = handle_get(&state, dir.to_str(), None, &["b".to_string()]).await;
-        assert!(swap.is_finished());
+        state.set_config(&reloaded);
+        let badges = ["b".to_string()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let outcome = resolve(&state, &stale, dir.to_str(), None, &badges, deadline).await;
+        assert!(matches!(outcome, Outcome::Reloaded(v) if v["b"].is_empty()));
+        assert!(
+            state.core().cache.is_empty(),
+            "no entry under the old config"
+        );
+
+        let answer = handle_get(&state, dir.to_str(), None, &badges).await;
         assert!(
             Arc::ptr_eq(&answer.cfg, &reloaded),
             "answered under the new config"
@@ -559,6 +586,14 @@ mod tests {
     }
 
     async fn get_b(state: &Arc<Daemon>, env: Option<&[(&str, &str)]>) -> String {
+        let env = env.map(|vars| ClientEnv {
+            vars: vars.to_vec(),
+            tag: None,
+        });
+        get_b_tagged(state, env.as_ref()).await
+    }
+
+    async fn get_b_tagged(state: &Arc<Daemon>, env: Option<&ClientEnv<'_>>) -> String {
         handle_get(state, None, env, &["b".to_string()])
             .await
             .values["b"]
@@ -593,6 +628,30 @@ mod tests {
         // No env block: the daemon's env, under a different key than "env sent, none matched".
         assert_eq!(get_b(&state, None).await, daemon_home);
         assert_eq!(state.core().cache.len(), 3);
+    }
+
+    /// A client that filtered by a stale `env-patterns` file (here: from before `HOME` was
+    /// forwarded) sent a block without `HOME`; trusting it would unset `HOME` and cache that.
+    /// It gets the daemon's env instead, under the no-env key.
+    #[tokio::test]
+    async fn stale_pattern_tag_falls_back_to_the_daemons_env() {
+        let state = env_badge("printf %s \"${HOME-unset}\"", &["HOME"]);
+        let daemon_home = std::env::var("HOME").unwrap_or_else(|_| "unset".into());
+        let stale_tag = crate::client::env_patterns_tag(&["PATH"]);
+        let stale = ClientEnv {
+            vars: vec![("PATH", "/bin")],
+            tag: Some(&stale_tag),
+        };
+        assert_eq!(get_b_tagged(&state, Some(&stale)).await, daemon_home);
+        let key = cache::Key::new("b", None, None);
+        assert!(state.core().cache.contains_key(&key));
+
+        let fresh_tag = crate::client::env_patterns_tag(&state.config().env_patterns());
+        let fresh = ClientEnv {
+            vars: vec![("HOME", "/h")],
+            tag: Some(&fresh_tag),
+        };
+        assert_eq!(get_b_tagged(&state, Some(&fresh)).await, "/h");
     }
 
     #[tokio::test]

@@ -47,6 +47,8 @@ struct ConfigMeta {
     /// Where the config's `env` patterns are published for clients (`None`: not published,
     /// as in tests).
     env_patterns: Option<PathBuf>,
+    /// The last publish to `env_patterns` failed; the next config check retries it.
+    env_patterns_pending: bool,
 }
 
 /// Records a config error, logging it to stderr unless it repeats the previous one.
@@ -151,6 +153,7 @@ impl Daemon {
                 checking: false,
                 last_error: None,
                 env_patterns: None,
+                env_patterns_pending: false,
             }),
             providers,
             last_request: AtomicInstant::new(now),

@@ -36,6 +36,12 @@ pub const ENV_PATTERNS_FILE: &str = "env-patterns";
 /// (a future format) is ignored, falling back to sending the whole environment.
 pub const ENV_PATTERNS_HEADER: &str = "star-forge env-patterns v1";
 
+/// Field right after [`ENV_MARK`] when the client filtered its env by [`ENV_PATTERNS_FILE`]:
+/// this prefix, then [`env_patterns_tag`] of the patterns it used. The daemon trusts such a
+/// block only if the tag matches its config's patterns; a stale file may have left out a
+/// variable some badge now forwards. Has no `=`, so an older daemon skips it.
+pub const ENV_TAG_PREFIX: &str = "\u{1e}tag:";
+
 /// Cap on [`ENV_PATTERNS_FILE`]: larger reads as unusable (whole environment sent).
 const MAX_ENV_PATTERNS_BYTES: u64 = 16 * 1024;
 
@@ -73,6 +79,19 @@ pub fn socket_path() -> PathBuf {
 
 pub fn env_patterns_path() -> PathBuf {
     runtime_dir().join(ENV_PATTERNS_FILE)
+}
+
+/// Identifies a pattern list (in order) across processes and builds: 64-bit FNV-1a over the
+/// patterns, each followed by `\n`, as 16 hex digits.
+pub fn env_patterns_tag<S: AsRef<str>>(patterns: &[S]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in patterns
+        .iter()
+        .flat_map(|p| p.as_ref().bytes().chain(std::iter::once(b'\n')))
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// `pattern` is a variable name, or a prefix with one trailing `*`.
@@ -255,15 +274,30 @@ fn valid_field(s: &str) -> bool {
     !s.chars().any(|c| c == '\n' || c == FIELD_SEP)
 }
 
+/// The env block of a `get` request (see [`encode_request`]).
+#[derive(Debug, PartialEq, Eq)]
+enum EnvBlock {
+    /// The whole environment, for a daemon that published no patterns. Entries that can't be
+    /// encoded or exceed [`MAX_ENV_ENTRY_BYTES`] are skipped.
+    All(Vec<(String, String)>),
+    /// Just the variables the daemon's patterns select, tagged with [`env_patterns_tag`]. All
+    /// of them or none: a variable left out would read as unset.
+    Selected {
+        tag: String,
+        vars: Vec<(String, String)>,
+    },
+}
+
 /// Encodes the one-line `get` request. `None` if `cwd` or any badge contains `\n` or the
 /// field separator — the caller must print empty lines without connecting in that case.
 /// `env: None` sends no env block (the daemon uses its own); `Some` sends one, even empty, so
-/// the daemon knows the client lacks every variable it didn't send.
+/// the daemon knows the client lacks every variable it didn't send. A selection with a
+/// variable that can't be encoded, or a block past the line cap, is dropped whole.
 fn encode_request(
     version: &str,
     cwd: &str,
     badges: &[String],
-    env: Option<&[(String, String)]>,
+    env: Option<&EnvBlock>,
 ) -> Option<String> {
     if !valid_field(cwd) || badges.iter().any(|b| !valid_field(b)) {
         return None;
@@ -281,17 +315,33 @@ fn encode_request(
         req.push_str(b);
     }
     let base = req.len();
-    if let Some(env) = env {
+    // A name starting with `\x1e` could be read back as the tag field.
+    let encodable = |(k, v): &(String, String)| {
+        !k.contains('=') && !k.starts_with('\u{1e}') && valid_field(k) && valid_field(v)
+    };
+    let block = match env {
+        None => None,
+        Some(EnvBlock::All(vars)) => Some((
+            None,
+            vars.iter()
+                .filter(|(k, v)| k.len() + v.len() <= MAX_ENV_ENTRY_BYTES)
+                .filter(|kv| encodable(kv))
+                .collect::<Vec<_>>(),
+        )),
+        Some(EnvBlock::Selected { tag, vars }) => vars
+            .iter()
+            .all(encodable)
+            .then(|| (Some(tag), vars.iter().collect())),
+    };
+    if let Some((tag, vars)) = block {
         req.push(FIELD_SEP);
         req.push_str(ENV_MARK);
-        for (k, v) in env {
-            if k.contains('=')
-                || k.len() + v.len() > MAX_ENV_ENTRY_BYTES
-                || !valid_field(k)
-                || !valid_field(v)
-            {
-                continue;
-            }
+        if let Some(tag) = tag {
+            req.push(FIELD_SEP);
+            req.push_str(ENV_TAG_PREFIX);
+            req.push_str(tag);
+        }
+        for (k, v) in vars {
             req.push(FIELD_SEP);
             req.push_str(k);
             req.push('=');
@@ -469,6 +519,21 @@ fn current_env(patterns: Option<&[String]>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Whether some variable `patterns` select has a non-UTF-8 name or value, which can't be sent:
+/// a filtered environment is sent whole or not at all.
+fn selected_env_has_non_utf8(patterns: &[String]) -> bool {
+    std::env::vars_os().any(|(k, v)| {
+        let name = k.as_encoded_bytes();
+        let selected = patterns.iter().any(|p| {
+            p.strip_suffix('*').map_or_else(
+                || p.as_bytes() == name,
+                |prefix| name.starts_with(prefix.as_bytes()),
+            )
+        });
+        selected && (k.to_str().is_none() || v.to_str().is_none())
+    })
+}
+
 /// Parses [`ENV_PATTERNS_FILE`]: `None` unless it starts with [`ENV_PATTERNS_HEADER`].
 fn parse_env_patterns(text: &str) -> Option<Vec<String>> {
     let mut lines = text.lines();
@@ -499,11 +564,14 @@ fn read_env_patterns() -> Option<Vec<String>> {
 /// The env block to send (see [`encode_request`]): only the variables the daemon's config
 /// can use, none at all if no badge forwards env, and the whole environment when the daemon
 /// hasn't said (it filters per badge either way).
-fn env_to_send() -> Option<Vec<(String, String)>> {
+fn env_to_send() -> Option<EnvBlock> {
     match read_env_patterns() {
-        Some(patterns) if patterns.is_empty() => None,
-        Some(patterns) => Some(current_env(Some(&patterns))),
-        None => Some(current_env(None)),
+        Some(patterns) if patterns.is_empty() || selected_env_has_non_utf8(&patterns) => None,
+        Some(patterns) => Some(EnvBlock::Selected {
+            tag: env_patterns_tag(&patterns),
+            vars: current_env(Some(&patterns)),
+        }),
+        None => Some(EnvBlock::All(current_env(None))),
     }
 }
 
@@ -564,7 +632,7 @@ fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
         return empty();
     };
     let env = env_to_send();
-    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, env.as_deref()) else {
+    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, env.as_ref()) else {
         return empty();
     };
 
@@ -735,12 +803,12 @@ mod tests {
 
     #[test]
     fn encode_request_appends_env_block_after_badges() {
-        let env = [
+        let env = EnvBlock::All(vec![
             ("PATH".to_string(), "/a:/b".to_string()),
             ("BAD".to_string(), "x\ny".to_string()),
             ("A=B".to_string(), "v".to_string()),
             ("FOO".to_string(), "bar=baz".to_string()),
-        ];
+        ]);
         let req = encode_request("0.1.0", "/tmp", &["n".to_string()], Some(&env)).unwrap();
         assert_eq!(
             req,
@@ -751,10 +819,10 @@ mod tests {
     #[test]
     fn encode_request_skips_oversized_entries_and_drops_an_oversized_block() {
         let big = "x".repeat(MAX_ENV_ENTRY_BYTES);
-        let env = [
+        let env = EnvBlock::All(vec![
             ("BIG".to_string(), big),
             ("PATH".to_string(), "/a".to_string()),
-        ];
+        ]);
         let req = encode_request("0.1.0", "/tmp", &[], Some(&env)).unwrap();
         assert_eq!(
             req,
@@ -762,17 +830,69 @@ mod tests {
         );
 
         // Many individually fine entries that together exceed the line cap: block dropped.
-        let many: Vec<_> = (0..40)
-            .map(|i| (format!("V{i}"), "y".repeat(MAX_ENV_ENTRY_BYTES - 8)))
-            .collect();
+        let many = EnvBlock::All(
+            (0..40)
+                .map(|i| (format!("V{i}"), "y".repeat(MAX_ENV_ENTRY_BYTES - 8)))
+                .collect(),
+        );
         let req = encode_request("0.1.0", "/tmp", &[], Some(&many)).unwrap();
         assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\n");
     }
 
     #[test]
     fn encode_request_marks_an_empty_env_block() {
-        let req = encode_request("0.1.0", "/tmp", &[], Some(&[])).unwrap();
+        let req = encode_request("0.1.0", "/tmp", &[], Some(&EnvBlock::All(vec![]))).unwrap();
         assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\u{1f}\u{1e}env\n");
+    }
+
+    #[test]
+    fn selected_env_is_tagged_and_sent_whole_or_not_at_all() {
+        let selected = |vars: &[(&str, String)]| EnvBlock::Selected {
+            tag: "t".into(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        };
+        // Past the per-entry cap that `All` applies: a selected variable is never skipped.
+        let long = "/p:".repeat(MAX_ENV_ENTRY_BYTES / 3 + 1);
+        let req = encode_request(
+            "0.1.0",
+            "/tmp",
+            &[],
+            Some(&selected(&[("PATH", long.clone())])),
+        );
+        assert_eq!(
+            req.unwrap(),
+            format!("get\u{1f}0.1.0\u{1f}/tmp\u{1f}\u{1e}env\u{1f}\u{1e}tag:t\u{1f}PATH={long}\n")
+        );
+        // One it can't encode: no block, rather than one that reads as "PATH unset".
+        let bad = selected(&[("PATH", "/a".into()), ("X", "a\nb".into())]);
+        let req = encode_request("0.1.0", "/tmp", &[], Some(&bad)).unwrap();
+        assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\n");
+    }
+
+    #[test]
+    fn whole_env_skips_names_that_would_read_as_the_tag() {
+        let all = EnvBlock::All(vec![
+            ("\u{1e}tag:x".into(), "1".into()),
+            ("A".into(), "b".into()),
+        ]);
+        let req = encode_request("0.1.0", "/tmp", &[], Some(&all)).unwrap();
+        assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\u{1f}\u{1e}env\u{1f}A=b\n");
+    }
+
+    #[test]
+    fn env_patterns_tag_depends_on_every_pattern_and_their_order() {
+        let tag = env_patterns_tag(&["PATH", "MISE_*"]);
+        assert_eq!(tag.len(), 16);
+        assert_eq!(
+            tag,
+            env_patterns_tag(&["PATH".to_string(), "MISE_*".to_string()])
+        );
+        assert_ne!(tag, env_patterns_tag(&["MISE_*", "PATH"]));
+        assert_ne!(tag, env_patterns_tag(&["PATHMISE_*"]));
+        assert_ne!(env_patterns_tag::<&str>(&[]), env_patterns_tag(&[""]));
     }
 
     #[test]

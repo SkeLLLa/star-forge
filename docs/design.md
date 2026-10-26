@@ -147,8 +147,13 @@ badge's `env` patterns to `env-patterns` next to the socket (first line `star-fo
 v1`, then one pattern per line; written to a temp file and renamed, at startup and on each reload),
 and the client sends only the variables matching it. An empty pattern list means no block at all; a
 missing, unreadable, or headerless file (an older daemon) means the whole environment, as before.
-Either way the daemon still filters per badge by its `env` allowlist (`select_env`), so a stale file
-only costs bytes, never correctness. No block (an older client) means the daemon's own env
+Either way the daemon still filters per badge by its `env` allowlist (`select_env`). A filtered block
+starts with a `\x1etag:<hash>` field, the FNV-1a hash of the patterns the client used. The daemon
+trusts it only if that matches its current config's patterns. A stale file (a reload landing
+mid-request, a failed publish, or one left by a previous daemon) may have left out a variable a badge
+now forwards. Such a request gets the daemon's own env, under the no-env cache key, instead of
+reading the missing variable as unset. A filtered variable the client can't encode drops the whole
+block for the same reason. No block (an older client) means the daemon's own env
 (`Key::env = None`); a block, even one where nothing matches a badge's allowlist, is
 `Some(selection)` and makes `provider` `env_remove` every daemon variable matching the allowlist but
 absent from the selection, so an unset client variable doesn't leak. An older daemon reads the block

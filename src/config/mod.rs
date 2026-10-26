@@ -424,7 +424,7 @@ fn resolve_badge(
     }
     if let Some(bad) = path.env.iter().find(|p| {
         let body = p.strip_suffix('*').unwrap_or(p);
-        body.is_empty() || body.contains(['*', '='])
+        body.is_empty() || body.contains(['*', '=']) || body.contains(char::is_control)
     }) {
         return Err(format!(
             "badge {name}: invalid `env` entry {bad:?} (a variable name, or a prefix \
@@ -801,6 +801,8 @@ when_file = ["package.json"]
         let cmd = "[badge.c]\ntype = \"command\"\ncommand = \"true\"\n";
         assert!(err(&format!("{cmd}env = [\"A*B\"]\n")).contains("env"));
         assert!(err(&format!("{cmd}env = [\"*\"]\n")).contains("env"));
+        assert!(err(&format!("{cmd}env = [\"A\\r\"]\n")).contains("env"));
+        assert!(err(&format!("{cmd}env = [\"A\\nB\"]\n")).contains("env"));
         let ok = parse(&format!("{cmd}env = [\"PATH\", \"MISE_*\"]\n")).unwrap();
         assert_eq!(ok.badge["c"].path.env, ["PATH", "MISE_*"]);
     }

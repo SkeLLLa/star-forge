@@ -72,9 +72,10 @@ async fn handle_json(state: &Arc<Daemon>, stream: &mut UnixStream, line: &[u8], 
 }
 
 /// Splits a `get` line into `(ver, cwd, badges, env)`. The optional env block follows the
-/// badges, introduced by a `client::ENV_MARK` field; a request without it (an older client)
-/// has an empty env, meaning the daemon's own. Values are never logged.
-fn parse_get(text: &str) -> (&str, &str, Vec<String>, ClientEnv<'_>) {
+/// badges, introduced by a `client::ENV_MARK` field and an optional `client::ENV_TAG_PREFIX`
+/// field; a request without it (an older client) has no env, meaning the daemon's own. Values
+/// are never logged.
+fn parse_get(text: &str) -> (&str, &str, Vec<String>, Option<ClientEnv<'_>>) {
     let mut fields = text.split('\u{1f}');
     let _cmd = fields.next(); // "get"
     let ver = fields.next().unwrap_or_default();
@@ -88,7 +89,14 @@ fn parse_get(text: &str) -> (&str, &str, Vec<String>, ClientEnv<'_>) {
         }
         badges.push(f.to_string());
     }
-    let env = marked.then(|| fields.filter_map(|f| f.split_once('=')).collect());
+    let env = marked.then(|| {
+        let mut fields = fields.peekable();
+        let tag = fields
+            .next_if(|f| f.starts_with(crate::client::ENV_TAG_PREFIX))
+            .map(|f| &f[crate::client::ENV_TAG_PREFIX.len()..]);
+        let vars = fields.filter_map(|f| f.split_once('=')).collect();
+        ClientEnv { vars, tag }
+    });
     (ver, cwd, badges, env)
 }
 
@@ -104,7 +112,7 @@ async fn handle_text_get(state: &Arc<Daemon>, stream: &mut UnixStream, line: &[u
 
     schedule_reload_check(state, now);
     let cwd_opt = (!cwd.is_empty()).then_some(cwd);
-    let answer = handle_get(state, cwd_opt, env.as_deref(), &badges).await;
+    let answer = handle_get(state, cwd_opt, env.as_ref(), &badges).await;
     let out = frame_lines(response_lines(&answer.cfg, &badges, &answer.values));
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.write_all(out.as_bytes())).await;
 
@@ -169,9 +177,21 @@ mod tests {
             "get\u{1f}1.0\u{1f}/p\u{1f}a\u{1f}\u{1e}env\u{1f}PATH=/x:/y\u{1f}K=v=w\u{1f}junk",
         );
         assert_eq!(badges, ["a"]);
-        assert_eq!(env, Some(vec![("PATH", "/x:/y"), ("K", "v=w")]));
+        let vars = vec![("PATH", "/x:/y"), ("K", "v=w")];
+        assert_eq!(env, Some(ClientEnv { vars, tag: None }));
         let (_, _, _, env) = parse_get("get\u{1f}1.0\u{1f}/p\u{1f}a\u{1f}\u{1e}env");
-        assert_eq!(env, Some(vec![]));
+        let vars = vec![];
+        assert_eq!(env, Some(ClientEnv { vars, tag: None }));
+        let (_, _, _, env) =
+            parse_get("get\u{1f}1.0\u{1f}/p\u{1f}\u{1e}env\u{1f}\u{1e}tag:ab\u{1f}P=1");
+        let vars = vec![("P", "1")];
+        assert_eq!(
+            env,
+            Some(ClientEnv {
+                vars,
+                tag: Some("ab")
+            })
+        );
     }
 
     async fn shutdown_requested(s: &Daemon) -> bool {

@@ -159,9 +159,11 @@ Without that file (an older daemon) the client sends its whole environment; the 
 badge either way. A client that sends none (an older `stfg`) gets the daemon's environment.
 Variables the client lacks do not fall back to the daemon's: for a request that carried an
 environment, matching variables missing from it are unset for the command (so `VIRTUAL_ENV` after
-`deactivate` is really gone). `stfg` skips single variables over 4 KiB (exported shell functions,
-`LS_COLORS`), and drops the whole block only if the request would still exceed ~60 KiB. Values are
-never logged.
+`deactivate` is really gone). A request filtered by an out-of-date `env-patterns` file (the config
+just changed) gets the daemon's environment instead, so a newly forwarded variable never reads as
+unset. When sending its whole environment, `stfg` skips single variables over 4 KiB (exported shell
+functions, `LS_COLORS`). A filtered environment is sent whole or not at all. Either way the block is
+dropped if the request would exceed ~60 KiB. Values are never logged.
 
 ### `tool_version`
 
@@ -523,19 +525,21 @@ shows the configured badges.
 
 ## Filesystem isolation
 
-Git discovery/file reads, host builtins, configuration reads, process spawning, and
-extraction run on a bounded blocking pool, not on the daemon's single-threaded async
-event loop. Global-only requests do not inspect the client's repository. Request-time git reads
-and cold fetch waits share a budget of at least 20 ms (or `cold_wait` if larger), inside the
-client's 30 ms deadline; configuration/power maintenance has a 500 ms budget and implicit checks
-run in the background.
+Git discovery/file reads, host builtins, configuration reads, and process spawning run on
+bounded blocking pools, not on the daemon's single-threaded async event loop. Global-only
+requests do not inspect the client's repository. Request-time git reads and cold fetch waits
+share a budget of at least 20 ms (or `cold_wait` if larger), inside the client's 30 ms
+deadline; configuration/power maintenance has a 500 ms budget and implicit checks run in the
+background.
 
 A filesystem syscall already blocked on NFS/FUSE cannot be cancelled by a timeout.
 The daemon stops waiting, but its worker slot stays occupied until the operation finishes.
-There are at most four admitted blocking jobs and no unbounded application queue.
-If all slots are stuck, new filesystem-dependent work fails softly; cached global values
-and administrative commands remain available. `stop` does not wait for stuck workers.
-Restart the daemon after fixing the mount if its worker capacity does not recover.
+Work under a request's directory has 8 slots; global badges, configuration reloads and
+power probes have 4 of their own, so a hung mount can fill only the first. There is no
+unbounded application queue. If all of a pool's slots are stuck, new work for it fails
+softly; cached global values and administrative commands remain available. `stop` does
+not wait for stuck workers. Restart the daemon after fixing the mount if its worker capacity
+does not recover.
 
 The runtime directory should be on a healthy local filesystem: startup must create/lock
 the socket directory before it can serve requests.

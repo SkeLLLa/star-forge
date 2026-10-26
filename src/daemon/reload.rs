@@ -1,7 +1,8 @@
 //! Config hot-reload: file identity stamps and the throttled reload check.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::cache::{Entry, Key};
@@ -24,10 +25,18 @@ pub(super) fn stamp(config: &Path, palette: Option<&Path>) -> Stamp {
     }
 }
 
+/// Numbers each [`publish_env_patterns`] call, so a late one never replaces a newer file.
+static PUBLISH_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The newest generation that has touched the file; held across the rename (or removal).
+static PUBLISHED_GENERATION: Mutex<u64> = Mutex::new(0);
+
 /// Writes `cfg`'s `env` patterns where clients read them (`client::read_env_patterns`), so a
 /// `get` carries only variables some badge can use. Through a temp file and a rename, so a
-/// client never reads a torn file. Best effort: a client that finds no usable file sends its
-/// whole environment, which the daemon filters per badge anyway.
+/// client never reads a torn file; a publish that outlives its budget and lands after a newer
+/// one is discarded. Best effort: if the write fails the old file is removed (a client that
+/// finds no usable file sends its whole environment, which the daemon filters per badge
+/// anyway), and on any failure the next config check retries. A stale file left behind is
+/// harmless: its tag no longer matches, so the daemon uses its own environment.
 pub(super) async fn publish_env_patterns(state: &Daemon, cfg: Arc<Config>) {
     let Some(path) = state
         .config_meta
@@ -38,27 +47,44 @@ pub(super) async fn publish_env_patterns(state: &Daemon, cfg: Arc<Config>) {
     else {
         return;
     };
-    let _ = state
+    let generation = PUBLISH_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let written = state
         .providers
         .blocking
         .run(
             tokio::time::Instant::now() + MAINTENANCE_BUDGET,
             move || {
+                // Validation rejects control characters in `env`, so each pattern is one line.
                 let mut text = format!("{}\n", crate::client::ENV_PATTERNS_HEADER);
-                for p in cfg.env_patterns().into_iter().filter(|p| !p.contains('\n')) {
+                for p in cfg.env_patterns() {
                     text.push_str(p);
                     text.push('\n');
                 }
-                let tmp = path.with_extension("tmp");
-                if std::fs::write(&tmp, text)
-                    .and_then(|()| std::fs::rename(&tmp, &path))
-                    .is_err()
-                {
+                let tmp = path.with_extension(format!("tmp.{generation}"));
+                let wrote = std::fs::write(&tmp, text).is_ok();
+                let mut published = PUBLISHED_GENERATION
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *published > generation {
                     let _ = std::fs::remove_file(&tmp);
+                    return false;
                 }
+                *published = generation;
+                let ok = wrote && std::fs::rename(&tmp, &path).is_ok();
+                if !ok {
+                    let _ = std::fs::remove_file(&tmp);
+                    let _ = std::fs::remove_file(&path);
+                }
+                drop(published);
+                ok
             },
         )
         .await;
+    state
+        .config_meta
+        .lock()
+        .expect("config_meta lock poisoned")
+        .env_patterns_pending = written != Ok(true);
 }
 
 /// Whether [`check_reload`] honours the `config_check` throttle.
@@ -153,7 +179,8 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, check: ReloadCheck, now: I
         Err(why) => {
             let msg = match why {
                 Rejected::Saturated => "config check skipped: filesystem workers are busy",
-                Rejected::Expired | Rejected::Panicked => "config check timed out",
+                Rejected::Expired => "config check timed out",
+                Rejected::Panicked => "config check panicked",
             }
             .into();
             set_config_error(
@@ -169,6 +196,16 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, check: ReloadCheck, now: I
                 .expect("config_meta lock poisoned")
                 .last_error = None;
         }
+    }
+    // A failed earlier publish is retried with the running config.
+    if published.is_none()
+        && state
+            .config_meta
+            .lock()
+            .expect("config_meta lock poisoned")
+            .env_patterns_pending
+    {
+        published = Some(state.config());
     }
     // Before clearing `checking`: the next reload can't publish until this one has.
     if let Some(cfg) = published {
@@ -265,6 +302,25 @@ mod tests {
         assert_ne!(stamp(&c, Some(&p)), s2);
     }
 
+    #[tokio::test]
+    async fn failed_env_patterns_publish_is_retried_by_the_next_check() {
+        let tmp = TempDir::new("publish");
+        let dir = tmp.path().join("run");
+        let file = dir.join("env-patterns");
+        let state = test_daemon(cache::Power::Ac);
+        state.config_meta.lock().unwrap().env_patterns = Some(file.clone());
+        publish_env_patterns(&state, state.config()).await;
+        assert!(state.config_meta.lock().unwrap().env_patterns_pending);
+
+        std::fs::create_dir(&dir).unwrap();
+        check_reload(&state, ReloadCheck::Forced, Instant::now()).await;
+        assert!(!state.config_meta.lock().unwrap().env_patterns_pending);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with(crate::client::ENV_PATTERNS_HEADER));
+        let leftovers = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 1, "temp files are renamed or removed");
+    }
+
     /// Temp dir with a config (`c.toml`, group `r` = `[{a}](brand)`) and palette (`p.toml`).
     struct ReloadEnv {
         tmp: TempDir,
@@ -313,7 +369,7 @@ mod tests {
                 // Unique size per write: ctime granularity can be coarser than the test.
                 format!(
                     "palette = \"p\"\n[palettes.p]\nbrand = \"{color}\"\n#{}\n",
-                    "x".repeat(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    "x".repeat(NEXT.fetch_add(1, Ordering::Relaxed))
                 ),
             )
             .unwrap();
@@ -331,8 +387,8 @@ mod tests {
 
         /// Non-forced check, each one a "later" instant than the last (never throttled).
         async fn check(&self) {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static N: AtomicU64 = AtomicU64::new(1);
+            let n = N.fetch_add(1, Ordering::Relaxed);
             let now = Instant::now() + Duration::from_secs(3600 * n);
             check_reload(&self.state, ReloadCheck::Throttled, now).await;
         }

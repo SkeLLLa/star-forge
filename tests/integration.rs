@@ -936,6 +936,7 @@ fn global_scope_is_rejected_for_every_git_builtin_at_startup() {
         assert!(ok, "status failed while checking {name}");
         let (errors, table): (Vec<_>, Vec<_>) = status
             .lines()
+            .filter(|line| !line.starts_with("version: "))
             .partition(|line| line.starts_with("config error: "));
         assert_eq!(
             table.len(),
@@ -1136,12 +1137,13 @@ interval = "60s"
     fifo.release();
 }
 
-/// Saturate all four bounded filesystem workers with in-process reads of FIFO `HEAD`s.
-/// Global-only requests with that cwd must still return their cache entry, and stop must exit
-/// while the readers remain blocked.
+/// Saturate every path-pool worker with in-process reads of FIFO `HEAD`s. Global-only
+/// requests with that cwd must still return their cache entry, and stop must exit while the
+/// readers remain blocked.
 #[test]
 fn blocked_git_head_reads_do_not_block_global_get_status_or_stop() {
-    const WORKERS: usize = 4;
+    // `provider::PATH_WORKERS` (the test crate can't import from the binary).
+    const WORKERS: usize = 8;
 
     let env = TestEnv::new(
         r#"
@@ -1215,10 +1217,7 @@ interval = "60s"
 
     let status_started = Instant::now();
     let (status, ok) = env.run(&["status"]);
-    assert!(
-        ok,
-        "status failed while all filesystem workers were blocked"
-    );
+    assert!(ok, "status failed while every path worker was blocked");
     assert!(
         status.contains("global"),
         "status omitted the cached global key"
@@ -1230,7 +1229,7 @@ interval = "60s"
 
     let stop_started = Instant::now();
     let (_, ok) = env.run(&["stop"]);
-    assert!(ok, "stop failed while all filesystem workers were blocked");
+    assert!(ok, "stop failed while every path worker was blocked");
     assert!(
         stop_started.elapsed() < Duration::from_millis(450),
         "stop stalled behind blocked git reads"
