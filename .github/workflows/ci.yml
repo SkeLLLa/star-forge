@@ -171,11 +171,19 @@ jobs:
         run: cargo test --locked
 
   musl:
-    name: musl static build
-    runs-on: ubuntu-latest
+    name: musl static build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -185,7 +193,7 @@ jobs:
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --target x86_64-unknown-linux-musl
+          rustup toolchain install "${v}" --profile minimal --target "${TARGET}"
           rustup default "${v}"
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -194,13 +202,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('.mise.toml', 'Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-${{ hashFiles('.mise.toml', 'Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-musl-
       - name: Build
         run: |
-          cargo build --locked --no-default-features --bin stfg --target x86_64-unknown-linux-musl
-          file target/x86_64-unknown-linux-musl/debug/stfg | grep -q static
+          cargo build --locked --no-default-features --bin stfg --target "${TARGET}"
+          file "target/${TARGET}/debug/stfg" | grep -q static
 
   nix:
     name: Nix build

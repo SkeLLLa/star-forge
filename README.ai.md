@@ -50,7 +50,7 @@ If `stfg` and `stfgd` already exist, skip step 2. Neither binary has a `--versio
 
 ## Step 2: Install
 
-Supported: Linux `x86_64` (glibc or musl) and macOS (`aarch64`, `x86_64`). Pick the first
+Supported: Linux `x86_64` and `aarch64` (glibc or musl) and macOS (`aarch64`, `x86_64`). Pick the first
 method that applies and that the user is happy with:
 
 | Condition | Command |

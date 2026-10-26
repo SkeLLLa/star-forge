@@ -57,7 +57,7 @@ itself on first use.
 | Any platform | [mise, packslip, Nix or cargo](#mise-packslip-nix-or-cargo), [tarball](#any-platform-tarball) |
 
 All downloads are on the [latest release](https://github.com/SkeLLLa/star-forge/releases/latest)
-page. Native packages and repositories are x86_64 only.
+page. Native packages and repositories cover x86_64 and aarch64.
 
 ### Fedora: DNF repository
 
@@ -94,8 +94,8 @@ You get no automatic updates with this method. Download the file from the
 [latest release](https://github.com/SkeLLLa/star-forge/releases/latest), then run:
 
 ```sh
-sudo apt install ./star-forge_<version>_amd64.deb      # Debian, Ubuntu
-sudo dnf install ./star-forge-<version>-1.x86_64.rpm   # Fedora
+sudo apt install ./star-forge_<version>_amd64.deb      # Debian, Ubuntu (arm64.deb on aarch64)
+sudo dnf install ./star-forge-<version>-1.x86_64.rpm   # Fedora (aarch64.rpm on aarch64)
 ```
 
 Packages install `/usr/bin/stfg`, `/usr/bin/stfgd` and the user service
@@ -103,8 +103,8 @@ Packages install `/usr/bin/stfg`, `/usr/bin/stfgd` and the user service
 
 ### Any platform: tarball
 
-Tarballs exist for Linux (`x86_64` glibc and static musl) and macOS (`aarch64`, `x86_64`). This
-method installs for your user only and doesn't need root:
+Tarballs exist for Linux (`x86_64` and `aarch64`, glibc and static musl) and macOS (`aarch64`,
+`x86_64`). This method installs for your user only and doesn't need root:
 
 ```sh
 tar -xzf star-forge-<version>-<target>.tar.gz

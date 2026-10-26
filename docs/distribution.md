@@ -13,8 +13,9 @@
 
 ### Binary archives
 
-Linux (`x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`)
-archives contain:
+Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`) and macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`) archives
+contain:
 
 - `bin/stfgd`
 - `bin/stfg`
@@ -23,9 +24,9 @@ archives contain:
 - `THIRD_PARTY_NOTICES.md`
 
 The `stfg` in the gnu tarball, `deb` and `rpm` is itself a static musl build (the release job
-builds it with `--no-default-features --bin stfg --target x86_64-unknown-linux-musl` right after
+builds it with `--no-default-features --bin stfg --target <arch>-unknown-linux-musl` right after
 the main build and installs it over the gnu one), so it never loads libc. The
-`x86_64-unknown-linux-musl` archive is the same layout with statically linked binaries (no
+`<arch>-unknown-linux-musl` archive is the same layout with statically linked binaries (no
 libc or `libgcc_s` to load). It is published only as a `tar.gz`; there is no `deb`/`rpm`. Choose it
 when you want the fastest `stfg` startup (a dynamic binary spends roughly 200 µs per call on
 loading and runtime init), or on a distro without a compatible glibc (Alpine, old LTS). Otherwise
@@ -36,7 +37,8 @@ the host's libc.
 
 ### `deb` / `rpm`
 
-Native packages install:
+Native packages are built for `x86_64` (`amd64.deb`, `x86_64.rpm`) and `aarch64` (`arm64.deb`,
+`aarch64.rpm`) and install:
 
 - `/usr/bin/stfgd`
 - `/usr/bin/stfg`
@@ -62,7 +64,7 @@ The unit does not change the daemon's lifecycle:
 
 Release CI publishes signed package repositories (see [Linux signing](#linux-signing)) at:
 
-- `https://skellla.github.io/star-forge/rpm/x86_64`
+- `https://skellla.github.io/star-forge/rpm/x86_64` and `.../rpm/aarch64`
 - `https://skellla.github.io/star-forge/deb`
 
 and the public key at `https://skellla.github.io/star-forge/star-forge.asc`.
@@ -127,18 +129,20 @@ The release flow:
 3. `release-plz update` edits the next version and `CHANGELOG.md` in the workflow checkout.
 4. The workflow commits that release bump directly back to `master` (`[skip ci]`).
 5. `release-plz release` creates the tag, publishes to crates.io, and creates the GitHub release.
-6. Three read-only build jobs check out the tag:
+6. Three read-only build jobs check out the tag; the Linux ones run once per architecture
+   (`x86_64` and `aarch64`), each on a native runner:
    - `linux-assets` builds the optimized gnu binaries, replaces `stfg` with the static musl build
      of `stfg`, assembles the tarball, builds `deb` via `cargo-deb` and `rpm` via
      `cargo-generate-rpm`, and verifies both packages contain the binaries, docs, notices, and
      the user unit. The tarball, `.deb` and `.rpm` are separate artifacts.
-   - `linux-musl-assets` builds the static `x86_64-unknown-linux-musl` tarball with `musl-tools`,
+   - `linux-musl-assets` builds the static `<arch>-unknown-linux-musl` tarball with `musl-tools`,
      checks the binaries are static, and smoke-tests them.
    - `macos-assets` builds both macOS targets, signs them (see [Signing](#signing)), and
      smoke-tests the native one.
-7. `sign-linux` signs the `.rpm` (see [Linux signing](#linux-signing)), and `verify-linux`
-   checks its signature and installs the `.rpm` on Fedora 44 and the `.deb` on Debian trixie and
-   Ubuntu 26.04, then smoke-tests `stfg`.
+7. `sign-linux` signs the `.rpm` files (see [Linux signing](#linux-signing)), and `verify-linux`
+   checks their signatures and installs the `.rpm` on Fedora 44 and the `.deb` on Debian trixie
+   and Ubuntu 26.04 (`x86_64`), and on Fedora 44 and Debian trixie (`aarch64`), then smoke-tests
+   `stfg`.
 8. `checksums` writes one `.sha256` sidecar per artifact plus `SHA256SUMS`, and attests the build
    provenance of every artifact.
 9. `publish-assets` attaches the artifacts and checksums to the GitHub release and appends the
@@ -240,7 +244,7 @@ primary's secret. The key is star-forge's own and signs no other project's packa
 | Signed                                | Checked by                                                |
 | ------------------------------------- | --------------------------------------------------------- |
 | each .rpm (release page and DNF repo) | dnf (`gpgcheck=1`), `rpm -K`                              |
-| `rpm/x86_64/repodata/repomd.xml`      | dnf (`repo_gpgcheck=1`)                                   |
+| `rpm/<arch>/repodata/repomd.xml`      | dnf (`repo_gpgcheck=1`)                                   |
 | APT `InRelease` and `Release.gpg`     | apt (`signed-by`); `InRelease` lists every .deb's SHA-256 |
 
 The .deb files carry no signature of their own: APT never checks one (`dpkg-sig` and `debsigs`
@@ -258,7 +262,7 @@ into CI's keyring, so the published `star-forge.asc` is the committed certificat
 it publishes.
 
 **Where it signs.** `sign-linux` runs after `linux-assets`, in the Fedora 44 container with
-`rpm-sign`, and replaces the `release-linux-rpm` artifact with the signed file, so
+`rpm-sign`, and replaces each `release-linux-rpm-<arch>` artifact with the signed file, so
 `verify-linux`, `checksums` and the release page see only that. No build runs in a job that holds
 the key. `repo` (in the Debian trixie container: the runner's rpm 4.18 can't read a pin with a
 revoked subkey) signs the metadata and also signs the .rpm files of the earlier releases it
@@ -383,15 +387,15 @@ systemctl --user enable --now star-forge.service
 ### Binary archive
 
 ```bash
-tar -xzf star-forge-<version>-x86_64-unknown-linux-gnu.tar.gz
-install -m 755 star-forge-<version>-x86_64-unknown-linux-gnu/bin/* ~/.local/bin/
+tar -xzf star-forge-<version>-<arch>-unknown-linux-gnu.tar.gz
+install -m 755 star-forge-<version>-<arch>-unknown-linux-gnu/bin/* ~/.local/bin/
 ```
 
 To verify a downloaded artifact before installing it, download the matching `.sha256` sidecar and
 run:
 
 ```bash
-sha256sum -c star-forge-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c star-forge-<version>-<arch>-unknown-linux-gnu.tar.gz.sha256
 ```
 
 The release also includes `SHA256SUMS`, merged from every sidecar (Linux, musl, and macOS) once all
@@ -404,11 +408,11 @@ sha256sum -c --ignore-missing SHA256SUMS
 ### Native package
 
 ```bash
-sudo dpkg -i star-forge_<version>_amd64.deb
+sudo dpkg -i star-forge_<version>_amd64.deb   # arm64.deb on aarch64
 ```
 
 ```bash
-sudo rpm -i star-forge-<version>-1.x86_64.rpm
+sudo rpm -i star-forge-<version>-1.x86_64.rpm # aarch64.rpm on aarch64
 ```
 
 Then, optionally, start the daemon with the session:
