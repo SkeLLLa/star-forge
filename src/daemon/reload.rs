@@ -4,39 +4,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::cache::{Entry, Key};
 use super::{Daemon, MAINTENANCE_BUDGET, set_config_error};
+use crate::blocking::Rejected;
 use crate::config::{Config, Scope};
-
-/// Identity of a file (following symlinks): changes on rewrite, rename-on-save and retarget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct FileId {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    ctime: i64,
-    ctime_nsec: i64,
-}
+pub(super) use crate::file_id::{FileId, file_id};
 
 /// Identities of the config file and its `palette_from` file (`None` = missing/unset).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Stamp {
     pub config: Option<FileId>,
     pub palette: Option<FileId>,
-}
-
-/// Not mtime alone: `cp -p`/`rsync -a` can preserve it, and Nix store files all share mtime 1,
-/// so re-pointing a symlink (home-manager) would go unnoticed. ctime can't be set from
-/// userspace, and the inode changes on rename-on-save and on a symlink retarget.
-pub(super) fn file_id(p: &Path) -> Option<FileId> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(p).ok()?;
-    Some(FileId {
-        dev: m.dev(),
-        ino: m.ino(),
-        len: m.len(),
-        ctime: m.ctime(),
-        ctime_nsec: m.ctime_nsec(),
-    })
 }
 
 pub(super) fn stamp(config: &Path, palette: Option<&Path>) -> Stamp {
@@ -46,10 +24,56 @@ pub(super) fn stamp(config: &Path, palette: Option<&Path>) -> Stamp {
     }
 }
 
+/// Writes `cfg`'s `env` patterns where clients read them (`client::read_env_patterns`), so a
+/// `get` carries only variables some badge can use. Through a temp file and a rename, so a
+/// client never reads a torn file. Best effort: a client that finds no usable file sends its
+/// whole environment, which the daemon filters per badge anyway.
+pub(super) async fn publish_env_patterns(state: &Daemon, cfg: Arc<Config>) {
+    let Some(path) = state
+        .config_meta
+        .lock()
+        .expect("config_meta lock poisoned")
+        .env_patterns
+        .clone()
+    else {
+        return;
+    };
+    let _ = state
+        .providers
+        .blocking
+        .run(
+            tokio::time::Instant::now() + MAINTENANCE_BUDGET,
+            move || {
+                let mut text = format!("{}\n", crate::client::ENV_PATTERNS_HEADER);
+                for p in cfg.env_patterns().into_iter().filter(|p| !p.contains('\n')) {
+                    text.push_str(p);
+                    text.push('\n');
+                }
+                let tmp = path.with_extension("tmp");
+                if std::fs::write(&tmp, text)
+                    .and_then(|()| std::fs::rename(&tmp, &path))
+                    .is_err()
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            },
+        )
+        .await;
+}
+
+/// Whether [`check_reload`] honours the `config_check` throttle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReloadCheck {
+    /// Timer- or request-driven: skipped if the file was stat'ed within `config_check`.
+    Throttled,
+    /// An explicit `reload` command: always stats the file.
+    Forced,
+}
+
 /// Stats the config file at most once every `config_check` (bypassed by an explicit
 /// `reload` command) and reloads if it, or its `palette_from` file, changed (inode, size or ctime). A config that fails to parse or
 /// validate is logged and ignored; the previous config keeps running.
-pub(super) async fn check_reload(state: &Arc<Daemon>, force: bool, now: Instant) {
+pub(super) async fn check_reload(state: &Arc<Daemon>, check: ReloadCheck, now: Instant) {
     let (config_check, palette) = {
         let cfg = state.config();
         (cfg.daemon.config_check, cfg.daemon.palette_from.clone())
@@ -58,8 +82,10 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, force: bool, now: Instant)
     let (path, previous) = loop {
         let notified = state.reload_finished.notified();
         let ready = {
-            let mut meta = state.config_meta.lock().unwrap();
-            if !force && now.saturating_duration_since(meta.last_checked) < config_check {
+            let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
+            if check == ReloadCheck::Throttled
+                && now.saturating_duration_since(meta.last_checked) < config_check
+            {
                 return;
             }
             if meta.checking {
@@ -73,7 +99,9 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, force: bool, now: Instant)
         if let Some(ready) = ready {
             break ready;
         }
-        if !force || tokio::time::timeout_at(deadline, notified).await.is_err() {
+        if check == ReloadCheck::Throttled
+            || tokio::time::timeout_at(deadline, notified).await.is_err()
+        {
             return;
         }
     };
@@ -82,7 +110,7 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, force: bool, now: Instant)
         .blocking
         .run(deadline, move || {
             let pre = stamp(&path, palette.as_deref());
-            if !force && previous == pre {
+            if check == ReloadCheck::Throttled && previous == pre {
                 return None;
             }
             let cfg = Config::load(&path);
@@ -98,74 +126,105 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, force: bool, now: Instant)
             Some((st, cfg))
         })
         .await;
+    // Set by a successful reload; published once every lock is released.
+    let mut published = None;
     match result {
-        Some(Some((st, Ok(new_cfg)))) => {
-            let mut meta = state.config_meta.lock().unwrap();
+        Ok(Some((st, Ok(new_cfg)))) => {
+            let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
             meta.stamp = st;
             meta.last_error = None;
             drop(meta);
-            let mut current = state.config.lock().unwrap();
-            let mut cache = state.cache.lock().unwrap();
-            cache.retain(|key, entry| {
-                let name = &key.badge;
-                let Some(badge) = new_cfg.badge.get(name) else {
-                    return false;
-                };
-                if key.root.is_some() != (badge.scope != Scope::Global) {
-                    return false;
-                }
-                // Scoped keys embed the old root/env: if what selects them changed, they
-                // can never be hit again (or hold a value computed another way).
-                if key.is_scoped()
-                    && current.badge.get(name).is_none_or(|old| {
-                        old.source != badge.source
-                            || old.scope != badge.scope
-                            || old.path != badge.path
-                    })
-                {
-                    return false;
-                }
-                // Keep activity and the last good value, but refresh under the new
-                // config. Stale fetch completions are rejected by `spawn_fetch`'s `Arc::ptr_eq` on the
-                // config and the entry identity.
-                entry.fetched_at = None;
-                entry.in_flight = false;
-                entry.fingerprint = None;
-                entry.watch = None;
-                entry.errors = 0;
-                entry.next_attempt = Instant::now();
-                true
-            });
-            drop(cache);
-            *current = Arc::new(new_cfg);
-            drop(current);
+            let new_cfg = Arc::new(new_cfg);
+            let mut core = state.core();
+            let old_cfg = std::mem::replace(&mut core.config, Arc::clone(&new_cfg));
+            core.cache
+                .retain(|key, entry| retain_entry(&old_cfg, &new_cfg, key, entry));
+            drop(core);
             state.reschedule.notify_one();
+            published = Some(new_cfg);
         }
-        Some(Some((_, Err(e)))) => {
+        Ok(Some((_, Err(e)))) => {
             let msg = format!("config reload failed, keeping previous config: {e}");
-            set_config_error(&mut state.config_meta.lock().unwrap(), msg);
+            set_config_error(
+                &mut state.config_meta.lock().expect("config_meta lock poisoned"),
+                msg,
+            );
         }
-        None => {
-            let msg = "config check timed out or filesystem workers are busy".into();
-            set_config_error(&mut state.config_meta.lock().unwrap(), msg);
+        Err(why) => {
+            let msg = match why {
+                Rejected::Saturated => "config check skipped: filesystem workers are busy",
+                Rejected::Expired | Rejected::Panicked => "config check timed out",
+            }
+            .into();
+            set_config_error(
+                &mut state.config_meta.lock().expect("config_meta lock poisoned"),
+                msg,
+            );
         }
         // Unchanged stamp: a failed parse never stores it, so any old error was transient.
-        Some(None) => state.config_meta.lock().unwrap().last_error = None,
+        Ok(None) => {
+            state
+                .config_meta
+                .lock()
+                .expect("config_meta lock poisoned")
+                .last_error = None;
+        }
     }
-    state.config_meta.lock().unwrap().checking = false;
+    // Before clearing `checking`: the next reload can't publish until this one has.
+    if let Some(cfg) = published {
+        publish_env_patterns(state, cfg).await;
+    }
+    state
+        .config_meta
+        .lock()
+        .expect("config_meta lock poisoned")
+        .checking = false;
     state.reload_finished.notify_waiters();
+}
+
+/// Whether a reload keeps `key`'s entry, resetting it if its badge changed. An unchanged
+/// badge's entry is left as is. A changed one keeps its activity and last good value but is
+/// refreshed under the new config; its `in_flight` flag stays, so a fetch still running for it
+/// is not duplicated, and that fetch's result is discarded (see `spawn_fetch`).
+fn retain_entry(old: &Config, new: &Config, key: &Key, entry: &mut Entry) -> bool {
+    let name = &key.badge;
+    let Some(badge) = new.badge.get(name) else {
+        return false;
+    };
+    if key.root.is_some() != (badge.scope != Scope::Global) {
+        return false;
+    }
+    let previous = old.badge.get(name);
+    if previous == Some(badge) {
+        return true;
+    }
+    // Scoped keys embed the old root/env: if what selects them changed, they can never be
+    // hit again (or hold a value computed another way).
+    if key.is_scoped()
+        && previous.is_none_or(|old| {
+            old.source != badge.source || old.scope != badge.scope || old.path != badge.path
+        })
+    {
+        return false;
+    }
+    entry.fetched_at = None;
+    entry.fingerprint = None;
+    entry.watch = None;
+    entry.errors = 0;
+    entry.next_attempt = Instant::now();
+    true
 }
 
 /// Implicit checks must not consume the prompt's latency budget.
 pub(super) fn schedule_reload_check(state: &Arc<Daemon>, now: Instant) {
     let config_check = state.config().daemon.config_check;
     let due = {
-        let meta = state.config_meta.lock().unwrap();
+        let meta = state.config_meta.lock().expect("config_meta lock poisoned");
         !meta.checking && now.saturating_duration_since(meta.last_checked) >= config_check
     };
     if due {
         let state = Arc::clone(state);
-        tokio::spawn(async move { check_reload(&state, false, now).await });
+        tokio::spawn(async move { check_reload(&state, ReloadCheck::Throttled, now).await });
     }
 }
 
@@ -216,14 +275,14 @@ mod tests {
         fn new(name: &str) -> Self {
             let env = Self {
                 tmp: TempDir::new(&format!("reload-{name}")),
-                state: test_daemon(true),
+                state: test_daemon(cache::Power::Ac),
             };
             env.write_palette("p.toml", "#112233");
             env.write_config("p.toml");
             let path = env.dir().join("c.toml");
             let cfg = Config::load(&path).unwrap();
             let st = stamp(&path, cfg.daemon.palette_from.as_deref());
-            *env.state.config.lock().unwrap() = Arc::new(cfg);
+            env.state.set_config(&Arc::new(cfg));
             let mut meta = env.state.config_meta.lock().unwrap();
             meta.path = path;
             meta.stamp = st;
@@ -275,7 +334,7 @@ mod tests {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let now = Instant::now() + Duration::from_secs(3600 * n);
-            check_reload(&self.state, false, now).await;
+            check_reload(&self.state, ReloadCheck::Throttled, now).await;
         }
     }
 
@@ -289,10 +348,10 @@ mod tests {
         // Changed, but inside the `config_check` window: no stat, no reload.
         env.write_palette("p.toml", "#445566");
         let last = env.state.config_meta.lock().unwrap().last_checked;
-        check_reload(&env.state, false, last).await;
+        check_reload(&env.state, ReloadCheck::Throttled, last).await;
         assert!(Arc::ptr_eq(&before, &env.cfg()));
         // Force bypasses the throttle (and the unchanged stamp).
-        check_reload(&env.state, true, last).await;
+        check_reload(&env.state, ReloadCheck::Forced, last).await;
         assert!(!Arc::ptr_eq(&before, &env.cfg()));
         assert_eq!(env.rendered(), "#[fg=#445566]x#[default]");
         assert!(!env.state.config_meta.lock().unwrap().checking);
@@ -380,29 +439,114 @@ mod tests {
             std::fs::write(&path, format!("{same}{}", badge("moved"))).unwrap();
         };
         write("m", "E");
-        let state = test_daemon(true);
-        *state.config.lock().unwrap() = Arc::new(Config::load(&path).unwrap());
+        let state = test_daemon(cache::Power::Ac);
+        state.set_config(&Arc::new(Config::load(&path).unwrap()));
         state.config_meta.lock().unwrap().path = path.clone();
         let root = Some(PathBuf::from("/r"));
         let env = Some(vec![("E".to_string(), "1".to_string())]);
         for n in ["same", "moved"] {
-            state.cache.lock().unwrap().insert(
-                cache::Key::new(n, root.clone(), env.clone()),
-                cache::Entry::new(Instant::now()),
+            state.insert(
+                &Key::new(n, root.clone(), env.clone()),
+                Entry::new(Instant::now()),
             );
         }
-        check_reload(&state, true, Instant::now()).await;
-        assert_eq!(
-            state.cache.lock().unwrap().len(),
-            2,
-            "unchanged config keeps both"
-        );
+        check_reload(&state, ReloadCheck::Forced, Instant::now()).await;
+        assert_eq!(state.core().cache.len(), 2, "unchanged config keeps both");
 
         write("m2", "E2");
-        check_reload(&state, true, Instant::now()).await;
-        let cache = state.cache.lock().unwrap();
-        assert!(cache.contains_key(&cache::Key::new("same", root.clone(), env.clone())));
-        assert!(!cache.contains_key(&cache::Key::new("moved", root, env)));
-        drop(cache);
+        check_reload(&state, ReloadCheck::Forced, Instant::now()).await;
+        let core = state.core();
+        assert!(
+            core.cache
+                .contains_key(&Key::new("same", root.clone(), env.clone()))
+        );
+        assert!(!core.cache.contains_key(&Key::new("moved", root, env)));
+        drop(core);
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_in_flight_and_resets_only_changed_badges() {
+        let tmp = TempDir::new("reload-inflight");
+        let path = tmp.path().join("c.toml");
+        let write = |interval: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "[badge.same]\ntype = \"command\"\ncommand = \"true\"\n\
+                     [badge.edited]\ntype = \"command\"\ncommand = \"true\"\n\
+                     interval = \"{interval}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("10m");
+        let state = test_daemon(cache::Power::Ac);
+        state.set_config(&Arc::new(Config::load(&path).unwrap()));
+        state.config_meta.lock().unwrap().path = path.clone();
+        let now = Instant::now();
+        for n in ["same", "edited"] {
+            let mut entry = Entry::new(now);
+            entry.value = Some("v".into());
+            entry.fetched_at = Some(now);
+            entry.in_flight = true;
+            state.insert(&Key::global(n), entry);
+        }
+        write("20m");
+        check_reload(&state, ReloadCheck::Forced, Instant::now()).await;
+        let core = state.core();
+        let same = &core.cache[&Key::global("same")];
+        assert!(same.in_flight, "unchanged badge left as is");
+        assert_eq!(same.fetched_at, Some(now));
+        let edited = &core.cache[&Key::global("edited")];
+        assert!(edited.in_flight, "its running fetch must not be duplicated");
+        assert_eq!(edited.fetched_at, None, "refreshed under the new config");
+        assert_eq!(edited.value.as_deref(), Some("v"), "last good value kept");
+        drop(core);
+    }
+
+    #[tokio::test]
+    async fn reload_publishes_the_union_of_env_patterns() {
+        let tmp = TempDir::new("reload-env-patterns");
+        let path = tmp.path().join("c.toml");
+        let published = tmp.path().join("env-patterns");
+        let badge = |n: &str, env: &str| {
+            format!(
+                "[badge.{n}]\ntype = \"command\"\ncommand = \"true\"\nscope = \"git_root\"\n\
+                 env = [{env}]\n"
+            )
+        };
+        let state = test_daemon(cache::Power::Ac);
+        {
+            let mut meta = state.config_meta.lock().unwrap();
+            meta.path = path.clone();
+            meta.env_patterns = Some(published.clone());
+        }
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                badge("a", "\"PATH\", \"MISE_*\""),
+                badge("b", "\"PATH\"")
+            ),
+        )
+        .unwrap();
+        check_reload(&state, ReloadCheck::Forced, Instant::now()).await;
+        let header = crate::client::ENV_PATTERNS_HEADER;
+        assert_eq!(
+            std::fs::read_to_string(&published).unwrap(),
+            format!("{header}\nMISE_*\nPATH\n")
+        );
+
+        // A config without `env` publishes an empty list: clients send no env at all.
+        std::fs::write(
+            &path,
+            "[badge.c]\ntype = \"builtin\"\nname = \"hostname\"\n",
+        )
+        .unwrap();
+        check_reload(&state, ReloadCheck::Forced, Instant::now()).await;
+        assert_eq!(
+            std::fs::read_to_string(&published).unwrap(),
+            format!("{header}\n")
+        );
     }
 }

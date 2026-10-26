@@ -38,11 +38,20 @@ pub enum Scope {
     ProjectRoot,
 }
 
-/// `pattern` is a variable name, or a prefix with one trailing `*`.
-pub fn env_matches(pattern: &str, name: &str) -> bool {
-    pattern
-        .strip_suffix('*')
-        .map_or(pattern == name, |prefix| name.starts_with(prefix))
+pub use crate::client::env_matches;
+
+impl Config {
+    /// Every badge's `env` patterns, sorted and deduplicated: what clients need to send.
+    pub fn env_patterns(&self) -> Vec<&str> {
+        let mut all: Vec<&str> = self
+            .badge
+            .values()
+            .flat_map(|b| b.path.env.iter().map(String::as_str))
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
 }
 
 /// Options for command badges: path scoping (all empty = unset) and env forwarding.
@@ -86,8 +95,9 @@ pub enum Source {
 }
 
 /// One `[badge.<name>]` entry, ready to use (extract regex already compiled, every timing
-/// knob resolved to a concrete `Duration`).
-#[derive(Debug)]
+/// knob resolved to a concrete `Duration`). `PartialEq` lets a reload keep the cache entries
+/// of badges it didn't change.
+#[derive(Debug, PartialEq)]
 pub struct BadgeConfig {
     pub source: Source,
     pub extract: Option<Extract>,

@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::BadgeConfig;
 use crate::provider::GitFingerprint;
 
-/// Combined `daemon::file_id` of a badge's `watch` paths (a missing file is `None`).
-pub type WatchFp = Vec<Option<super::reload::FileId>>;
+/// Combined `file_id::file_id` of a badge's `watch` paths (a missing file is `None`).
+pub type WatchFp = Vec<Option<crate::file_id::FileId>>;
 
 /// The `env` variables (name, value) a command badge was run with, sorted by name. `None` =
 /// no env from the client (old client, or a badge without `env`): the daemon's env. `Some`
@@ -120,13 +120,19 @@ pub fn is_active(last_access: Instant, active_window: Duration, now: Instant) ->
     now.saturating_duration_since(last_access) < active_window
 }
 
+/// The machine's power source, which picks a badge's `interval` or `battery_interval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Power {
+    Ac,
+    Battery,
+}
+
 /// The AC-aware interval, shared by the timer path (`due_at`) and the request-time
-/// staleness check in `handler::handle_get` (not always `cfg.interval`).
-pub const fn effective_interval(cfg: &BadgeConfig, on_ac: bool) -> Duration {
-    if on_ac {
-        cfg.interval
-    } else {
-        cfg.battery_interval
+/// staleness check in `resolve::handle_get` (not always `cfg.interval`).
+pub const fn effective_interval(cfg: &BadgeConfig, power: Power) -> Duration {
+    match power {
+        Power::Ac => cfg.interval,
+        Power::Battery => cfg.battery_interval,
     }
 }
 
@@ -136,14 +142,14 @@ fn due_at(
     key: &Key,
     entry: &Entry,
     badges: &BTreeMap<String, BadgeConfig>,
-    on_ac: bool,
+    power: Power,
     now: Instant,
 ) -> Option<Instant> {
     if key.is_scoped() || entry.in_flight {
         return None;
     }
     let cfg = badges.get(&key.badge)?;
-    let interval = effective_interval(cfg, on_ac);
+    let interval = effective_interval(cfg, power);
     if !is_active(entry.last_access, cfg.active_window, now) {
         return None;
     }
@@ -157,12 +163,12 @@ fn due_at(
 pub fn next_due(
     cache: &HashMap<Key, Entry>,
     badges: &BTreeMap<String, BadgeConfig>,
-    on_ac: bool,
+    power: Power,
     now: Instant,
 ) -> Option<Instant> {
     cache
         .iter()
-        .filter_map(|(key, entry)| due_at(key, entry, badges, on_ac, now))
+        .filter_map(|(key, entry)| due_at(key, entry, badges, power, now))
         .min()
 }
 
@@ -171,14 +177,14 @@ pub fn next_due(
 pub fn due_keys(
     cache: &HashMap<Key, Entry>,
     badges: &BTreeMap<String, BadgeConfig>,
-    on_ac: bool,
+    power: Power,
     coalesce: Duration,
     now: Instant,
 ) -> Vec<Key> {
     cache
         .iter()
         .filter_map(|(key, entry)| {
-            let due = due_at(key, entry, badges, on_ac, now)?;
+            let due = due_at(key, entry, badges, power, now)?;
             (due <= now + coalesce).then(|| key.clone())
         })
         .collect()
@@ -273,9 +279,10 @@ pub fn evict(
 }
 
 #[cfg(test)]
-// Test data builds `Instant`s a fixed, small offset before `Instant::now()`; that can
-// never underflow, so the checked-subtraction ceremony would be pure noise here.
-#[allow(clippy::unchecked_time_subtraction)]
+#[expect(
+    clippy::unchecked_time_subtraction,
+    reason = "test `Instant`s sit a small fixed offset before `Instant::now()` and never underflow"
+)]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -368,7 +375,7 @@ mod tests {
         e_path.fetched_at = Some(now - Duration::from_secs(1000));
         cache.insert(Key::new("a", Some(PathBuf::from("/repo")), None), e_path);
 
-        let due = next_due(&cache, &badges, true, now);
+        let due = next_due(&cache, &badges, Power::Ac, now);
         assert_eq!(
             due,
             Some(now - Duration::from_secs(100) + Duration::from_secs(10))
@@ -392,8 +399,8 @@ mod tests {
         e.fetched_at = Some(now);
         cache.insert(Key::global("a"), e);
 
-        let on_ac = next_due(&cache, &badges, true, now).unwrap();
-        let on_batt = next_due(&cache, &badges, false, now).unwrap();
+        let on_ac = next_due(&cache, &badges, Power::Ac, now).unwrap();
+        let on_batt = next_due(&cache, &badges, Power::Battery, now).unwrap();
         assert_eq!(on_ac - now, Duration::from_secs(10));
         assert_eq!(on_batt - now, Duration::from_secs(45));
     }
@@ -407,11 +414,11 @@ mod tests {
         entry.next_attempt = now + Duration::from_secs(2);
         let mut cache = HashMap::from([(Key::global("a"), entry)]);
         assert_eq!(
-            next_due(&cache, &badges, true, now),
+            next_due(&cache, &badges, Power::Ac, now),
             Some(now + Duration::from_secs(2))
         );
         cache.get_mut(&Key::global("a")).unwrap().next_attempt = now;
-        assert_eq!(next_due(&cache, &badges, true, now), Some(now));
+        assert_eq!(next_due(&cache, &badges, Power::Ac, now), Some(now));
     }
 
     #[test]
@@ -429,7 +436,7 @@ mod tests {
         e_b.fetched_at = Some(now - Duration::from_millis(9500));
         cache.insert(Key::global("b"), e_b);
 
-        let due = due_keys(&cache, &badges, true, Duration::from_secs(1), now);
+        let due = due_keys(&cache, &badges, Power::Ac, Duration::from_secs(1), now);
         assert_eq!(due.len(), 2);
     }
 
@@ -448,7 +455,7 @@ mod tests {
         cache.insert(Key::global("b"), e_b);
 
         // A tighter-than-default coalesce window (500ms) no longer catches the 500ms gap.
-        let due = due_keys(&cache, &badges, true, Duration::from_millis(100), now);
+        let due = due_keys(&cache, &badges, Power::Ac, Duration::from_millis(100), now);
         assert_eq!(due.len(), 1);
     }
 
@@ -555,9 +562,7 @@ mod tests {
     fn plan_watch_change_forces_cold_refresh() {
         let now = Instant::now();
         let w1: WatchFp = vec![None];
-        let w2: WatchFp = vec![Some(
-            crate::daemon::reload::file_id(Path::new("/")).unwrap(),
-        )];
+        let w2: WatchFp = vec![Some(crate::file_id::file_id(Path::new("/")).unwrap())];
         let mut e = warm_entry(now);
         e.watch = Some(w1.clone());
         assert!(!plan(&mut e, now, IV, None, Some(&w1)).spawn);
@@ -611,7 +616,7 @@ mod tests {
         for i in 0..MAX_PATH_SCOPED_KEYS {
             cache.insert(
                 Key::new("g", Some(PathBuf::from(format!("/r{i}"))), None),
-                Entry::new(now - Duration::from_secs(i as u64)),
+                Entry::new(now - Duration::from_secs(u64::try_from(i).expect("index fits in u64"))),
             );
         }
         assert_eq!(cache.len(), MAX_PATH_SCOPED_KEYS + 1);

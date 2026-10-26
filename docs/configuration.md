@@ -9,13 +9,16 @@ have an AI assistant set things up for you, see [`README.ai.md`](../README.ai.md
 ```sh
 stfgd get <badge>... [--cwd <path>]   # hot path: never fails, no stderr
 stfgd daemon                          # foreground (used internally; run instead by `get`)
-stfgd status                          # cached badges, scope, age, errors; last config error
+stfgd status                          # cached badges, scope, age, errors; last config error; versions
 stfgd stop
 stfgd reload
 ```
 
 If the daemon isn't running, exit codes follow LSB init scripts (as `systemctl` does): `status`
 exits 3, `reload` exits 7, and `stop` succeeds (0). An unresponsive daemon exits 1.
+
+`status` ends with `version: stfgd X, daemon Y`; the two differ only mid-upgrade, until the old
+daemon hands over. With no daemon it prints just `version: stfgd X`.
 
 `stfg <badge>... [--cwd <path>]` is a separate, tiny binary that is an exact equivalent to
 `stfgd get` — same implementation, same flags, same behavior, just without the full binary's
@@ -85,9 +88,12 @@ Every badge-level knob above falls back to its `[daemon]` counterpart when unset
   under `.git` on every request — no subprocess, no cache, so they're always exactly as
   fresh as `HEAD`/the ref files on disk (no stale-while-revalidate window at all).
 - `git_status` and `git_counts` still shell out to `git status`, but their cached value is
-  invalidated the instant `.git/HEAD` or `.git/index` changes (e.g. `git add`, `git commit`,
-  `git checkout -b`), not just on `interval`. Unstaged worktree edits touch neither file, so
-  those are still only picked up on `interval`. `git_counts` requires
+  invalidated the instant `.git/HEAD`, `.git/index` or `.git/FETCH_HEAD` changes (e.g.
+  `git add`, `git commit`, `git checkout -b`, `git fetch`), not just on `interval`. Unstaged
+  worktree edits touch none of these files, so those are still only picked up on `interval`.
+  Their `git status` output is counted as it streams, so `max_output` limits one output line,
+  not the whole status: a repo with thousands of changed files still shows its counts.
+  `git_counts` requires
   `field = "ahead" | "behind" | "staged" | "modified" | "untracked" | "conflicted"`
   (rejected on every other builtin); concurrent `git_counts` badges on the same repo share
   one `git status` subprocess instead of one each.
@@ -141,19 +147,21 @@ when_file = ["package.json", ".nvmrc"]              # not a node project -> empt
 interval = "10m"
 ```
 
-`env = ["PATH", "NVM_BIN", "MISE_*"]` on a `command` badge runs it with those variables taken
-from the client that asked (a trailing `*` is a prefix glob, e.g. `MISE_*`); every other
-variable comes from the daemon's environment. The selected `(name, value)` pairs are part of
-the cache key (next to the scope root), so after `nvm use` / `mise use` the next prompt gets
-its own entry and shows the new version immediately. Such entries are evicted like path-scoped
-ones (`max_paths`/`path_evict`) and are refreshed on request only, never by the timer. The
-client always sends its whole environment (a few KB over the socket) and the daemon filters
-per badge, so `stfg` never reads the config. A client that sends none (an older `stfg`) gets
-the daemon's environment. Variables the client lacks do not fall back to the daemon's: for a
-request that carried an environment, matching variables missing from it are unset for the
-command (so `VIRTUAL_ENV` after `deactivate` is really gone). `stfg` skips single variables
-over 4 KiB (exported shell functions, `LS_COLORS`), and drops the whole block only if the
-request would still exceed ~60 KiB. Values are never logged.
+`env = ["PATH", "NVM_BIN", "MISE_*"]` on a `command` badge runs it with those variables taken from
+the client that asked (a trailing `*` is a prefix glob, e.g. `MISE_*`); every other variable comes
+from the daemon's environment. The selected `(name, value)` pairs are part of the cache key (next to
+the scope root), so after `nvm use` / `mise use` the next prompt gets its own entry and shows the
+new version immediately. Such entries are evicted like path-scoped ones (`max_paths`/`path_evict`)
+and are refreshed on request only, never by the timer. `stfg` never parses the config: the daemon
+writes every badge's `env` patterns to `env-patterns` next to its socket (at startup and on each
+reload), and the client sends only the variables that match them, or none when no badge uses `env`.
+Without that file (an older daemon) the client sends its whole environment; the daemon filters per
+badge either way. A client that sends none (an older `stfg`) gets the daemon's environment.
+Variables the client lacks do not fall back to the daemon's: for a request that carried an
+environment, matching variables missing from it are unset for the command (so `VIRTUAL_ENV` after
+`deactivate` is really gone). `stfg` skips single variables over 4 KiB (exported shell functions,
+`LS_COLORS`), and drops the whole block only if the request would still exceed ~60 KiB. Values are
+never logged.
 
 ### `tool_version`
 

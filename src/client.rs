@@ -28,6 +28,17 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// extra badge names: unknown, empty, and cut off by the client's line count.
 pub const ENV_MARK: &str = "\u{1e}env";
 
+/// File in the runtime dir where the daemon publishes its config's `env` patterns (see
+/// [`read_env_patterns`]), so the client sends only the variables some badge can use.
+pub const ENV_PATTERNS_FILE: &str = "env-patterns";
+
+/// First line of [`ENV_PATTERNS_FILE`]; the rest is one pattern per line. A file without it
+/// (a future format) is ignored, falling back to sending the whole environment.
+pub const ENV_PATTERNS_HEADER: &str = "star-forge env-patterns v1";
+
+/// Cap on [`ENV_PATTERNS_FILE`]: larger reads as unusable (whole environment sent).
+const MAX_ENV_PATTERNS_BYTES: u64 = 16 * 1024;
+
 /// Per-variable cap (name + value): skips exported shell functions, `LS_COLORS` and the like
 /// so one huge entry doesn't cost the whole env block.
 const MAX_ENV_ENTRY_BYTES: usize = 4 * 1024;
@@ -58,6 +69,17 @@ pub fn runtime_dir() -> PathBuf {
 
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("sock")
+}
+
+pub fn env_patterns_path() -> PathBuf {
+    runtime_dir().join(ENV_PATTERNS_FILE)
+}
+
+/// `pattern` is a variable name, or a prefix with one trailing `*`.
+pub fn env_matches(pattern: &str, name: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .map_or(pattern == name, |prefix| name.starts_with(prefix))
 }
 
 /// Whether the runtime dir `dir` can be trusted with the socket: a real directory (not a
@@ -134,11 +156,10 @@ fn new_stream_socket() -> Option<OwnedFd> {
     // SAFETY: `fd` was just returned by the successful `socket(2)` call and isn't owned
     // anywhere else.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: `fd` is valid; F_SETFD/F_SETFL on it are plain flag operations.
-    let failed = unsafe {
-        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) < 0
-            || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) < 0
-    };
+    // SAFETY: `fd` is valid; F_SETFD on it is a plain flag operation.
+    let failed = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+        // SAFETY: as above, for F_SETFL.
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0;
     (!failed).then_some(fd)
 }
 
@@ -236,11 +257,13 @@ fn valid_field(s: &str) -> bool {
 
 /// Encodes the one-line `get` request. `None` if `cwd` or any badge contains `\n` or the
 /// field separator — the caller must print empty lines without connecting in that case.
+/// `env: None` sends no env block (the daemon uses its own); `Some` sends one, even empty, so
+/// the daemon knows the client lacks every variable it didn't send.
 fn encode_request(
     version: &str,
     cwd: &str,
     badges: &[String],
-    env: &[(String, String)],
+    env: Option<&[(String, String)]>,
 ) -> Option<String> {
     if !valid_field(cwd) || badges.iter().any(|b| !valid_field(b)) {
         return None;
@@ -258,24 +281,22 @@ fn encode_request(
         req.push_str(b);
     }
     let base = req.len();
-    let mut marked = false;
-    for (k, v) in env {
-        if k.contains('=')
-            || k.len() + v.len() > MAX_ENV_ENTRY_BYTES
-            || !valid_field(k)
-            || !valid_field(v)
-        {
-            continue;
-        }
-        if !marked {
-            req.push(FIELD_SEP);
-            req.push_str(ENV_MARK);
-            marked = true;
-        }
+    if let Some(env) = env {
         req.push(FIELD_SEP);
-        req.push_str(k);
-        req.push('=');
-        req.push_str(v);
+        req.push_str(ENV_MARK);
+        for (k, v) in env {
+            if k.contains('=')
+                || k.len() + v.len() > MAX_ENV_ENTRY_BYTES
+                || !valid_field(k)
+                || !valid_field(v)
+            {
+                continue;
+            }
+            req.push(FIELD_SEP);
+            req.push_str(k);
+            req.push('=');
+            req.push_str(v);
+        }
     }
     if req.len() > MAX_REQUEST_BYTES {
         req.truncate(base);
@@ -440,12 +461,50 @@ fn current_dir_string() -> String {
         .unwrap_or_default()
 }
 
-/// The process environment (UTF-8 entries only), sent so the daemon can run `env`-forwarding
-/// badges with it.
-fn current_env() -> Vec<(String, String)> {
+/// The process environment (UTF-8 entries only) that `patterns` select (`None`: all of it).
+fn current_env(patterns: Option<&[String]>) -> Vec<(String, String)> {
     std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| patterns.is_none_or(|ps| ps.iter().any(|p| env_matches(p, k))))
         .collect()
+}
+
+/// Parses [`ENV_PATTERNS_FILE`]: `None` unless it starts with [`ENV_PATTERNS_HEADER`].
+fn parse_env_patterns(text: &str) -> Option<Vec<String>> {
+    let mut lines = text.lines();
+    (lines.next()? == ENV_PATTERNS_HEADER).then(|| {
+        lines
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+/// The daemon's published `env` patterns; `None` if it hasn't published any (an older
+/// daemon, or none running yet) or the file is unusable.
+fn read_env_patterns() -> Option<Vec<String>> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    std::fs::File::open(env_patterns_path())
+        .ok()?
+        .take(MAX_ENV_PATTERNS_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() > usize::try_from(MAX_ENV_PATTERNS_BYTES).ok()? {
+        return None;
+    }
+    parse_env_patterns(&text)
+}
+
+/// The env block to send (see [`encode_request`]): only the variables the daemon's config
+/// can use, none at all if no badge forwards env, and the whole environment when the daemon
+/// hasn't said (it filters per badge either way).
+fn env_to_send() -> Option<Vec<(String, String)>> {
+    match read_env_patterns() {
+        Some(patterns) if patterns.is_empty() => None,
+        Some(patterns) => Some(current_env(Some(&patterns))),
+        None => Some(current_env(None)),
+    }
 }
 
 /// Parses `get`'s argv (`<badge>... [--cwd <path>]`), shared by `stfg` and `stfgd get`.
@@ -504,7 +563,8 @@ fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
     let Some(cwd) = initial_cwd(cwd, deadline) else {
         return empty();
     };
-    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, &current_env()) else {
+    let env = env_to_send();
+    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, env.as_deref()) else {
         return empty();
     };
 
@@ -660,7 +720,7 @@ mod tests {
     #[test]
     fn encode_request_joins_fields_with_unit_separator() {
         let badges = vec!["git_branch".to_string(), "git_status".to_string()];
-        let req = encode_request("0.1.0", "/home/u/proj", &badges, &[]).unwrap();
+        let req = encode_request("0.1.0", "/home/u/proj", &badges, None).unwrap();
         assert_eq!(
             req,
             "get\u{1f}0.1.0\u{1f}/home/u/proj\u{1f}git_branch\u{1f}git_status\n"
@@ -669,7 +729,7 @@ mod tests {
 
     #[test]
     fn encode_request_handles_no_badges() {
-        let req = encode_request("0.1.0", "/tmp", &[], &[]).unwrap();
+        let req = encode_request("0.1.0", "/tmp", &[], None).unwrap();
         assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\n");
     }
 
@@ -681,7 +741,7 @@ mod tests {
             ("A=B".to_string(), "v".to_string()),
             ("FOO".to_string(), "bar=baz".to_string()),
         ];
-        let req = encode_request("0.1.0", "/tmp", &["n".to_string()], &env).unwrap();
+        let req = encode_request("0.1.0", "/tmp", &["n".to_string()], Some(&env)).unwrap();
         assert_eq!(
             req,
             "get\u{1f}0.1.0\u{1f}/tmp\u{1f}n\u{1f}\u{1e}env\u{1f}PATH=/a:/b\u{1f}FOO=bar=baz\n"
@@ -695,7 +755,7 @@ mod tests {
             ("BIG".to_string(), big),
             ("PATH".to_string(), "/a".to_string()),
         ];
-        let req = encode_request("0.1.0", "/tmp", &[], &env).unwrap();
+        let req = encode_request("0.1.0", "/tmp", &[], Some(&env)).unwrap();
         assert_eq!(
             req,
             "get\u{1f}0.1.0\u{1f}/tmp\u{1f}\u{1e}env\u{1f}PATH=/a\n"
@@ -705,25 +765,54 @@ mod tests {
         let many: Vec<_> = (0..40)
             .map(|i| (format!("V{i}"), "y".repeat(MAX_ENV_ENTRY_BYTES - 8)))
             .collect();
-        let req = encode_request("0.1.0", "/tmp", &[], &many).unwrap();
+        let req = encode_request("0.1.0", "/tmp", &[], Some(&many)).unwrap();
         assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\n");
     }
 
     #[test]
+    fn encode_request_marks_an_empty_env_block() {
+        let req = encode_request("0.1.0", "/tmp", &[], Some(&[])).unwrap();
+        assert_eq!(req, "get\u{1f}0.1.0\u{1f}/tmp\u{1f}\u{1e}env\n");
+    }
+
+    #[test]
+    fn env_patterns_file_needs_its_header() {
+        let text = format!("{ENV_PATTERNS_HEADER}\nPATH\nMISE_*\n");
+        assert_eq!(
+            parse_env_patterns(&text),
+            Some(vec!["PATH".to_string(), "MISE_*".to_string()])
+        );
+        assert_eq!(
+            parse_env_patterns(&format!("{ENV_PATTERNS_HEADER}\n")),
+            Some(vec![])
+        );
+        assert_eq!(parse_env_patterns("PATH\n"), None);
+        assert_eq!(parse_env_patterns(""), None);
+    }
+
+    #[test]
+    fn env_matches_names_and_trailing_star_prefixes() {
+        assert!(env_matches("PATH", "PATH"));
+        assert!(!env_matches("PATH", "PATHX"));
+        assert!(env_matches("MISE_*", "MISE_SHELL"));
+        assert!(!env_matches("MISE_*", "XMISE_A"));
+    }
+
+    #[test]
     fn encode_request_rejects_newline_in_cwd() {
-        assert!(encode_request("0.1.0", "/tmp/evil\ninjected", &[], &[]).is_none());
+        assert!(encode_request("0.1.0", "/tmp/evil\ninjected", &[], None).is_none());
     }
 
     #[test]
     fn encode_request_rejects_field_separator_in_badge() {
         let badges = vec!["a\u{1f}b".to_string()];
-        assert!(encode_request("0.1.0", "/tmp", &badges, &[]).is_none());
+        assert!(encode_request("0.1.0", "/tmp", &badges, None).is_none());
     }
 
     #[test]
     fn encode_request_rejects_newline_in_badge() {
         let badges = vec!["a\nb".to_string()];
-        assert!(encode_request("0.1.0", "/tmp", &badges, &[]).is_none());
+        assert!(encode_request("0.1.0", "/tmp", &badges, None).is_none());
     }
 
     #[test]
@@ -906,7 +995,7 @@ mod tests {
     #[test]
     fn run_before_deadline_skips_work_after_the_deadline() {
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = ran.clone();
+        let flag = std::sync::Arc::clone(&ran);
         let result = run_before_deadline(Instant::now(), move || {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
@@ -986,9 +1075,10 @@ mod tests {
     /// client's deadline. This fills a real backlog (using the same non-blocking helper,
     /// so the filling itself can never hang either) and checks that once it's full, an
     /// extra connect attempt fails immediately with the platform's full-backlog outcome.
-    // `holders` is never read: its only job is to keep every connected stream's fd open
-    // so the backlog stays full for the rest of the test, not to be inspected.
-    #[allow(clippy::collection_is_never_read)]
+    #[expect(
+        clippy::collection_is_never_read,
+        reason = "`holders` only keeps every connected stream's fd open so the backlog stays full"
+    )]
     #[test]
     fn nonblocking_connect_fails_fast_without_blocking_on_full_backlog() {
         let dir = crate::test_support::TempDir::new("client-backlog");

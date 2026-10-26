@@ -111,8 +111,7 @@ pub(in crate::provider) async fn battery(
         .run(deadline, move || {
             sysfs_battery(Path::new(POWER_SUPPLY), device.as_deref())
         })
-        .await
-        .ok_or(ProviderError::Timeout)?
+        .await?
 }
 
 pub(in crate::provider) fn mem_used_percent() -> Result<u64, ProviderError> {

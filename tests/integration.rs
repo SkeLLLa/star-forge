@@ -29,18 +29,15 @@ impl TestEnv {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock is after the Unix epoch")
             .as_nanos();
         let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         // Not `temp_dir()`: macOS's `/var/folders/...` would push the socket path past
         // `sun_path`'s 104 bytes.
         let dir = PathBuf::from(format!("/tmp/sf-it-{}-{seq}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("create test runtime dir");
         let config_path = dir.join("config.toml");
-        std::fs::File::create(&config_path)
-            .unwrap()
-            .write_all(config_toml.as_bytes())
-            .unwrap();
+        std::fs::write(&config_path, config_toml).expect("write test config");
         Self { dir }
     }
 
@@ -506,6 +503,36 @@ timeout = "30s"
         || proc_cmdline_count(&marker) != 0,
     );
     assert!(!restarted, "a queued fetch started a new group after stop");
+}
+
+#[test]
+fn status_reports_versions_with_and_without_daemon() {
+    let env = TestEnv::new("");
+    let want = env!("CARGO_PKG_VERSION");
+
+    let (out, ok) = env.run(&["status"]);
+    assert!(!ok, "status must fail (LSB 3) with no daemon");
+    assert_eq!(out, format!("version: stfgd {want}\n"));
+    assert!(
+        !env.socket_path().exists(),
+        "status must not spawn the daemon"
+    );
+
+    let _ = env.get(&["anything"]);
+    wait_for_socket(&env);
+    let mut out = String::new();
+    assert!(
+        wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
+            let (status, ok) = env.run(&["status"]);
+            out = status;
+            ok
+        }),
+        "status never succeeded once the daemon was up"
+    );
+    assert_eq!(
+        out.lines().last(),
+        Some(format!("version: stfgd {want}, daemon {want}").as_str())
+    );
 }
 
 /// design.md §11.2: no daemon yet -> empty fast; once the daemon is up, a later `get`

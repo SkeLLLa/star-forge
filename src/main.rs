@@ -8,6 +8,7 @@ mod config;
 mod daemon;
 mod duration;
 mod extract;
+mod file_id;
 mod ipc;
 mod provider;
 mod template;
@@ -48,15 +49,24 @@ fn cmd_get(args: impl Iterator<Item = String>) {
     client::run_cli(args);
 }
 
+/// Prints the daemon's status table, then both versions (they differ mid-upgrade); with no
+/// daemon, only this binary's version, before the LSB exit.
 fn cmd_status() {
+    let ours = env!("CARGO_PKG_VERSION");
     match ipc::client_admin("status", Duration::from_secs(1)) {
-        Ok(resp) => println!(
-            "{}",
-            resp.values
-                .get("status")
-                .map_or("(no badges queried yet)", String::as_str)
-        ),
-        Err(e) => admin_failed(e, NOT_RUNNING_STATUS),
+        Ok(resp) => {
+            println!(
+                "{}",
+                resp.values
+                    .get("status")
+                    .map_or("(no badges queried yet)", String::as_str)
+            );
+            println!("version: stfgd {ours}, daemon {}", resp.ver);
+        }
+        Err(e) => {
+            println!("version: stfgd {ours}");
+            admin_failed(e, NOT_RUNNING_STATUS);
+        }
     }
 }
 

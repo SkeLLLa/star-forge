@@ -1,6 +1,7 @@
 //! Daemon lifecycle: setsid/chdir, flock singleton, accept loop and dispatch, refresh
-//! scheduling (`refresh_due`, `spawn_fetch`), idle exit. Submodules: `cache`, `handler`,
-//! `reload`.
+//! scheduling (`refresh_due`, `spawn_fetch`), idle exit. Submodules: `cache`, `protocol`
+//! (wire format, connection dispatch), `resolve` (answering a `get`), `render` (response and
+//! status text), `reload`, `upgrade`.
 
 //! Scheduling is one loop: `select! { accept, sleep_until(next_due), signals }`. No
 //! per-badge tasks, no fixed tick; refreshes are demand-driven and coalesced (see
@@ -11,14 +12,18 @@
 //! [beachcomber](https://github.com/NavistAu/beachcomber); see `THIRD_PARTY_NOTICES.md`.
 
 mod cache;
-mod handler;
+mod protocol;
 mod reload;
+mod render;
+mod resolve;
+mod upgrade;
 
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::net::UnixListener;
@@ -27,7 +32,7 @@ use tokio::sync::{Notify, oneshot};
 
 use crate::config::Config;
 use crate::{ipc, provider};
-use handler::handle_connection;
+use protocol::handle_connection;
 use reload::{Stamp, file_id};
 
 struct ConfigMeta {
@@ -39,6 +44,9 @@ struct ConfigMeta {
     /// Last config load/reload failure, cleared by the next success; shown by `stfgd status`
     /// (the daemon's stderr is /dev/null).
     last_error: Option<String>,
+    /// Where the config's `env` patterns are published for clients (`None`: not published,
+    /// as in tests).
+    env_patterns: Option<PathBuf>,
 }
 
 /// Records a config error, logging it to stderr unless it repeats the previous one.
@@ -49,27 +57,76 @@ fn set_config_error(meta: &mut ConfigMeta, msg: String) {
     meta.last_error = Some(msg);
 }
 
-struct OnAc {
-    value: bool,
+/// Initial power reading for [`Daemon::new`].
+#[derive(Clone, Copy)]
+struct PowerState {
+    value: cache::Power,
     checked_at: Instant,
 }
 
-/// Lock order (never held across an `.await`): `config_meta` -> `config` -> `cache`. Take
-/// them in that order, skipping any you don't need. `last_request`, `last_evict` and `on_ac`
-/// are leaf locks: take them alone, never while holding another lock (read what you need
-/// from `config` first, via [`Daemon::config`]).
+/// An `Instant` in an atomic: nanoseconds since `epoch`, its initial value (earlier instants
+/// saturate to it). Replaces what were leaf mutexes, so they need no lock-order rule.
+struct AtomicInstant {
+    epoch: Instant,
+    nanos: AtomicU64,
+}
+
+impl AtomicInstant {
+    const fn new(at: Instant) -> Self {
+        Self {
+            epoch: at,
+            nanos: AtomicU64::new(0),
+        }
+    }
+
+    fn nanos_of(&self, t: Instant) -> u64 {
+        u64::try_from(t.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn get(&self) -> Instant {
+        self.epoch + Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, t: Instant) {
+        self.nanos.store(self.nanos_of(t), Ordering::Relaxed);
+    }
+
+    /// Sets `now` and returns `true` if the stored instant is at least `gap` before it; of
+    /// several callers in one window, only the first wins.
+    fn claim_if_elapsed(&self, now: Instant, gap: Duration) -> bool {
+        let now = self.nanos_of(now);
+        let gap = u64::try_from(gap.as_nanos()).unwrap_or(u64::MAX);
+        let last = self.nanos.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= gap
+            && self
+                .nanos
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+}
+
+/// The config and the cache it governs, under one lock: a reload swaps both at once, and a
+/// fetch's write-back sees the config it is checked against, with no lock order to follow.
+struct Core {
+    config: Arc<Config>,
+    cache: HashMap<cache::Key, cache::Entry>,
+}
+
+/// Two locks, `core` and `config_meta`, each taken alone (never both at once) and never held
+/// across an `.await`; everything else is atomic or a `Notify`.
 struct Daemon {
-    cache: Mutex<HashMap<cache::Key, cache::Entry>>,
-    config: Mutex<Arc<Config>>,
+    core: Mutex<Core>,
     config_meta: Mutex<ConfigMeta>,
     providers: provider::Shared,
-    last_request: Mutex<Instant>,
-    last_evict: Mutex<Instant>,
-    on_ac: Mutex<OnAc>,
+    last_request: AtomicInstant,
+    last_evict: AtomicInstant,
+    power_checked_at: AtomicInstant,
+    on_battery: AtomicBool,
     shutdown: Notify,
     reload_finished: Notify,
     /// Signalled when a fetch finishes, so the loop recomputes `next_due` for that key.
     reschedule: Notify,
+    upgrade: upgrade::Upgrade,
 }
 
 impl Daemon {
@@ -78,32 +135,50 @@ impl Daemon {
         config_path: PathBuf,
         stamp: Stamp,
         providers: provider::Shared,
-        on_ac: OnAc,
+        power: PowerState,
+        upgrade: upgrade::Upgrade,
         now: Instant,
     ) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
-            config: Mutex::new(Arc::new(config)),
+            core: Mutex::new(Core {
+                config: Arc::new(config),
+                cache: HashMap::new(),
+            }),
             config_meta: Mutex::new(ConfigMeta {
                 path: config_path,
                 stamp,
                 last_checked: now,
                 checking: false,
                 last_error: None,
+                env_patterns: None,
             }),
             providers,
-            last_request: Mutex::new(now),
-            last_evict: Mutex::new(now),
-            on_ac: Mutex::new(on_ac),
+            last_request: AtomicInstant::new(now),
+            last_evict: AtomicInstant::new(now),
+            power_checked_at: AtomicInstant::new(power.checked_at),
+            on_battery: AtomicBool::new(power.value == cache::Power::Battery),
             shutdown: Notify::new(),
             reload_finished: Notify::new(),
             reschedule: Notify::new(),
+            upgrade,
         }
+    }
+
+    fn core(&self) -> MutexGuard<'_, Core> {
+        self.core.lock().expect("core lock poisoned")
     }
 
     /// Snapshot of the current config; the lock is released before returning.
     fn config(&self) -> Arc<Config> {
-        Arc::clone(&self.config.lock().unwrap())
+        Arc::clone(&self.core().config)
+    }
+
+    fn power(&self) -> cache::Power {
+        if self.on_battery.load(Ordering::Relaxed) {
+            cache::Power::Battery
+        } else {
+            cache::Power::Ac
+        }
     }
 }
 
@@ -150,15 +225,35 @@ pub fn run() {
     // the kernel released the lock). Safe to unlink before binding.
     let sock_path = ipc::socket_path();
     let _ = std::fs::remove_file(&sock_path);
+    // Bind before loading the config (up to `MAINTENANCE_BUDGET`): a client that connects
+    // meanwhile is queued, rather than seeing no socket and spawning yet another daemon.
+    let Ok(listener) = std::os::unix::net::UnixListener::bind(&sock_path) else {
+        return;
+    };
+    // Identity of the socket we bound, so shutdown never unlinks a successor's socket.
+    let sock_id = std::fs::symlink_metadata(&sock_path)
+        .ok()
+        .map(|md| (md.dev(), md.ino()));
 
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .max_blocking_threads(4)
+        // Both pools' slots, plus headroom for tokio's own blocking work (reqwest's DNS
+        // lookups go through `spawn_blocking` too).
+        .max_blocking_threads(provider::PATH_WORKERS + provider::GLOBAL_WORKERS + 8)
         .build()
     else {
         return;
     };
-    rt.block_on(async_main(sock_path, &lock_file));
+    let upgrade = upgrade::Upgrade::record(Instant::now());
+    rt.block_on(async_main(
+        upgrade,
+        Bound {
+            listener,
+            path: sock_path,
+            id: sock_id,
+        },
+        &lock_file,
+    ));
     // spawn_blocking cannot cancel a stuck filesystem syscall. Do not wait for such
     // workers on shutdown; returning from main terminates the daemon process.
     rt.shutdown_timeout(Duration::ZERO);
@@ -184,7 +279,20 @@ fn prepare_runtime_dir(dir: &Path) -> bool {
     matches!(ipc::runtime_dir_is_private(dir), Ok(true))
 }
 
-async fn async_main(sock_path: PathBuf, lock_file: &std::fs::File) {
+/// The daemon socket, bound (not yet listening through tokio) before startup work.
+struct Bound {
+    listener: std::os::unix::net::UnixListener,
+    path: PathBuf,
+    /// `(dev, ino)` of the socket file we created.
+    id: Option<(u64, u64)>,
+}
+
+async fn async_main(upgrade: upgrade::Upgrade, sock: Bound, lock_file: &std::fs::File) {
+    let Bound {
+        listener,
+        path: sock_path,
+        id: sock_id,
+    } = sock;
     let config_path = ipc::config_path();
     let providers = provider::Shared::new();
     let path = config_path.clone();
@@ -207,11 +315,13 @@ async fn async_main(sock_path: PathBuf, lock_file: &std::fs::File) {
             },
         )
         .await;
-    let (loaded, stamp) = loaded.unwrap_or_else(|| {
-        (
-            Err("config read timed out or filesystem workers are busy".into()),
-            Stamp::default(),
-        )
+    let (loaded, stamp) = loaded.unwrap_or_else(|why| {
+        let why = match why {
+            crate::blocking::Rejected::Saturated => "filesystem workers are busy",
+            crate::blocking::Rejected::Expired => "config read timed out",
+            crate::blocking::Rejected::Panicked => "config read panicked",
+        };
+        (Err(why.into()), Stamp::default())
     });
     let mut last_error = None;
     let initial = loaded.unwrap_or_else(|e| {
@@ -233,22 +343,27 @@ async fn async_main(sock_path: PathBuf, lock_file: &std::fs::File) {
         config_path,
         stamp,
         providers,
-        OnAc {
-            value: true,
+        PowerState {
+            value: cache::Power::Ac,
             checked_at: power_checked_at,
         },
+        upgrade,
         now,
     ));
 
-    state.config_meta.lock().unwrap().last_error = last_error;
+    {
+        let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
+        meta.last_error = last_error;
+        meta.env_patterns = Some(ipc::env_patterns_path());
+    }
+    reload::publish_env_patterns(&state, state.config()).await;
 
-    let Ok(listener) = UnixListener::bind(&sock_path) else {
+    let Ok(listener) = listener
+        .set_nonblocking(true)
+        .and_then(|()| UnixListener::from_std(listener))
+    else {
         return;
     };
-    // Identity of the socket we bound, so shutdown never unlinks a successor's socket.
-    let sock_id = std::fs::symlink_metadata(&sock_path)
-        .ok()
-        .map(|md| (md.dev(), md.ino()));
     let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
         return;
     };
@@ -260,10 +375,10 @@ async fn async_main(sock_path: PathBuf, lock_file: &std::fs::File) {
         let now = Instant::now();
         let cfg = state.config();
         let idle_exit = cfg.daemon.idle_exit;
-        let idle_deadline = *state.last_request.lock().unwrap() + idle_exit;
+        let idle_deadline = state.last_request.get() + idle_exit;
 
-        let on_ac = refresh_on_ac_if_due(&state, now);
-        let next_due = cache::next_due(&state.cache.lock().unwrap(), &cfg.badge, on_ac, now);
+        let power = refresh_power_if_due(&state, now);
+        let next_due = cache::next_due(&state.core().cache, &cfg.badge, power, now);
         let target = next_due
             .map_or(idle_deadline, |t| t.min(idle_deadline))
             .min(now + MAX_SLEEP)
@@ -285,7 +400,7 @@ async fn async_main(sock_path: PathBuf, lock_file: &std::fs::File) {
             },
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(target)) => {
                 let now2 = Instant::now();
-                let idle_for = now2.saturating_duration_since(*state.last_request.lock().unwrap());
+                let idle_for = now2.saturating_duration_since(state.last_request.get());
                 if idle_for >= idle_exit {
                     break;
                 }
@@ -329,14 +444,12 @@ async fn async_main(sock_path: PathBuf, lock_file: &std::fs::File) {
 
 /// Returns the last known AC state, and spawns a background probe to refresh it if the last
 /// one is older than `power_check`.
-fn refresh_on_ac_if_due(state: &Arc<Daemon>, now: Instant) -> bool {
+fn refresh_power_if_due(state: &Arc<Daemon>, now: Instant) -> cache::Power {
     let power_check = state.config().daemon.power_check;
-    let mut g = state.on_ac.lock().unwrap();
-    if now.saturating_duration_since(g.checked_at) >= power_check {
-        g.checked_at = now;
+    if state.power_checked_at.claim_if_elapsed(now, power_check) {
         let state = Arc::clone(state);
         tokio::spawn(async move {
-            if let Some(value) = state
+            if let Ok(on_ac) = state
                 .providers
                 .blocking
                 .run(
@@ -345,25 +458,28 @@ fn refresh_on_ac_if_due(state: &Arc<Daemon>, now: Instant) -> bool {
                 )
                 .await
             {
-                state.on_ac.lock().unwrap().value = value;
+                state.on_battery.store(!on_ac, Ordering::Relaxed);
                 state.reschedule.notify_one();
             }
         });
     }
-    g.value
+    state.power()
 }
 
 /// Spawns one fetch per coalesced-due key, then evicts dormant/excess path-scoped keys.
 fn refresh_due(state: &Arc<Daemon>, now: Instant) {
     let cfg = state.config();
-    let on_ac = refresh_on_ac_if_due(state, now);
-    let due = {
-        let cache = state.cache.lock().unwrap();
-        cache::due_keys(&cache, &cfg.badge, on_ac, cfg.daemon.coalesce, now)
-    };
+    let power = refresh_power_if_due(state, now);
+    let due = cache::due_keys(
+        &state.core().cache,
+        &cfg.badge,
+        power,
+        cfg.daemon.coalesce,
+        now,
+    );
     for key in due {
-        let mut cache = state.cache.lock().unwrap();
-        let Some(entry) = cache.get_mut(&key) else {
+        let mut core = state.core();
+        let Some(entry) = core.cache.get_mut(&key) else {
             continue;
         };
         if entry.in_flight {
@@ -371,19 +487,54 @@ fn refresh_due(state: &Arc<Daemon>, now: Instant) {
         }
         entry.in_flight = true;
         let identity = Arc::clone(&entry.identity);
-        drop(cache);
+        drop(core);
         spawn_fetch(Arc::clone(state), key, identity, Arc::clone(&cfg), None);
     }
     cache::evict(
-        &mut state.cache.lock().unwrap(),
+        &mut state.core().cache,
         cfg.daemon.path_evict,
         cfg.daemon.max_paths,
         now,
     );
 }
 
+/// Clears a key's single-flight flag if its fetch task ends without writing back (a panic in
+/// a provider, or the runtime dropping the task), so the key can't stay in flight forever.
+/// Checked like the write-back: a task for an evicted entry must not release its
+/// replacement's flag.
+struct InFlightGuard {
+    state: Arc<Daemon>,
+    key: cache::Key,
+    identity: Arc<()>,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // No panic in Drop: it may run during unwinding, with the lock poisoned.
+        let mut core = self
+            .state
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = core.cache.get_mut(&self.key)
+            && Arc::ptr_eq(&entry.identity, &self.identity)
+        {
+            entry.in_flight = false;
+        }
+    }
+}
+
 /// Runs a fetch outside any lock, then writes the result back (single-flight release,
-/// stale value kept on failure, backoff on failure).
+/// stale value kept on failure, backoff on failure, a short retry on pool saturation).
+///
+/// An entry has at most one fetch in flight, even across a reload (which keeps the flag), so
+/// a matching identity always releases it. The result is kept only if the badge's config is
+/// still the one it ran under: a reload that changed the badge already marked the entry stale,
+/// and the loop refetches it with the new config.
 fn spawn_fetch(
     state: Arc<Daemon>,
     key: cache::Key,
@@ -392,50 +543,33 @@ fn spawn_fetch(
     done: Option<oneshot::Sender<()>>,
 ) {
     tokio::spawn(async move {
-        let cwd = key.root.clone();
+        let mut guard = InFlightGuard {
+            state: Arc::clone(&state),
+            key: key.clone(),
+            identity: Arc::clone(&identity),
+            armed: true,
+        };
         let result = match cfg.badge.get(&key.badge) {
             Some(badge_cfg) => Some(
                 provider::fetch(
                     &state.providers,
                     badge_cfg,
-                    cwd.as_deref(),
+                    key.root.as_deref(),
                     key.env.as_deref(),
                 )
                 .await,
             ),
             None => None,
         };
-        let now = Instant::now();
-        {
-            let current = state.config.lock().unwrap();
-            let mut cache = state.cache.lock().unwrap();
-            // A pre-reload fetch must not overwrite a value fetched under the new
-            // configuration, or release that new fetch's single-flight flag.
-            if Arc::ptr_eq(&current, &cfg)
-                && let Some(entry) = cache.get_mut(&key)
-                && Arc::ptr_eq(&entry.identity, &identity)
-            {
-                entry.in_flight = false;
-                match result {
-                    Some(Ok(rendered)) => {
-                        entry.value = Some(rendered);
-                        entry.fetched_at = Some(now);
-                        entry.errors = 0;
-                        entry.next_attempt = now;
-                    }
-                    Some(Err(_)) => {
-                        entry.errors += 1;
-                        entry.next_attempt = now
-                            + cache::backoff(
-                                cfg.daemon.retry_min,
-                                cfg.daemon.retry_max,
-                                entry.errors,
-                            );
-                    }
-                    None => {}
-                }
-            }
-        }
+        write_back(
+            &mut state.core(),
+            &key,
+            &identity,
+            &cfg,
+            result,
+            Instant::now(),
+        );
+        guard.armed = false;
         state.reschedule.notify_one();
         if let Some(tx) = done {
             let _ = tx.send(());
@@ -443,18 +577,59 @@ fn spawn_fetch(
     });
 }
 
+/// Stores a fetch's result in its entry, if the entry is still the one it ran for (see
+/// [`spawn_fetch`]).
+fn write_back(
+    core: &mut Core,
+    key: &cache::Key,
+    identity: &Arc<()>,
+    cfg: &Arc<Config>,
+    result: Option<Result<String, provider::ProviderError>>,
+    now: Instant,
+) {
+    let Core { config, cache } = core;
+    let Some(entry) = cache
+        .get_mut(key)
+        .filter(|e| Arc::ptr_eq(&e.identity, identity))
+    else {
+        return;
+    };
+    entry.in_flight = false;
+    let daemon = &config.daemon;
+    let unchanged =
+        Arc::ptr_eq(config, cfg) || config.badge.get(&key.badge) == cfg.badge.get(&key.badge);
+    match result.filter(|_| unchanged) {
+        Some(Ok(rendered)) => {
+            entry.value = Some(rendered);
+            entry.fetched_at = Some(now);
+            entry.errors = 0;
+            entry.next_attempt = now;
+        }
+        // The fetch never ran: not the badge's failure. Retry after `retry_min` (not at once:
+        // the entry would stay due and spin the scheduler) without growing the backoff.
+        Some(Err(provider::ProviderError::Saturated)) => {
+            entry.next_attempt = now + daemon.retry_min;
+        }
+        Some(Err(_)) => {
+            entry.errors += 1;
+            entry.next_attempt =
+                now + cache::backoff(daemon.retry_min, daemon.retry_max, entry.errors);
+        }
+        None => {}
+    }
+}
+
 /// Runs the path-scoped idle-eviction pass at most once every `config_check`, the same
 /// throttle `check_reload` uses. The `max_paths` LRU cap itself is enforced immediately on
-/// insert (see `handle_get`); this only needs to catch keys going idle, which is cheap to
-/// delay.
+/// insert (see `resolve::plan_badge`); this only needs to catch keys going idle, which is
+/// cheap to delay.
 fn maybe_evict_idle(state: &Daemon, cfg: &Config, now: Instant) {
-    let mut last = state.last_evict.lock().unwrap();
-    if now.saturating_duration_since(*last) < cfg.daemon.config_check {
-        return;
+    if state
+        .last_evict
+        .claim_if_elapsed(now, cfg.daemon.config_check)
+    {
+        cache::evict_idle(&mut state.core().cache, cfg.daemon.path_evict, now);
     }
-    *last = now;
-    drop(last);
-    cache::evict_idle(&mut state.cache.lock().unwrap(), cfg.daemon.path_evict, now);
 }
 
 #[cfg(test)]
@@ -483,7 +658,7 @@ mod tests {
         }
     }
 
-    pub(super) fn test_daemon(on_ac: bool) -> Arc<Daemon> {
+    pub(super) fn test_daemon(power: cache::Power) -> Arc<Daemon> {
         let now = Instant::now();
         Arc::new(Daemon::new(
             Config {
@@ -494,59 +669,155 @@ mod tests {
             PathBuf::new(),
             Stamp::default(),
             provider::Shared::new(),
-            OnAc {
-                value: on_ac,
+            PowerState {
+                value: power,
                 checked_at: now,
             },
+            upgrade::Upgrade::new(None, now),
             now,
         ))
     }
 
-    #[tokio::test]
-    async fn old_config_fetch_cannot_overwrite_a_new_config_entry() {
-        let state = test_daemon(true);
-        let old_cfg = Arc::new(test_cfg(Duration::from_secs(60), Duration::from_secs(60)));
-        let key = cache::Key::global("b");
-        let mut entry = cache::Entry::new(Instant::now());
-        entry.value = Some("new-config-value".into());
-        entry.in_flight = true;
-        let identity = Arc::clone(&entry.identity);
-        state.cache.lock().unwrap().insert(key.clone(), entry);
+    impl Daemon {
+        pub(super) fn set_config(&self, cfg: &Arc<Config>) {
+            self.core().config = Arc::clone(cfg);
+        }
+
+        pub(super) fn insert(&self, key: &cache::Key, entry: cache::Entry) -> Arc<()> {
+            let identity = Arc::clone(&entry.identity);
+            self.core().cache.insert(key.clone(), entry);
+            identity
+        }
+
+        pub(super) fn entry<T>(&self, key: &cache::Key, f: impl FnOnce(&cache::Entry) -> T) -> T {
+            f(&self.core().cache[key])
+        }
+    }
+
+    async fn run_fetch(state: &Arc<Daemon>, key: &cache::Key, identity: Arc<()>, cfg: Arc<Config>) {
         let (tx, rx) = oneshot::channel();
-        spawn_fetch(Arc::clone(&state), key.clone(), identity, old_cfg, Some(tx));
+        spawn_fetch(Arc::clone(state), key.clone(), identity, cfg, Some(tx));
         tokio::time::timeout(Duration::from_secs(2), rx)
             .await
             .unwrap()
             .unwrap();
-        let cache = state.cache.lock().unwrap();
-        assert_eq!(cache[&key].value.as_deref(), Some("new-config-value"));
-        assert!(cache[&key].in_flight, "must not release a new fetch's flag");
-        drop(cache);
+    }
+
+    fn in_flight_entry(value: Option<&str>) -> cache::Entry {
+        let mut entry = cache::Entry::new(Instant::now());
+        entry.value = value.map(str::to_string);
+        entry.in_flight = true;
+        entry
+    }
+
+    #[tokio::test]
+    async fn fetch_for_a_changed_badge_releases_the_flag_but_keeps_the_value() {
+        let state = test_daemon(cache::Power::Ac);
+        // Same badge, edited interval.
+        state.set_config(&Arc::new(test_cfg(
+            Duration::from_secs(61),
+            Duration::from_secs(60),
+        )));
+        let old_cfg = Arc::new(test_cfg(Duration::from_secs(60), Duration::from_secs(60)));
+        let key = cache::Key::global("b");
+        let identity = state.insert(&key, in_flight_entry(Some("kept")));
+        run_fetch(&state, &key, identity, old_cfg).await;
+        let (value, in_flight) = state.entry(&key, |e| (e.value.clone(), e.in_flight));
+        assert_eq!(
+            value.as_deref(),
+            Some("kept"),
+            "old-config result discarded"
+        );
+        assert!(!in_flight, "the entry's only fetch has finished");
+    }
+
+    #[tokio::test]
+    async fn fetch_across_a_reload_that_kept_the_badge_writes_back() {
+        let state = test_daemon(cache::Power::Ac);
+        state.set_config(&Arc::new(test_cfg(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )));
+        // A different `Config` (as after a reload) with an equal badge `b`.
+        let old_cfg = Arc::new(test_cfg(Duration::from_secs(60), Duration::from_secs(60)));
+        let key = cache::Key::global("b");
+        let identity = state.insert(&key, in_flight_entry(None));
+        run_fetch(&state, &key, identity, old_cfg).await;
+        let (value, in_flight) = state.entry(&key, |e| (e.value.clone(), e.in_flight));
+        assert!(value.is_some(), "unchanged badge: the result is current");
+        assert!(!in_flight);
+    }
+
+    #[tokio::test]
+    async fn saturated_pool_retries_without_counting_an_error() {
+        let state = test_daemon(cache::Power::Ac);
+        let cfg = Arc::new(test_cfg(Duration::from_secs(60), Duration::from_secs(60)));
+        state.set_config(&cfg);
+        let key = cache::Key::global("b");
+        let mut entry = in_flight_entry(None);
+        entry.errors = 2;
+        let identity = state.insert(&key, entry);
+        let held = state.providers.blocking.hold_all();
+        let before = Instant::now();
+        run_fetch(&state, &key, identity, cfg).await;
+        drop(held);
+        let (in_flight, errors, next_attempt) =
+            state.entry(&key, |e| (e.in_flight, e.errors, e.next_attempt));
+        assert!(!in_flight);
+        assert_eq!(errors, 2, "saturation is not the badge's failure");
+        assert!(next_attempt >= before + DaemonConfig::default().retry_min);
+    }
+
+    #[tokio::test]
+    async fn in_flight_guard_clears_the_flag_when_a_fetch_task_panics() {
+        let state = test_daemon(cache::Power::Ac);
+        let key = cache::Key::global("b");
+        let identity = state.insert(&key, in_flight_entry(None));
+        let guard = |identity: &Arc<()>| InFlightGuard {
+            state: Arc::clone(&state),
+            key: key.clone(),
+            identity: Arc::clone(identity),
+            armed: true,
+        };
+
+        // A guard for an evicted entry must not release its replacement's flag.
+        drop(guard(&Arc::new(())));
+        assert!(state.entry(&key, |e| e.in_flight));
+
+        let g = guard(&identity);
+        let task = tokio::spawn(async move {
+            let _g = g;
+            panic!("provider bug");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(!state.entry(&key, |e| e.in_flight));
     }
 
     #[tokio::test]
     async fn evicted_fetch_cannot_overwrite_a_replacement_entry() {
-        let state = test_daemon(true);
+        let state = test_daemon(cache::Power::Ac);
         let cfg = Arc::new(test_cfg(Duration::from_secs(60), Duration::from_secs(60)));
-        *state.config.lock().unwrap() = Arc::clone(&cfg);
+        state.set_config(&cfg);
         let key = cache::Key::global("b");
         let old_identity = cache::Entry::new(Instant::now()).identity;
-        let mut replacement = cache::Entry::new(Instant::now());
-        replacement.value = Some("replacement-value".into());
-        replacement.in_flight = true;
-        state.cache.lock().unwrap().insert(key.clone(), replacement);
-        let (tx, rx) = oneshot::channel();
-        spawn_fetch(Arc::clone(&state), key.clone(), old_identity, cfg, Some(tx));
-        tokio::time::timeout(Duration::from_secs(2), rx)
-            .await
-            .unwrap()
-            .unwrap();
-        let cache = state.cache.lock().unwrap();
-        assert_eq!(cache[&key].value.as_deref(), Some("replacement-value"));
-        assert!(
-            cache[&key].in_flight,
-            "must not release a replacement fetch"
-        );
-        drop(cache);
+        state.insert(&key, in_flight_entry(Some("replacement-value")));
+        run_fetch(&state, &key, old_identity, cfg).await;
+        let (value, in_flight) = state.entry(&key, |e| (e.value.clone(), e.in_flight));
+        assert_eq!(value.as_deref(), Some("replacement-value"));
+        assert!(in_flight, "must not release a replacement fetch");
+    }
+
+    #[test]
+    fn atomic_instant_claims_once_per_gap() {
+        let t0 = Instant::now();
+        let gap = Duration::from_secs(10);
+        let at = AtomicInstant::new(t0);
+        assert!(!at.claim_if_elapsed(t0 + Duration::from_secs(9), gap));
+        assert!(at.claim_if_elapsed(t0 + gap, gap));
+        assert_eq!(at.get(), t0 + gap);
+        assert!(!at.claim_if_elapsed(t0 + gap, gap), "the window is taken");
+        // Before the epoch saturates to it rather than wrapping.
+        at.set(t0.checked_sub(Duration::from_secs(1)).unwrap_or(t0));
+        assert_eq!(at.get(), t0);
     }
 }

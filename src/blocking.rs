@@ -8,7 +8,17 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-const WORKERS: usize = 4;
+/// Why [`Pool::run`] produced no result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejected {
+    /// Every slot is held (possibly by workers stuck in the kernel): the job never ran. Not
+    /// the job's fault, so callers must not treat it as a failure of what it would have done.
+    Saturated,
+    /// The deadline passed before the job started or finished.
+    Expired,
+    /// The worker panicked.
+    Panicked,
+}
 
 #[derive(Clone)]
 pub struct Pool {
@@ -16,35 +26,48 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new() -> Self {
+    pub fn new(workers: usize) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(WORKERS)),
+            slots: Arc::new(Semaphore::new(workers)),
         }
     }
 
-    /// Returns `None` on saturation, deadline expiry, or a panicking worker. There is
-    /// deliberately no admission queue. Dropping this future cannot release a running
-    /// worker's permit: the worker owns it, not the waiter.
+    /// Takes every free slot until the permit drops, so tests can saturate the pool.
+    #[cfg(test)]
+    pub fn hold_all(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let free = u32::try_from(self.slots.available_permits()).expect("slot count fits in u32");
+        Arc::clone(&self.slots)
+            .try_acquire_many_owned(free)
+            .expect("pool is open")
+    }
+
+    /// There is deliberately no admission queue: a full pool rejects at once. Dropping this
+    /// future cannot release a running worker's permit: the worker owns it, not the waiter.
     pub async fn run<T: Send + 'static>(
         &self,
         deadline: Instant,
         job: impl FnOnce() -> T + Send + 'static,
-    ) -> Option<T> {
+    ) -> Result<T, Rejected> {
         if Instant::now() >= deadline {
-            return None;
+            return Err(Rejected::Expired);
         }
-        let permit = Arc::clone(&self.slots).try_acquire_owned().ok()?;
+        let permit = Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map_err(|_| Rejected::Saturated)?;
         let work = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             // Work admitted just before a deadline may not have started yet.
             (Instant::now() < deadline).then(job)
         });
-        let result = tokio::time::timeout_at(deadline, work).await.ok()?.ok()?;
+        let result = tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_| Rejected::Expired)?
+            .map_err(|_| Rejected::Panicked)?;
         // timeout_at polls ready work before its timer; never accept a late result.
         if Instant::now() >= deadline {
-            return None;
+            return Err(Rejected::Expired);
         }
-        result
+        result.ok_or(Rejected::Expired)
     }
 }
 
@@ -53,6 +76,8 @@ mod tests {
     use super::*;
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
+
+    const WORKERS: usize = 4;
 
     struct DropSignal(tokio::sync::mpsc::UnboundedSender<()>);
 
@@ -64,7 +89,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_workers_keep_slots_and_do_not_block_the_reactor() {
-        let pool = Arc::new(Pool::new());
+        let pool = Arc::new(Pool::new(WORKERS));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -112,8 +137,12 @@ mod tests {
         gate.1.notify_all();
         assert!(started.is_ok(), "workers did not start");
         let (results, rejected) = results.unwrap();
-        assert!(results.iter().all(Option::is_none));
-        assert_eq!(rejected, None, "timeout must not free a running slot");
+        assert!(results.iter().all(|r| matches!(r, Err(Rejected::Expired))));
+        assert_eq!(
+            rejected,
+            Err(Rejected::Saturated),
+            "timeout must not free a running slot"
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
             for _ in 0..WORKERS {
                 dropped_rx.recv().await.unwrap();
@@ -127,18 +156,29 @@ mod tests {
         assert_eq!(
             pool.run(Instant::now() + Duration::from_secs(1), || 42)
                 .await,
-            Some(42)
+            Ok(42)
         );
     }
 
     #[tokio::test]
     async fn expired_jobs_are_not_admitted() {
-        let pool = Pool::new();
+        let pool = Pool::new(WORKERS);
         assert_eq!(
             pool.run::<()>(Instant::now(), || panic!("must not run"))
                 .await,
-            None
+            Err(Rejected::Expired)
         );
         assert_eq!(pool.slots.available_permits(), WORKERS);
+    }
+
+    #[tokio::test]
+    async fn panicking_jobs_are_reported_and_free_their_slot() {
+        let pool = Pool::new(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            pool.run::<()>(deadline, || panic!("boom")).await,
+            Err(Rejected::Panicked)
+        );
+        assert_eq!(pool.run(deadline, || 7).await, Ok(7));
     }
 }

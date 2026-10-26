@@ -34,6 +34,8 @@ struct SpawnedChild {
 impl SpawnedChild {
     fn kill_group(&self) {
         if self.armed {
+            // SAFETY: `killpg` takes plain integers and touches no memory; `armed` means the
+            // group is still registered (not yet reaped), so the pgid can't have been reused.
             unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
         }
     }
@@ -42,7 +44,10 @@ impl SpawnedChild {
         let result = self.child.wait().await;
         if result.is_ok() {
             self.armed = false;
-            self.inflight.lock().unwrap().remove(&self.pgid);
+            self.inflight
+                .lock()
+                .expect("inflight lock poisoned")
+                .remove(&self.pgid);
         }
         result
     }
@@ -60,6 +65,35 @@ impl Drop for SpawnedChild {
     }
 }
 
+/// Consumes a child's stdout as it arrives. An error stops the read and kills the group.
+pub(super) trait Sink {
+    type Output;
+    fn feed(&mut self, chunk: &[u8]) -> Result<(), ProviderError>;
+    fn finish(self) -> Self::Output;
+}
+
+/// Buffers the whole output, failing with `TooLarge` past `cap` bytes.
+struct Capped {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl Sink for Capped {
+    type Output = Vec<u8>;
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > self.cap {
+            return Err(ProviderError::TooLarge);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
 /// Runs `prog args` (stdin from `/dev/null`), killing the whole process group on timeout
 /// or oversized stdout. The capped stdout read and `wait()` both happen inside `deadline`; on
 /// the success path the leader is reaped and never killed (its pgid may be reused once dead).
@@ -71,6 +105,22 @@ pub(super) async fn run_with_timeout(
     cap: usize,
     opts: RunOpts<'_>,
 ) -> Result<Vec<u8>, ProviderError> {
+    let sink = Capped {
+        buf: Vec::new(),
+        cap,
+    };
+    run_into(prog, args, cwd, deadline, sink, opts).await
+}
+
+/// [`run_with_timeout`], streaming stdout into `sink` instead of a capped buffer.
+pub(super) async fn run_into<S: Sink>(
+    prog: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    deadline: Instant,
+    mut sink: S,
+    opts: RunOpts<'_>,
+) -> Result<S::Output, ProviderError> {
     if opts.shared.stopping.load(Ordering::SeqCst) {
         return Err(ProviderError::Stopped);
     }
@@ -95,7 +145,7 @@ pub(super) async fn run_with_timeout(
     let shared = opts.shared.clone();
     let mut child = opts
         .shared
-        .blocking
+        .pool_for(cwd)
         .run(deadline, move || {
             if shared.stopping.load(Ordering::SeqCst) {
                 return Err(ProviderError::Stopped);
@@ -115,7 +165,7 @@ pub(super) async fn run_with_timeout(
                 armed: true,
             };
             {
-                let mut registry = shared.inflight.lock().unwrap();
+                let mut registry = shared.inflight.lock().expect("inflight lock poisoned");
                 if shared.stopping.load(Ordering::SeqCst) {
                     // Drop outside the registry lock: the guard also removes its pid.
                     drop(registry);
@@ -125,15 +175,14 @@ pub(super) async fn run_with_timeout(
             }
             Ok(spawned)
         })
-        .await
-        .ok_or(ProviderError::Timeout)??;
+        .await??;
 
     let mut stdout = child.child.stdout.take().expect("stdout is piped");
 
     let work = async {
-        match read_capped(&mut stdout, cap).await {
-            Ok(out) => match child.wait().await {
-                Ok(status) if status.success() => Ok(out),
+        match read_into(&mut stdout, &mut sink).await {
+            Ok(()) => match child.wait().await {
+                Ok(status) if status.success() => Ok(sink.finish()),
                 Ok(status) => Err(ProviderError::NonZeroExit(status.code().unwrap_or(-1))),
                 Err(e) => Err(e.into()),
             },
@@ -159,20 +208,15 @@ pub(super) async fn run_with_timeout(
     }
 }
 
-async fn read_capped(stdout: &mut ChildStdout, cap: usize) -> Result<Vec<u8>, ProviderError> {
-    let mut buf = Vec::new();
+async fn read_into<S: Sink>(stdout: &mut ChildStdout, sink: &mut S) -> Result<(), ProviderError> {
     let mut chunk = [0u8; 8192];
     loop {
         let n = stdout.read(&mut chunk).await?;
         if n == 0 {
-            break;
+            return Ok(());
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > cap {
-            return Err(ProviderError::TooLarge);
-        }
+        sink.feed(&chunk[..n])?;
     }
-    Ok(buf)
 }
 
 pub(super) async fn http_fetch(

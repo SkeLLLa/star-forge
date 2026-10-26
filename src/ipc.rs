@@ -59,7 +59,7 @@ impl Response {
 
 /// Re-exported so daemon-side code (binds the socket, derives the lock path, vets the
 /// runtime dir) and `client.rs` (connects to it) never disagree on where it is.
-pub use crate::client::{runtime_dir, runtime_dir_is_private, socket_path};
+pub use crate::client::{env_patterns_path, runtime_dir, runtime_dir_is_private, socket_path};
 
 pub fn lock_path() -> PathBuf {
     runtime_dir().join("daemon.lock")
@@ -99,7 +99,7 @@ fn feed_line(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> io::Result<bool> {
 /// Reads one `\n`-terminated line as raw bytes (discarding the newline), erroring if the
 /// line is longer than `cap` bytes. EOF with no newline returns what was read so far.
 /// Byte-oriented (rather than `String`) so callers can dispatch on the first byte (`{` JSON
-/// vs `g` text `get`, see `daemon::handler::handle_connection`) before deciding how to decode the rest.
+/// vs `g` text `get`, see `daemon::protocol::handle_connection`) before deciding how to decode the rest.
 pub async fn read_line_bytes_capped_async<R>(r: &mut R, cap: usize) -> io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,

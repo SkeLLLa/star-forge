@@ -1,0 +1,48 @@
+# cargo-deny (`mise run lint:deny`, CI's deny job): licenses, bans, sources, advisories.
+
+[graph]
+# The release targets: platform-specific dependencies are checked for each of them.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# Every advisory kind (vulnerability, unmaintained, unsound, notice) fails unless ignored
+# here with a reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Each one can be combined into a GPL-3.0-or-later work.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "GPL-3.0-or-later",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

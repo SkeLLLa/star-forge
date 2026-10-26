@@ -24,6 +24,13 @@ use std::collections::BTreeMap;
 /// Lowercased name -> color spec (`#rrggbb`, named, `bright-*`, 0-255).
 pub type Palette = BTreeMap<String, String>;
 
+/// Which SGR color slot a [`Color`] fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    Fg,
+    Bg,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Color {
     /// 0-15: the 8 named colors, then their bright variants.
@@ -44,19 +51,23 @@ impl Color {
         }
     }
 
-    fn sgr(self, bg: bool) -> String {
+    fn sgr(self, layer: Layer) -> String {
+        let extended = match layer {
+            Layer::Fg => 38,
+            Layer::Bg => 48,
+        };
         match self {
             Self::Named(n) => {
-                let base = match (n < 8, bg) {
-                    (true, false) => 30,
-                    (true, true) => 40,
-                    (false, false) => 90 - 8,
-                    (false, true) => 100 - 8,
+                let base = match (n < 8, layer) {
+                    (true, Layer::Fg) => 30,
+                    (true, Layer::Bg) => 40,
+                    (false, Layer::Fg) => 90 - 8,
+                    (false, Layer::Bg) => 100 - 8,
                 };
                 (base + u16::from(n)).to_string()
             }
-            Self::Fixed(n) => format!("{};5;{n}", if bg { 48 } else { 38 }),
-            Self::Rgb(r, g, b) => format!("{};2;{r};{g};{b}", if bg { 48 } else { 38 }),
+            Self::Fixed(n) => format!("{extended};5;{n}"),
+            Self::Rgb(r, g, b) => format!("{extended};2;{r};{g};{b}"),
         }
     }
 }
@@ -80,6 +91,10 @@ impl Dialect {
     }
 
     /// Starts `eff`; `reset_first` when an outer style is active and must be replaced.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "private helper with one caller in this file"
+    )]
     fn open(self, eff: &Style, reset_first: bool) -> String {
         match self {
             Self::Ansi => eff.sgr(reset_first),
@@ -123,6 +138,10 @@ struct Style {
 impl Style {
     /// `ESC[..m` for the full state; `reset_first` prefixes `0` so an inner span replaces
     /// (rather than adds to) whatever the outer span left active.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "private helper; its callers are in this file"
+    )]
     fn sgr(&self, reset_first: bool) -> String {
         let mut codes: Vec<String> = Vec::new();
         if reset_first {
@@ -143,10 +162,10 @@ impl Style {
             }
         }
         if let Some(c) = self.bg {
-            codes.push(c.sgr(true));
+            codes.push(c.sgr(Layer::Bg));
         }
         if let Some(c) = self.fg {
-            codes.push(c.sgr(false));
+            codes.push(c.sgr(Layer::Fg));
         }
         format!("\x1b[{}m", codes.join(";"))
     }

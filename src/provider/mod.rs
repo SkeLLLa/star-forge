@@ -21,13 +21,16 @@ use exec::{RunOpts, http_fetch, run_with_timeout};
 pub(crate) use git::{
     GitFingerprint, git_dir, git_fingerprint, git_root, project_root, run_in_process_git,
 };
-use git::{PorcelainFlight, count_or_empty, git_field_value, parse_porcelain_v2, porcelain_fetch};
+use git::{PorcelainFlight, count_or_empty, git_field_value, porcelain_fetch};
 pub use system::on_ac;
 use system::{battery, hostname, load_avg, mem_used_percent, uptime_secs};
 
 #[derive(Debug, Clone)]
 pub enum ProviderError {
     Timeout,
+    /// The blocking pool had no free slot: the fetch never ran. Retried soon, without
+    /// counting as a failure (no backoff growth).
+    Saturated,
     Stopped,
     TooLarge,
     Spawn(String),
@@ -45,10 +48,21 @@ impl From<std::io::Error> for ProviderError {
     }
 }
 
+impl From<crate::blocking::Rejected> for ProviderError {
+    fn from(r: crate::blocking::Rejected) -> Self {
+        match r {
+            crate::blocking::Rejected::Saturated => Self::Saturated,
+            crate::blocking::Rejected::Expired => Self::Timeout,
+            crate::blocking::Rejected::Panicked => Self::Io("blocking worker panicked".into()),
+        }
+    }
+}
+
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Timeout => write!(f, "timed out"),
+            Self::Saturated => write!(f, "blocking pool busy"),
             Self::Stopped => write!(f, "daemon is stopping"),
             Self::TooLarge => write!(f, "output exceeded max_output"),
             Self::Spawn(e) => write!(f, "spawn failed: {e}"),
@@ -62,15 +76,28 @@ impl fmt::Display for ProviderError {
     }
 }
 
+/// Slots for work tied to a request's directory (git snapshots, path-scoped spawns): the work
+/// most likely to hang on a dead mount.
+pub const PATH_WORKERS: usize = 8;
+/// Slots for everything else: global badges, config reload, power probes, shutdown.
+pub const GLOBAL_WORKERS: usize = 4;
+
 /// State shared by every fetch: one pooled HTTP client, the in-flight process-group
-/// registry (killed on stop/signal/idle-exit), a global concurrency cap, and the in-flight-only
-/// per-repo `git_counts` singleflight map (see `porcelain_fetch`).
+/// registry (killed on stop/signal/idle-exit), a global concurrency cap, the two blocking
+/// pools, and the in-flight-only per-repo `git_counts` singleflight map (see
+/// `porcelain_fetch`).
+///
+/// The pools are split so workers stuck on one hung mount (path-scoped work) can't starve
+/// global badges or config reload.
 #[derive(Clone)]
 pub struct Shared {
     http: reqwest::Client,
     inflight: Arc<Mutex<HashSet<i32>>>,
     semaphore: Arc<Semaphore>,
+    /// Global badges and daemon maintenance.
     pub blocking: crate::blocking::Pool,
+    /// Work under a request's directory.
+    pub path_blocking: crate::blocking::Pool,
     stopping: Arc<AtomicBool>,
     porcelain: Arc<Mutex<HashMap<PathBuf, Arc<PorcelainFlight>>>>,
 }
@@ -86,9 +113,19 @@ impl Shared {
             http,
             inflight: Arc::new(Mutex::new(HashSet::new())),
             semaphore: Arc::new(Semaphore::new(4)),
-            blocking: crate::blocking::Pool::new(),
+            blocking: crate::blocking::Pool::new(GLOBAL_WORKERS),
+            path_blocking: crate::blocking::Pool::new(PATH_WORKERS),
             stopping: Arc::new(AtomicBool::new(false)),
             porcelain: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The pool for work that runs in `cwd` (`None`: global).
+    pub(crate) const fn pool_for(&self, cwd: Option<&Path>) -> &crate::blocking::Pool {
+        if cwd.is_some() {
+            &self.path_blocking
+        } else {
+            &self.blocking
         }
     }
 
@@ -97,8 +134,10 @@ impl Shared {
     pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.semaphore.close();
-        let pgids = self.inflight.lock().unwrap();
+        let pgids = self.inflight.lock().expect("inflight lock poisoned");
         for &pgid in pgids.iter() {
+            // SAFETY: `killpg` takes plain integers and touches no memory; `inflight` only
+            // holds groups that haven't been reaped yet.
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
         }
     }
@@ -114,19 +153,18 @@ async fn run_builtin(
     shared: &Shared,
 ) -> Result<Vec<u8>, ProviderError> {
     match name {
-        // In-process (no subprocess, no fetch-path cache entry): `daemon::handler::handle_get`
+        // In-process (no subprocess, no fetch-path cache entry): `daemon::resolve::handle_get`
         // intercepts these four via `git_snapshot` before calling `fetch`/`fetch_raw`. This arm
         // keeps dispatch total and serves direct `fetch` callers, off the reactor.
         Builtin::GitBranch | Builtin::GitCommit | Builtin::GitState | Builtin::GitStash => {
             let cwd = cwd.map(Path::to_path_buf);
-            shared
-                .blocking
+            Ok(shared
+                .path_blocking
                 .run(deadline, move || {
                     run_in_process_git(name, cwd.as_deref().and_then(git_dir).as_deref())
                         .unwrap_or_default()
                 })
-                .await
-                .ok_or(ProviderError::Timeout)
+                .await?)
         }
         // Both share one `git status --porcelain=v2 --branch` per repo (`porcelain_fetch`).
         // Raw value only (design.md §5): the template adds any symbol, and a zero count
@@ -134,8 +172,7 @@ async fn run_builtin(
         Builtin::GitStatus | Builtin::GitCounts => {
             let repo_root = cwd
                 .ok_or_else(|| ProviderError::Io("git status requires a repo root".to_string()))?;
-            let counts =
-                parse_porcelain_v2(&porcelain_fetch(shared, repo_root, deadline, cap).await?);
+            let counts = porcelain_fetch(shared, repo_root, deadline, cap).await?;
             Ok(field.map_or_else(
                 || count_or_empty(counts.dirty),
                 |field| git_field_value(&counts, field),
@@ -146,13 +183,14 @@ async fn run_builtin(
         Builtin::Hostname => hostname().map(String::into_bytes),
         Builtin::LoadAvg => load_avg().map(String::into_bytes),
         Builtin::Uptime => uptime_secs().map(|s| s.to_string().into_bytes()),
-        Builtin::MemUsedPercent => shared
-            .blocking
-            .run(deadline, || {
-                mem_used_percent().map(|p| p.to_string().into_bytes())
-            })
-            .await
-            .ok_or(ProviderError::Timeout)?,
+        Builtin::MemUsedPercent => {
+            shared
+                .blocking
+                .run(deadline, || {
+                    mem_used_percent().map(|p| p.to_string().into_bytes())
+                })
+                .await?
+        }
     }
 }
 
@@ -250,17 +288,10 @@ pub async fn fetch(
         badge.max_output,
     )
     .await?;
-    let extraction = badge.extract.clone();
-    let format = badge.format.clone();
-    shared
-        .blocking
-        .run(deadline, move || {
-            let extracted =
-                extract::apply(extraction.as_ref(), &raw).map_err(ProviderError::Extract)?;
-            Ok(extract::render(&format, &extracted))
-        })
-        .await
-        .ok_or(ProviderError::Timeout)?
+    // Inline: linear-time regex/JSON over at most `max_output` bytes, and a second pool hop
+    // would let saturation fail a fetch whose source already succeeded.
+    let extracted = extract::apply(badge.extract.as_ref(), &raw).map_err(ProviderError::Extract)?;
+    Ok(extract::render(&badge.format, &extracted))
 }
 
 #[cfg(test)]

@@ -11,6 +11,21 @@ pub enum Extract {
     Json { pointer: String },
 }
 
+/// By pattern text: `Regex` has no `PartialEq`, and a reload only needs to know whether the
+/// configured extraction changed.
+impl PartialEq for Extract {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Trim, Self::Trim) => true,
+            (Self::Regex { re: a, group: g }, Self::Regex { re: b, group: h }) => {
+                a.as_str() == b.as_str() && g == h
+            }
+            (Self::Json { pointer: a }, Self::Json { pointer: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Deserialize-only mirror of [`Extract`]; the regex is compiled afterward.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -100,8 +115,10 @@ pub fn apply(extract: Option<&Extract>, raw: &[u8]) -> Result<String, String> {
 /// renders as an empty string regardless of `format` — e.g. `format = "✗{value}"` shows
 /// nothing when `git_status` reports a clean tree (empty `value`), and empty output ⇒
 /// starship hides the module.
-// "{value}" is a literal template placeholder, not a forgotten `format!`.
-#[allow(clippy::literal_string_with_formatting_args)]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "\"{value}\" is a literal template placeholder, not a forgotten `format!`"
+)]
 pub fn render(format: &str, value: &str) -> String {
     if value.is_empty() {
         return String::new();

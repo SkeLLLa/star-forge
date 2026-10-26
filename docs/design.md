@@ -23,7 +23,7 @@ described in [`distribution.md`](distribution.md).
 | Subprocess kill | `process_group(0)` + `killpg(SIGKILL)` on timeout, always reaped |
 | Platforms | Linux and macOS (aarch64, x86_64); `cfg(target_os)` picks the host-builtin backend, everything else is shared |
 | Builtins | `git_branch`, `git_status`, `git_counts` (`git status --porcelain=v2`, deduped per repo); `git_commit`/`git_state`/`git_stash` (in-process, no subprocess); `battery` (Linux `/sys/class/power_supply`; macOS `pmset -g batt` subprocess, bounded by `timeout`); `hostname` (`gethostname(3)`); `load_avg` (`getloadavg(3)`); `uptime` (Linux `CLOCK_BOOTTIME`; macOS `kern.boottime`); `mem_used_percent` (Linux `/proc/meminfo`; macOS `host_statistics64` + `hw.memsize`) |
-| Git freshness | `git_branch`/`git_commit`/`git_state`/`git_stash` computed in-process per request (no cache, no stale window); `git_status`/`git_counts` invalidate their cache entry on a `.git/HEAD`/`.git/index` mtime change instead of waiting out `interval` (see §5/§6) |
+| Git freshness | `git_branch`/`git_commit`/`git_state`/`git_stash` computed in-process per request (no cache, no stale window); `git_status`/`git_counts` invalidate their cache entry on a `.git/HEAD`/`.git/index`/`FETCH_HEAD` identity change instead of waiting out `interval` (see §5/§6) |
 | Cache scope | explicit `Scope { Global, GitRoot, ProjectRoot }` on every badge; git builtins require `GitRoot`, other sources can override their default (`ProjectRoot` needs `markers`) |
 | Scheduling | demand-driven, one coalesced timer, dormant when unused (see §6) |
 
@@ -83,18 +83,32 @@ doesn't pin mount points). The client never unlinks the socket; the daemon does 
 avoids a client deleting a live daemon's socket during a race.
 
 **Singleton**: daemon opens `daemon.lock`, `flock(LOCK_EX|LOCK_NB)`. If that fails, another daemon
-is live → exit 0. Once holding the lock it unlinks any stale socket and binds. The kernel releases the
-lock on any death, so there is nothing stale to trust. On shutdown it unlinks the socket only if its
-dev/ino still match the one it bound, so it never deletes a successor daemon's socket. It bumps
-`daemon.lock`'s mtime at least once per `idle_exit`: macOS's daily periodic job deletes `/tmp`
-files older than 3 days, and an unlinked lock would let a second daemon lock a fresh inode.
+is live → exit 0. Once holding the lock it unlinks any stale socket and binds, before loading the
+config or starting the runtime, so a client spawned alongside it can connect (its backlog queues)
+while the daemon is still starting. The kernel releases the lock on any death, so there is nothing
+stale to trust. On shutdown it unlinks the socket only if its dev/ino still match the one it bound,
+so it never deletes a successor daemon's socket. It bumps `daemon.lock`'s mtime at least once per
+`idle_exit`: macOS's daily periodic job deletes `/tmp` files older than 3 days, and an unlinked lock
+would let a second daemon lock a fresh inode.
 
-**Upgrade safety**: requests carry `"ver": env!("CARGO_PKG_VERSION")` (the client's version);
-responses carry the daemon's. On a `get` whose `ver` differs from its own, the daemon answers
-normally and only then initiates its normal graceful shutdown (killpg in-flight, unlink socket,
-exit) — the same path `stop` uses. Zero extra client latency: there is no synchronous
-notification round-trip on the hot path. The next prompt's connect finds no socket and spawns the
-new binary.
+**Upgrade safety** (`daemon/upgrade.rs`): requests carry `"ver": env!("CARGO_PKG_VERSION")` (the
+client's version); responses carry the daemon's. On a `get` whose `ver` differs from its own, the
+daemon answers normally, records the client version (`status` shows `version mismatch: client X,
+daemon Y`), and then decides whether to exit:
+
+- its own executable was replaced — the path and dev/ino recorded at startup no longer match (the
+  path is kept because Linux's `/proc/self/exe` follows the old, deleted inode) — that is the
+  upgrade, so it restarts;
+- the client is a strictly newer `major.minor.patch` and the daemon has been up at least 60 s
+  (`MIN_UPTIME_FOR_NEWER_CLIENT`): restart. The uptime floor bounds a loop to one restart a minute
+  when the newer client finds only this same binary to spawn;
+- otherwise (an older client, an unparsable version) it stays: restarting would only spawn this
+  same binary again, on every prompt.
+
+A restart is the normal graceful shutdown (killpg in-flight, unlink socket, exit), the same path
+`stop` uses. The executable check is one `stat` on the global blocking pool, after the reply is
+written. Zero extra client latency: there is no synchronous notification round-trip on the hot
+path. The next prompt's connect finds no socket and spawns the new binary.
 
 ## 2. Wire protocol
 
@@ -120,7 +134,7 @@ get\x1f0.1.0\x1f/home/u/proj\x1fgit_branch\x1fgit_status\n
 ```
 
 fields: literal `get`, the client's `CARGO_PKG_VERSION`, cwd, then one field per badge name.
-Optionally the badges are followed by a `\x1eenv` field and the client's whole environment, one
+Optionally the badges are followed by a `\x1eenv` field and the client's environment, one
 `NAME=value` field each (entries with `\n`/`\x1f`, or over 4 KiB, are skipped; if the block still
 would push the line past ~60 KiB it is omitted):
 
@@ -128,20 +142,24 @@ would push the line past ~60 KiB it is omitted):
 get\x1f0.1.0\x1f/home/u/proj\x1fnode\x1f\x1eenv\x1fPATH=/a:/b\x1fMISE_SHELL=zsh\n
 ```
 
-The client doesn't read the config (latency), so it can't know which variables a badge wants;
-the daemon filters per badge by its `env` allowlist (`select_env`). No block (an older client)
-means the daemon's own env (`Key::env = None`); a block, even one where nothing matches a badge's
-allowlist, is `Some(selection)` and makes `provider` `env_remove` every daemon variable matching
-the allowlist but absent from the selection, so an unset client variable doesn't leak.
-An older daemon reads the block as unknown badge names, whose
-lines the client drops (it keeps only as many lines as it asked for).
-If cwd or any badge name contains `\n`, `\r`, or `\x1f`, the client refuses to encode the request
-at all and prints empty lines without connecting (see `client::encode_request`). The daemon
-answers with exactly one line per requested badge, in the same order, then closes; a rendered
-value's own `\n`/`\r` are replaced with a space so the line framing can't be broken by badge
-content. Version mismatch (`ver` differs from the daemon's own `CARGO_PKG_VERSION`) → the daemon
-answers normally, then initiates the same graceful shutdown `stop` uses (no added client latency;
-see §1 upgrade safety). Both directions are capped at 64 KiB per line.
+The client doesn't parse the config (latency). Instead the daemon publishes the union of every
+badge's `env` patterns to `env-patterns` next to the socket (first line `star-forge env-patterns
+v1`, then one pattern per line; written to a temp file and renamed, at startup and on each reload),
+and the client sends only the variables matching it. An empty pattern list means no block at all; a
+missing, unreadable, or headerless file (an older daemon) means the whole environment, as before.
+Either way the daemon still filters per badge by its `env` allowlist (`select_env`), so a stale file
+only costs bytes, never correctness. No block (an older client) means the daemon's own env
+(`Key::env = None`); a block, even one where nothing matches a badge's allowlist, is
+`Some(selection)` and makes `provider` `env_remove` every daemon variable matching the allowlist but
+absent from the selection, so an unset client variable doesn't leak. An older daemon reads the block
+as unknown badge names, whose lines the client drops (it keeps only as many lines as it asked for).
+If cwd or any badge name contains `\n`, `\r`, or `\x1f`, the client refuses to encode the request at
+all and prints empty lines without connecting (see `client::encode_request`). The daemon answers
+with exactly one line per requested badge, in the same order, then closes; a rendered value's own
+`\n`/`\r` are replaced with a space so the line framing can't be broken by badge content. Version
+mismatch (`ver` differs from the daemon's own `CARGO_PKG_VERSION`) → the daemon answers normally,
+then may initiate the same graceful shutdown `stop` uses (no added client latency; see §1 upgrade
+safety for when). Both directions are capped at 64 KiB per line.
 
 **Groups** — a requested name that matches a `[groups.<name>]` entry (`badges`, optional
 `separator`, default `" "`) is resolved daemon-side: the members are fetched through the normal
@@ -236,13 +254,18 @@ cost dominates a call) is covered in the "Batching calls" section of [`configura
   readers, and the JSON admin (`status`/`stop`/`reload`) client. The `get` client lives entirely
   in `client`; nothing here duplicates it.
 - `src/daemon/mod.rs` — setsid/chdir, flock, accept loop, `Daemon` state, refresh scheduling
-  (`refresh_due`, `spawn_fetch`), stop, idle exit.
+  (`refresh_due`, `spawn_fetch`), stop, idle exit. `Daemon` has two locks, `core` (the config
+  and the cache together) and `config_meta`, each taken alone and never across an `.await`;
+  request, eviction and power timestamps are atomics, so there is no lock order.
 - `src/daemon/reload.rs` — `FileId` stamps and the throttled config/palette reload check.
-- `src/daemon/handler.rs` — request handling (dispatches JSON vs text
-  `get` by first byte, see §2). `handle_get` intercepts the four
-  in-process git builtins before they ever touch the cache (see §5/§6), and applies
-  request-time fingerprint invalidation for `git_status`/`git_counts`. Also owns the `status`
-  output and config-error reporting.
+- `src/daemon/protocol.rs` — the wire side: dispatches JSON vs text `get` by first byte (see
+  §2), parses the `get` line, frames the answer, and runs the post-answer upgrade check.
+- `src/daemon/resolve.rs` — answers a `get`. `handle_get` intercepts the four in-process git
+  builtins before they ever touch the cache (see §5/§6), applies request-time fingerprint
+  invalidation for `git_status`/`git_counts`, and restarts under the new config if a reload
+  lands mid-request.
+- `src/daemon/render.rs` — group expansion and joining, in-process git values through a
+  badge's format, and the `status` table (including config errors).
 - `src/daemon/cache.rs` — `Key`, `Entry` (incl. the `git_status`/`git_counts` fingerprint, see §4),
   backoff, scheduling state (next-due computation, eviction), `effective_interval`
   (AC-aware; shared by the timer path and `handle_get`'s staleness check).
@@ -358,21 +381,21 @@ struct Entry {
     errors: u32,
     next_attempt: Instant,     // backoff gate after failures
     in_flight: bool,           // single-flight
-    // `.git/HEAD` + `.git/index` mtimes as of the fetch this entry last *started*; only set
-    // for `git_status`/`git_counts` (see §5/§6's fingerprint invalidation). `None` for every
+    // `.git/HEAD` + `.git/index` + `FETCH_HEAD` identities as of the fetch this entry last
+    // *started*; only set for `git_status`/`git_counts` (see §5/§6's fingerprint invalidation). `None` for every
     // other badge, including the four in-process git builtins, which never get an Entry at
     // all (handle_get bypasses the cache for them entirely).
     fingerprint: Option<GitFingerprint>,
 }
 ```
 
-Cache is a `HashMap<Key, Entry>` inside a `std::sync::Mutex` (single-threaded runtime, never held
-across `.await`). Scope is structural: git builtins are keyed by repo root, everything else is global.
-Hard caps: max `max_paths` path-scoped keys (default 256, LRU by `last_access`), enforced
-immediately whenever a new path-scoped key is inserted (`handle_get`), not only from the timer
-path — otherwise a config with only path-scoped badges could overshoot it for up to `idle_exit`.
-Idle path-scoped keys (see §6) are dropped from the same request path too, throttled to once
-every `config_check` (default 2s), same as `check_reload`.
+Cache is a `HashMap<Key, Entry>` behind one `std::sync::Mutex` together with the config
+(single-threaded runtime, never held across `.await`). Scope is structural: git builtins are keyed
+by repo root, everything else is global. Hard caps: max `max_paths` path-scoped keys (default 256,
+LRU by `last_access`), enforced immediately whenever a new path-scoped key is inserted
+(`handle_get`), not only from the timer path — otherwise a config with only path-scoped badges could
+overshoot it for up to `idle_exit`. Idle path-scoped keys (see §6) are dropped from the same request
+path too, throttled to once every `config_check` (default 2s), same as `check_reload`.
 
 Backoff: `min(retry_min * 2^errors, retry_max)` ±20% jitter (defaults 2s/5min).
 
@@ -414,8 +437,8 @@ closes admission before the sweep: a spawn that returns afterwards kills its own
 registering it. On `stop`/SIGTERM/SIGINT/idle-exit it `killpg`s every entry before exiting;
 `kill_on_drop` alone only kills the leader.
 
-Invariants: stdin is never the tty; `Command::spawn` (which waits for exec/chdir) runs on the
-four-slot blocking pool; nothing that can block is awaited outside the
+Invariants: stdin is never the tty; `Command::spawn` (which waits for exec/chdir) runs on a blocking
+pool (the path pool when the command has a cwd); nothing that can block is awaited outside the
 deadline; the process group is always killed and the child always reaped. Stdout past `cap` →
 `TooLarge` error (and kill). Env var `GIT_OPTIONAL_LOCKS=0` is set for git to avoid index lock
 contention with the user's own git commands.
@@ -423,16 +446,25 @@ contention with the user's own git commands.
 **HTTP**: one `reqwest::Client` (connect timeout 2s, pool idle timeout 30s so idle sockets don't keep
 the radio/timers busy). Each request is wrapped in `timeout_at(deadline)`; body read by `chunk()` with
 the byte cap. Non-2xx → error. DNS goes through `getaddrinfo` on tokio's blocking pool, which a
-timeout cannot cancel; the runtime is built with `max_blocking_threads(4)`. Filesystem,
-process-spawn, and extraction jobs also use that runtime pool, with a separate four-slot
-admission limit held until actual completion. A stuck resolver or mount cannot block the event
-loop, although it can exhaust blocking-worker capacity. Shutdown uses a zero blocking-worker
-wait.
+timeout cannot cancel. Filesystem and process-spawn jobs also use tokio's blocking pool, through
+two admission pools (`blocking::Pool`) whose slots are held until a job actually completes:
+`path_blocking` (`PATH_WORKERS` = 8) for work under a request's directory — git snapshots and
+fingerprints, path-scoped spawns — and `blocking` (`GLOBAL_WORKERS` = 4) for global badges, config
+reload, power probes and the upgrade check. Workers stuck on one hung mount can therefore fill the
+path pool but never starve global badges or reload. The runtime's `max_blocking_threads` is both
+pools plus 8 for DNS. A full pool rejects a job immediately (`Rejected::Saturated`) rather than
+queueing it: the fetch never ran, so the daemon retries after `retry_min` without counting an
+error or growing the backoff. A stuck resolver or mount cannot block the event loop. Shutdown uses
+a zero blocking-worker wait.
 
-**Extraction** runs on a blocking worker within the same per-badge deadline, in-process
-(no subprocess); semaphore admission time counts against that deadline too.
+**Extraction** runs inline on the runtime thread after the fetch: regex and JSON are linear-time
+over at most `max_output` bytes, and a second pool hop would let saturation fail a fetch whose
+source already succeeded.
 
-**Concurrency**: global `Semaphore(4)` acquired per fetch. Single-flight via `Entry.in_flight`.
+**Concurrency**: global `Semaphore(4)` acquired per fetch. Single-flight via `Entry.in_flight`,
+which an `InFlightGuard` clears if the fetch task panics or is aborted before its write-back (only
+when the entry still has the same identity), so a provider bug can't wedge a key forever. A
+reload keeps the flag, so an entry never has two fetches running.
 
 **Git root discovery** is in-process (walk up from cwd, `stat` for `.git` file or dir), never a
 subprocess on the request path. It runs on a bounded worker only for requests that need a
@@ -444,31 +476,36 @@ no fetch. Regular git directories, directory symlinks, and worktree `gitdir:` fi
 refs/heads/<name>` line or lack thereof, check for `MERGE_HEAD`/`rebase-merge`/etc., count
 the stash reflog's lines via `commondir`-resolved shared git dir). Normally cheap enough to
 recompute from scratch on *every* `get`, but file reads can hang on remote mounts, so
-`daemon::handler::handle_get` takes one worker snapshot of the requested git values and fingerprint
+`daemon::resolve::handle_get` takes one worker snapshot of the requested git values and fingerprint
 before touching the cache or `provider::fetch`. These four badges never get a `cache::Entry`
 and have no stale-while-revalidate window or fs watcher. On timeout/saturation they render
 empty. `run_builtin`'s match arm for the same
 four builtins is kept only as a structurally-unreachable fallback (nothing on the real request
 path calls it once `handle_get` intercepts first).
 
-**Git fingerprinting** (`provider::git_fingerprint`, `GitFingerprint { head, index }`): mtimes
-of `.git/HEAD` and `.git/index` (gitdir-resolved), used as a cheap, subprocess-free proxy for
-"has the repo's branch or stage changed". `git_status`/`git_counts` are the two git builtins
-still backed by a `git` subprocess (status is relatively expensive to compute in-process), so
-instead of recomputing per request they keep their normal cache entry, but `handle_get`
-compares the fingerprint at `get`-time against the one stored on the `Entry` when its last
-fetch started; a mismatch forces the entry stale *and* cold, so the refreshing fetch lands in
-the same prompt via `cold_wait` instead of waiting out `interval`. This catches `git add`,
-`git commit`, `git checkout -b`, etc. — anything that touches `HEAD` or the index. Unstaged
-worktree edits touch neither file, so they're still only picked up on `interval`; closing that
-gap would need a watcher on the whole worktree, which this crate otherwise avoids.
+**Git fingerprinting** (`provider::git_fingerprint`, `GitFingerprint { head, index, fetch_head }`):
+the file identity (`file_id::FileId`: dev, inode, size, ctime and mtime in nanoseconds) of
+`.git/HEAD`, `.git/index` and `.git/FETCH_HEAD` (gitdir-resolved), used as a cheap, subprocess-free
+proxy for "has the repo's branch, stage or upstream changed". Git replaces these files by rename, so
+the inode changes even within one mtime tick; `FETCH_HEAD` makes a `git fetch` refresh the
+ahead/behind counts. `git_status`/`git_counts` are the two git builtins still backed by a `git`
+subprocess (status is relatively expensive to compute in-process), so instead of recomputing per
+request they keep their normal cache entry, but `handle_get` compares the fingerprint at `get`-time
+against the one stored on the `Entry` when its last fetch started; a mismatch forces the entry stale
+*and* cold, so the refreshing fetch lands in the same prompt via `cold_wait` instead of waiting out
+`interval`. This catches `git add`, `git commit`, `git checkout -b`, `git fetch`, etc. — anything
+that touches `HEAD`, the index or `FETCH_HEAD`. Unstaged worktree edits touch none of these files,
+so they're still only picked up on `interval`; closing that gap would need a watcher on the whole
+worktree, which this crate otherwise avoids.
 
 **`git_status`/`git_counts` dedupe** (`provider::porcelain_fetch`): concurrent `git_status` and
 `git_counts` badges for the same repo share `git status --porcelain=v2 --branch` work. Completed
 results are not kept as a second permanent repository cache: badge entries own freshness and TTL
 refreshes fetch new worktree state even when HEAD/index have not changed. Each caller enforces
-its own deadline and output cap while sharing work, but the shared subprocess runs with the
-creator's limits: a joiner with looser limits can fail conservatively.
+its own deadline while sharing work, but the shared subprocess runs with the creator's limits: a
+joiner with a looser deadline can fail conservatively. The output is counted as it streams
+(`PorcelainCounter`, an `exec::Sink`), never buffered, so `max_output` bounds a single porcelain
+line rather than the total: a repo with thousands of changed files still gets its counts.
 
 ## 6. Scheduling and power efficiency
 
@@ -503,13 +540,13 @@ Goal: near-zero wakeups when the user isn't looking at a prompt.
 - **In-process git builtins skip this entirely.** `git_branch`/`git_commit`/`git_state`/
   `git_stash` are recomputed on a bounded blocking worker per request (see §5) — no `Entry`, no
   staleness check, no background task; every `get` sees the current on-disk state.
-- **Fingerprint invalidation for `git_status`/`git_counts`.** On top of the interval check
-  above, `handle_get` also compares a freshly-read `GitFingerprint` (`.git/HEAD` +
-  `.git/index` mtimes) against the one recorded when the entry's current value was fetched; a
-  mismatch forces the entry stale *and* treats it as a cold miss, so the refresh is awaited
-  (bounded by `cold_wait`) instead of answering with the old value and refreshing in the
-  background. This is what makes `git checkout -b`/`git add`/`git commit` visible in the very
-  next prompt instead of after up to `interval` — see §5 for what it does and doesn't catch.
+- **Fingerprint invalidation for `git_status`/`git_counts`.** On top of the interval check above,
+  `handle_get` also compares a freshly-read `GitFingerprint` (`.git/HEAD`, `.git/index` and
+  `FETCH_HEAD` identities) against the one recorded when the entry's current value was fetched; a
+  mismatch forces the entry stale *and* treats it as a cold miss, so the refresh is awaited (bounded
+  by `cold_wait`) instead of answering with the old value and refreshing in the background. This is
+  what makes `git checkout -b`/`git add`/`git commit` visible in the very next prompt instead of
+  after up to `interval` — see §5 for what it does and doesn't catch.
 - **One timer.** The daemon loop is `select!{ accept, sleep_until(target), sigterm, sigint,
   shutdown, reschedule }`, where `target` is `min(next_due, idle_deadline)`. `next_due` is the
   min over active global keys of `max(fetched_at + interval, next_attempt)` (`interval` or
@@ -537,8 +574,12 @@ Goal: near-zero wakeups when the user isn't looking at a prompt.
   kept running (on initial daemon startup, where there is no previous config yet, an empty
   default config is used instead and logged the same way). Implicit checks run in the
   background, with no filesystem access on the event loop; explicit reload waits at most
-  500 ms. Successful reload invalidates active entries, wakes the scheduler, and prevents
-  old-config fetch completions from overwriting new-config state.
+  500 ms. A successful reload leaves the entries of unchanged badges as they are, marks
+  changed badges' entries stale (keeping the last good value and any running fetch), drops
+  scoped entries whose source, scope or path options changed, and wakes the scheduler. A fetch
+  that started under the old config still releases its entry's flag when it finishes, but its
+  result is kept only if the badge didn't change. A request that a reload overtakes restarts
+  under the new config within the same budget, rather than answering blank.
 - **Cold-miss wait.** A `get` on a key with *no value at all* (first `cd` into a repo) waits up
   to the configured `cold_wait` (default 20 ms) for the fetch it just started, then answers with
   whatever it has. The fetch keeps running in the background either way. Config validation
@@ -622,7 +663,7 @@ Empty output ⇒ starship hides the module.
 ```sh
 stfgd get <badge>... [--cwd <path>]   # hot path, never fails, no stderr
 stfgd daemon                          # foreground
-stfgd status                          # table of badges/keys, age, errors; 1s timeout
+stfgd status                          # badges/keys, age, errors, versions; 1s timeout
 stfgd stop
 stfgd reload
 ```
@@ -652,7 +693,9 @@ clap/anyhow/thiserror/git2/gix/notify.
 | Command hangs | killpg at `timeout` (default 2s), reaped, error counted, backoff, stale value kept |
 | Command reads stdin | gets EOF from /dev/null |
 | Command backgrounds a grandchild | killed with the group after main process exits |
-| Command floods stdout | cut at `max_output` (default 64 KiB), killed, error |
+| Command floods stdout | cut at `max_output` (default 64 KiB), killed, error (`git_status`/`git_counts` stream instead: only one line over `max_output` fails) |
+| Blocking pool full (e.g. a hung mount) | job rejected at once, no error counted, retried after `retry_min`; path work and global work have separate pools |
+| Fetch task panics | `InFlightGuard` clears `in_flight`; the key refreshes on its next schedule |
 | HTTP slow/unreachable | deadline → error, backoff, stale value kept |
 | Config broken on reload | logged, previous config kept |
 | Config broken at daemon startup | logged (stderr only), daemon runs with zero badges until fixed |
@@ -660,7 +703,7 @@ clap/anyhow/thiserror/git2/gix/notify.
 | Many repos visited | path-scoped keys evicted after `path_evict` idle (default 30 min), LRU cap `max_paths` (default 256) |
 | Laptop idle | no requests → keys go dormant → zero wakeups → daemon exits after `idle_exit` (default 30 min) |
 | On battery | badges use their resolved `battery_interval` instead of `interval` |
-| Binary upgraded | version mismatch on a `get` → daemon answers, then shuts itself down; next prompt spawns new |
+| Binary upgraded | version mismatch on a `get` → daemon answers; it shuts itself down if its executable was replaced, or the client is newer and it has been up 60 s; next prompt spawns new. An older client never restarts it; `status` shows the mismatch |
 | `stop`/SIGTERM with in-flight fetches | every registered pgid is `killpg`ed, then exit; lock released by kernel, socket unlinked only if its dev/ino are still the ones this daemon bound |
 | `accept()` fails (e.g. `EMFILE`) | wait 20 ms, then retry — no busy spin |
 

@@ -6,22 +6,22 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio::time::Instant;
 
-use super::exec::{RunOpts, run_with_timeout};
+use super::exec::{RunOpts, Sink, run_into};
 use super::{ProviderError, Shared};
 use crate::config::{Builtin, GitField};
+use crate::file_id::{FileId, file_id};
 
 const GIT_ENV: &[(&str, &str)] = &[("GIT_OPTIONAL_LOCKS", "0")];
 
-/// A `git status` result shared only while its subprocess is running. The sender stores the
+/// `git status` counts shared only while its subprocess is running. The sender stores the
 /// completed result long enough for current waiters to receive it, but the map entry is
 /// removed before publication so a later badge refresh always starts a fresh status check.
 pub(super) struct PorcelainFlight {
-    result: watch::Sender<Option<Result<Arc<[u8]>, ProviderError>>>,
+    result: watch::Sender<Option<Result<GitCounts, ProviderError>>>,
 }
 
 // Adapted from beachcomber `src/provider/git.rs` `find_repo_root` (MIT, Copyright (c) 2026
@@ -82,27 +82,31 @@ pub(crate) fn git_dir(repo_root: &Path) -> Option<PathBuf> {
     })
 }
 
-/// mtimes of `.git/HEAD` and `.git/index` (gitdir-resolved): a cheap, subprocess-free proxy
-/// for "has the repo's branch or stage changed". Used by the outer cache to invalidate the
-/// two git builtins still backed by a subprocess (`git_status`/`git_counts`, see
-/// `cache::Entry::fingerprint`) the instant either file changes, instead of waiting up to
-/// `interval`.
+/// Identities ([`file_id`]: inode, size, ctime) of `.git/HEAD`, `.git/index` and
+/// `.git/FETCH_HEAD` (gitdir-resolved): a cheap, subprocess-free proxy for "has the repo's
+/// branch, stage or upstream changed". Used by the outer cache to invalidate the two git
+/// builtins still backed by a subprocess (`git_status`/`git_counts`, see
+/// `cache::Entry::fingerprint`) the instant any of them changes, instead of waiting up to
+/// `interval`. Not mtimes: coarse (1 s) mtime resolution hides two writes in one second, and
+/// git rewrites these by rename, which a new inode always shows. `FETCH_HEAD` is rewritten
+/// by every fetch, so ahead/behind follow a `git fetch`/`pull`.
 ///
-/// Limitation: doesn't see unstaged worktree edits (they touch neither `HEAD` nor `index`), so
+/// Limitation: doesn't see unstaged worktree edits (they touch none of these files), so
 /// those still only surface on `interval` — documented in `docs/configuration.md`; the upgrade
 /// path if that ever matters enough is inotify on the worktree, at the cost of a watcher thread
 /// this design otherwise avoids entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GitFingerprint {
-    head: Option<SystemTime>,
-    index: Option<SystemTime>,
+    head: Option<FileId>,
+    index: Option<FileId>,
+    fetch_head: Option<FileId>,
 }
 
 pub(crate) fn git_fingerprint(dir: &Path) -> GitFingerprint {
-    let mtime = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
     GitFingerprint {
-        head: mtime(&dir.join("HEAD")),
-        index: mtime(&dir.join("index")),
+        head: file_id(&dir.join("HEAD")),
+        index: file_id(&dir.join("index")),
+        fetch_head: file_id(&dir.join("FETCH_HEAD")),
     }
 }
 
@@ -213,7 +217,7 @@ fn git_branch_from_head(git_dir: &Path) -> String {
 /// (`git_branch`/`git_commit`/`git_state`/`git_stash`): cheap enough (microseconds) to
 /// recompute on every request instead of going through the cache/fetch machinery, which
 /// gives them the same observable freshness as a real fs watcher without running one (see
-/// `daemon::handler::handle_get`, design.md §6). `Some(_)` (possibly empty bytes — outside a repo,
+/// `daemon::resolve::handle_get`, design.md §6). `Some(_)` (possibly empty bytes — outside a repo,
 /// detached HEAD, etc.) for these four builtins; `None` for everything else, which still
 /// goes through the normal cache + (for `git_status`/`git_counts`) subprocess path.
 pub(crate) fn run_in_process_git(name: Builtin, git_dir: Option<&Path>) -> Option<Vec<u8>> {
@@ -238,7 +242,7 @@ pub(crate) fn run_in_process_git(name: Builtin, git_dir: Option<&Path>) -> Optio
 }
 
 /// Status counts parsed from `git status --porcelain=v2 --branch`.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GitCounts {
     ahead: u32,
     behind: u32,
@@ -252,44 +256,104 @@ pub(super) struct GitCounts {
 
 // Adapted from beachcomber `src/provider/git.rs` `parse_git_status` (MIT, Copyright (c) 2026
 // Joshua Hogendorn); see THIRD_PARTY_NOTICES.md.
-/// Parses `git status --porcelain=v2 --branch` output. Header lines (`#`) carry
+/// Counts one `git status --porcelain=v2 --branch` line. Header lines (`#`) carry
 /// `branch.ab +<ahead> -<behind>` (absent with no upstream); `1`/`2` file lines carry a 2-char
 /// `XY` status (staged = `X != '.'`, modified = `Y != '.'`); `u` lines are always conflicted;
 /// `?` lines are untracked.
-pub(super) fn parse_porcelain_v2(out: &[u8]) -> GitCounts {
-    let text = String::from_utf8_lossy(out);
-    let mut counts = GitCounts::default();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            let mut parts = rest.split_whitespace();
-            counts.ahead = parts
-                .next()
-                .and_then(|s| s.strip_prefix('+'))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            counts.behind = parts
-                .next()
-                .and_then(|s| s.strip_prefix('-'))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("1 ").or_else(|| line.strip_prefix("2 ")) {
-            let mut xy = rest.chars();
-            if xy.next().is_some_and(|x| x != '.') {
-                counts.staged += 1;
-            }
-            if xy.next().is_some_and(|y| y != '.') {
-                counts.modified += 1;
-            }
-            counts.dirty += 1;
-        } else if line.starts_with("u ") {
-            counts.conflicted += 1;
-            counts.dirty += 1;
-        } else if line.starts_with("? ") {
-            counts.untracked += 1;
-            counts.dirty += 1;
+fn count_porcelain_line(counts: &mut GitCounts, line: &[u8]) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.strip_suffix('\r').unwrap_or(&line);
+    if let Some(rest) = line.strip_prefix("# branch.ab ") {
+        let mut parts = rest.split_whitespace();
+        counts.ahead = parts
+            .next()
+            .and_then(|s| s.strip_prefix('+'))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        counts.behind = parts
+            .next()
+            .and_then(|s| s.strip_prefix('-'))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+    } else if let Some(rest) = line.strip_prefix("1 ").or_else(|| line.strip_prefix("2 ")) {
+        let mut xy = rest.chars();
+        if xy.next().is_some_and(|x| x != '.') {
+            counts.staged += 1;
+        }
+        if xy.next().is_some_and(|y| y != '.') {
+            counts.modified += 1;
+        }
+        counts.dirty += 1;
+    } else if line.starts_with("u ") {
+        counts.conflicted += 1;
+        counts.dirty += 1;
+    } else if line.starts_with("? ") {
+        counts.untracked += 1;
+        counts.dirty += 1;
+    }
+}
+
+/// Counts porcelain output as it streams in, so a very dirty repo costs one line of memory
+/// rather than its whole status: `max_output` bounds a single line, not the total.
+pub(super) struct PorcelainCounter {
+    counts: GitCounts,
+    line: Vec<u8>,
+    cap: usize,
+}
+
+impl PorcelainCounter {
+    pub(super) const fn new(cap: usize) -> Self {
+        Self {
+            counts: GitCounts {
+                ahead: 0,
+                behind: 0,
+                staged: 0,
+                modified: 0,
+                untracked: 0,
+                conflicted: 0,
+                dirty: 0,
+            },
+            line: Vec::new(),
+            cap,
         }
     }
-    counts
+}
+
+impl Sink for PorcelainCounter {
+    type Output = GitCounts;
+
+    fn feed(&mut self, mut chunk: &[u8]) -> Result<(), ProviderError> {
+        while let Some(end) = chunk.iter().position(|&b| b == b'\n') {
+            if self.line.is_empty() {
+                count_porcelain_line(&mut self.counts, &chunk[..end]);
+            } else {
+                self.line.extend_from_slice(&chunk[..end]);
+                count_porcelain_line(&mut self.counts, &self.line);
+                self.line.clear();
+            }
+            chunk = &chunk[end + 1..];
+        }
+        self.line.extend_from_slice(chunk);
+        if self.line.len() > self.cap {
+            return Err(ProviderError::TooLarge);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> GitCounts {
+        if !self.line.is_empty() {
+            count_porcelain_line(&mut self.counts, &self.line);
+        }
+        self.counts
+    }
+}
+
+/// Parses a whole `git status --porcelain=v2 --branch` output (see [`PorcelainCounter`]).
+#[cfg(test)]
+pub(super) fn parse_porcelain_v2(out: &[u8]) -> GitCounts {
+    let mut counter = PorcelainCounter::new(usize::MAX);
+    counter.feed(out).expect("an uncapped counter never fails");
+    counter.finish()
 }
 
 /// `0` renders empty (design.md §5): the template adds any symbol, so e.g.
@@ -324,7 +388,7 @@ struct PorcelainCompletion {
 }
 
 impl PorcelainCompletion {
-    fn finish(&mut self, result: Result<Vec<u8>, ProviderError>) {
+    fn finish(&mut self, result: Result<GitCounts, ProviderError>) {
         {
             let mut flights = self
                 .flights
@@ -337,9 +401,7 @@ impl PorcelainCompletion {
                 flights.remove(&self.repo_root);
             }
         }
-        self.flight
-            .result
-            .send_replace(Some(result.map(Arc::<[u8]>::from)));
+        self.flight.result.send_replace(Some(result));
         self.completed = true;
     }
 }
@@ -358,25 +420,31 @@ impl Drop for PorcelainCompletion {
 /// to the outer badge cache, so completed status output must never be retained here. The
 /// semaphore permit is acquired only for a new flight: duplicate callers join the map before
 /// admission and therefore cannot queue behind the process they are trying to share. The
-/// creator's configured deadline and output cap bound the shared subprocess; each waiter also
-/// enforces its own deadline and cap, but may fail if the creator's limits are tighter.
+/// creator's configured deadline and line cap bound the shared subprocess; each waiter also
+/// enforces its own deadline.
 async fn porcelain_fetch_with<F, Fut>(
     shared: &Shared,
     repo_root: PathBuf,
     deadline: Instant,
-    cap: usize,
     initialize: F,
-) -> Result<Arc<[u8]>, ProviderError>
+) -> Result<GitCounts, ProviderError>
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<Vec<u8>, ProviderError>> + Send + 'static,
+    Fut: Future<Output = Result<GitCounts, ProviderError>> + Send + 'static,
 {
     if shared.stopping.load(Ordering::SeqCst) {
         return Err(ProviderError::Stopped);
     }
-    let existing = { shared.porcelain.lock().unwrap().get(&repo_root).cloned() };
+    let existing = {
+        shared
+            .porcelain
+            .lock()
+            .expect("porcelain lock poisoned")
+            .get(&repo_root)
+            .cloned()
+    };
     if let Some(flight) = existing {
-        return await_porcelain(&flight, deadline, cap).await;
+        return await_porcelain(&flight, deadline).await;
     }
 
     // Only a new flight needs a process slot. Callers that arrive after insertion join it
@@ -387,7 +455,7 @@ where
         .map_err(|_| ProviderError::Stopped)?;
 
     let (flight, newly_created) = {
-        let mut flights = shared.porcelain.lock().unwrap();
+        let mut flights = shared.porcelain.lock().expect("porcelain lock poisoned");
         match flights.entry(repo_root.clone()) {
             Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
             Entry::Vacant(entry) => {
@@ -400,7 +468,7 @@ where
     };
     if !newly_created {
         drop(permit);
-        return await_porcelain(&flight, deadline, cap).await;
+        return await_porcelain(&flight, deadline).await;
     }
 
     let completion = PorcelainCompletion {
@@ -414,26 +482,18 @@ where
         let mut completion = completion;
         let result = tokio::time::timeout_at(deadline, initialize())
             .await
-            .unwrap_or(Err(ProviderError::Timeout))
-            .and_then(|output| {
-                if output.len() > cap {
-                    Err(ProviderError::TooLarge)
-                } else {
-                    Ok(output)
-                }
-            });
+            .unwrap_or(Err(ProviderError::Timeout));
         completion.finish(result);
     });
-    await_porcelain(&flight, deadline, cap).await
+    await_porcelain(&flight, deadline).await
 }
 
 async fn await_porcelain(
     flight: &PorcelainFlight,
     deadline: Instant,
-    cap: usize,
-) -> Result<Arc<[u8]>, ProviderError> {
+) -> Result<GitCounts, ProviderError> {
     let mut result = flight.result.subscribe();
-    let completed = tokio::time::timeout_at(deadline, async {
+    tokio::time::timeout_at(deadline, async {
         loop {
             let completed = result.borrow_and_update().clone();
             if let Some(value) = completed {
@@ -447,14 +507,7 @@ async fn await_porcelain(
         }
     })
     .await
-    .map_err(|_| ProviderError::Timeout)?;
-    completed.map(|output| {
-        if output.len() > cap {
-            Err(ProviderError::TooLarge)
-        } else {
-            Ok(output)
-        }
-    })?
+    .map_err(|_| ProviderError::Timeout)?
 }
 
 pub(super) async fn porcelain_fetch(
@@ -462,21 +515,21 @@ pub(super) async fn porcelain_fetch(
     repo_root: &Path,
     deadline: Instant,
     cap: usize,
-) -> Result<Arc<[u8]>, ProviderError> {
+) -> Result<GitCounts, ProviderError> {
     let cwd = repo_root.to_path_buf();
     let owned = shared.clone();
-    porcelain_fetch_with(shared, cwd.clone(), deadline, cap, move || async move {
+    porcelain_fetch_with(shared, cwd.clone(), deadline, move || async move {
         let args = [
             "status".to_string(),
             "--porcelain=v2".to_string(),
             "--branch".to_string(),
         ];
-        run_with_timeout(
+        run_into(
             "git",
             &args,
             Some(&cwd),
             deadline,
-            cap,
+            PorcelainCounter::new(cap),
             RunOpts {
                 envs: GIT_ENV,
                 unset: &[],
@@ -837,16 +890,59 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let before = git_fingerprint(&dir.join(".git"));
-        // Guarantee a distinct mtime on filesystems with coarse (e.g. 1s) resolution.
-        std::thread::sleep(Duration::from_millis(1100));
-        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/other\n").unwrap();
+        // Same length, same second: only ctime/inode can tell the two apart.
+        std::fs::write(dir.join(".git/HEAD.lock"), "ref: refs/heads/mainx\n").unwrap();
+        std::fs::rename(dir.join(".git/HEAD.lock"), dir.join(".git/HEAD")).unwrap();
         let after = git_fingerprint(&dir.join(".git"));
         assert_ne!(before, after);
     }
 
     #[test]
+    fn git_fingerprint_changes_when_fetch_head_appears() {
+        let dir_tmp = TempDir::new("fingerprint-fetch-head");
+        let git = dir_tmp.path().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let before = git_fingerprint(&git);
+        std::fs::write(git.join("FETCH_HEAD"), "abc\t\tbranch 'main'\n").unwrap();
+        assert_ne!(before, git_fingerprint(&git));
+    }
+
+    #[test]
     fn git_fingerprint_without_head_or_index_is_default() {
         assert_eq!(git_fingerprint(Path::new("/")), GitFingerprint::default());
+    }
+
+    /// Distinct counts per test value: `dirty = n`.
+    fn counts(n: u32) -> GitCounts {
+        GitCounts {
+            dirty: n,
+            ..GitCounts::default()
+        }
+    }
+
+    #[test]
+    fn porcelain_counter_handles_lines_split_across_chunks() {
+        let out = b"# branch.ab +3 -1\n1 M. N... 100644 100644 100644 a b f\n? new\n? other";
+        let whole = parse_porcelain_v2(out);
+        for split in 0..out.len() {
+            let mut counter = PorcelainCounter::new(64);
+            counter.feed(&out[..split]).unwrap();
+            counter.feed(&out[split..]).unwrap();
+            assert_eq!(counter.finish(), whole, "split at {split}");
+        }
+        assert_eq!((whole.ahead, whole.behind, whole.untracked), (3, 1, 2));
+    }
+
+    #[test]
+    fn porcelain_counter_caps_a_line_not_the_total() {
+        let mut counter = PorcelainCounter::new(16);
+        for _ in 0..10_000 {
+            counter.feed(b"? short-name\n").unwrap();
+        }
+        assert_eq!(counter.finish().untracked, 10_000);
+        let mut counter = PorcelainCounter::new(16);
+        counter.feed(b"? a-very-long-file-name").unwrap_err();
     }
 
     #[tokio::test]
@@ -857,43 +953,41 @@ mod tests {
         let root_tmp = TempDir::new("porcelain-refresh");
         let root = root_tmp.path().to_path_buf();
         let calls = Arc::new(AtomicUsize::new(0));
-        for output in [
-            b"old worktree status".to_vec(),
-            b"new worktree status".to_vec(),
-        ] {
+        for n in [1, 2] {
             let calls = Arc::clone(&calls);
-            let output = output.clone();
-            let expected = output.clone();
             let out = porcelain_fetch_with(
                 &shared,
                 root.clone(),
                 Instant::now() + Duration::from_secs(2),
-                65536,
                 move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(output)
+                    Ok(counts(n))
                 },
             )
             .await
             .unwrap();
-            assert_eq!(out.as_ref(), expected.as_slice());
+            assert_eq!(out, counts(n));
             assert!(shared.porcelain.lock().unwrap().is_empty());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn git_init(root: &Path) {
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[tokio::test]
     async fn porcelain_fetch_observes_worktree_changes_after_a_completed_status() {
         let root_tmp = TempDir::new("porcelain-worktree-change");
         let root = root_tmp.path().to_path_buf();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
+        git_init(&root);
         let shared = Shared::new();
         let first = porcelain_fetch(
             &shared,
@@ -903,7 +997,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse_porcelain_v2(first.as_ref()).untracked, 0);
+        assert_eq!(first.untracked, 0);
 
         std::fs::write(root.join("new-file"), "changed after first status").unwrap();
         let second = porcelain_fetch(
@@ -914,75 +1008,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse_porcelain_v2(second.as_ref()).untracked, 1);
+        assert_eq!(second.untracked, 1);
         assert!(shared.porcelain.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn porcelain_fetch_concurrent_callers_share_initializer_but_apply_caps_independently() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let shared = Shared::new();
-        let root_tmp = TempDir::new("porcelain-limits");
+    async fn porcelain_fetch_counts_a_status_larger_than_the_cap() {
+        let root_tmp = TempDir::new("porcelain-dirty");
         let root = root_tmp.path().to_path_buf();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (large, small) = tokio::join!(
-            {
-                let calls = Arc::clone(&calls);
-                porcelain_fetch_with(&shared, root.clone(), deadline, 16, move || async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    Ok(b"status".to_vec())
-                })
-            },
-            {
-                let calls = Arc::clone(&calls);
-                porcelain_fetch_with(&shared, root.clone(), deadline, 2, move || async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(b"status".to_vec())
-                })
-            }
-        );
-        assert!(matches!(small, Err(ProviderError::TooLarge)));
-        assert_eq!(large.unwrap().as_ref(), b"status");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(shared.porcelain.lock().unwrap().is_empty());
-
-        let tighter_creator_root = root.join("tighter-creator");
-        let (small_creator, large_joiner) = tokio::join!(
-            {
-                let calls = Arc::clone(&calls);
-                porcelain_fetch_with(
-                    &shared,
-                    tighter_creator_root.clone(),
-                    deadline,
-                    2,
-                    move || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                        Ok(b"status".to_vec())
-                    },
-                )
-            },
-            {
-                let calls = Arc::clone(&calls);
-                porcelain_fetch_with(
-                    &shared,
-                    tighter_creator_root,
-                    deadline,
-                    16,
-                    move || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(b"unused".to_vec())
-                    },
-                )
-            }
-        );
-        assert!(matches!(small_creator, Err(ProviderError::TooLarge)));
-        assert!(matches!(large_joiner, Err(ProviderError::TooLarge)));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(shared.porcelain.lock().unwrap().is_empty());
+        git_init(&root);
+        for i in 0..500 {
+            std::fs::write(root.join(format!("file-{i}")), "x").unwrap();
+        }
+        let shared = Shared::new();
+        // ~6 KiB of status lines, each well under the 64-byte cap.
+        let counts = porcelain_fetch(&shared, &root, Instant::now() + Duration::from_secs(5), 64)
+            .await
+            .unwrap();
+        assert_eq!((counts.untracked, counts.dirty), (500, 500));
     }
 
     #[tokio::test]
@@ -1000,11 +1043,10 @@ mod tests {
                     &shared,
                     root.clone(),
                     Instant::now() + Duration::from_secs(2),
-                    64,
                     move || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(60)).await;
-                        Ok(b"finished".to_vec())
+                        Ok(counts(1))
                     },
                 )
             },
@@ -1014,15 +1056,14 @@ mod tests {
                     &shared,
                     root.clone(),
                     Instant::now() + Duration::from_millis(10),
-                    64,
                     move || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(b"unused second initializer".to_vec())
+                        Ok(counts(2))
                     },
                 )
             }
         );
-        assert_eq!(long.unwrap().as_ref(), b"finished");
+        assert_eq!(long.unwrap(), counts(1));
         assert!(matches!(short, Err(ProviderError::Timeout)));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(shared.porcelain.lock().unwrap().is_empty());
@@ -1037,7 +1078,6 @@ mod tests {
             &shared,
             root.clone(),
             Instant::now() + Duration::from_secs(2),
-            64,
             || async { Err(ProviderError::Io("expected failure".to_string())) },
         )
         .await;
@@ -1062,30 +1102,30 @@ mod tests {
         let (first, second, third) = tokio::join!(
             {
                 let calls = Arc::clone(&calls);
-                porcelain_fetch_with(&shared, root.clone(), deadline, 64, move || async move {
+                porcelain_fetch_with(&shared, root.clone(), deadline, move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(30)).await;
-                    Ok(b"shared".to_vec())
+                    Ok(counts(1))
                 })
             },
             {
                 let calls = Arc::clone(&calls);
-                porcelain_fetch_with(&shared, root.clone(), deadline, 64, move || async move {
+                porcelain_fetch_with(&shared, root.clone(), deadline, move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(b"not used".to_vec())
+                    Ok(counts(2))
                 })
             },
             {
                 let calls = Arc::clone(&calls);
-                porcelain_fetch_with(&shared, root.clone(), deadline, 64, move || async move {
+                porcelain_fetch_with(&shared, root.clone(), deadline, move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(b"not used".to_vec())
+                    Ok(counts(2))
                 })
             }
         );
-        assert_eq!(first.unwrap().as_ref(), b"shared");
-        assert_eq!(second.unwrap().as_ref(), b"shared");
-        assert_eq!(third.unwrap().as_ref(), b"shared");
+        assert_eq!(first.unwrap(), counts(1));
+        assert_eq!(second.unwrap(), counts(1));
+        assert_eq!(third.unwrap(), counts(1));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(shared.porcelain.lock().unwrap().is_empty());
         drop(reserved);
@@ -1109,11 +1149,10 @@ mod tests {
                 shared_ref,
                 root.clone(),
                 Instant::now() + Duration::from_secs(2),
-                64,
                 move || async move {
                     let _ = started_tx.send(());
                     let _ = finish_rx.await;
-                    Ok(b"old generation".to_vec())
+                    Ok(counts(1))
                 },
             ),
             async {
@@ -1126,7 +1165,7 @@ mod tests {
                 finish_tx.send(()).unwrap();
             }
         );
-        assert_eq!(result.unwrap().as_ref(), b"old generation");
+        assert_eq!(result.unwrap(), counts(1));
         assert!(Arc::ptr_eq(
             &replacement,
             &shared.porcelain.lock().unwrap()[&root]

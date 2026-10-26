@@ -22,6 +22,8 @@ hyperfine = "2.0.0"
 # Workflow lint (CI's actions-lint job reads the jactionlint version from here).
 jactionlint = "2.3.0"
 shellcheck = "0.11.0"
+# Dependency licenses/bans/sources/advisories (CI's deny job pins the same version).
+cargo-deny = "0.20.2"
 # Tests for scripts/check-action-pins.sh (CI's pin-check job installs this version with
 # bats-core/bats-action).
 bats = "1.14.0"
@@ -75,13 +77,17 @@ run = "jactionlint"
 description = "Check that every GitHub action is pinned to a commit SHA"
 run = ["bats scripts/check-action-pins.bats", "sh scripts/check-action-pins.sh .github/workflows/*.yml"]
 
+[tasks."lint:deny"]
+description = "cargo-deny: dependency licenses, bans, sources and advisories"
+run = "cargo deny check"
+
 [tasks."lint:shell"]
 description = "shellcheck the repository's shell scripts"
 run = "shellcheck -S info scripts/*.sh scripts/*.bats packaging/macos/*.sh packaging/ci/*.sh"
 
 [tasks.check]
 description = "Run the full quality suite"
-depends = ["fmt-check", "lint", "test", "doc", "md-check", "lint:actions", "lint:pins", "lint:shell"]
+depends = ["fmt-check", "lint", "test", "doc", "md-check", "lint:actions", "lint:pins", "lint:shell", "lint:deny"]
 
 [tasks.bench]
 description = "Benchmark stfg against running the same commands directly"

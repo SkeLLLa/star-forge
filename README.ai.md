@@ -46,7 +46,8 @@ echo "${STARSHIP_CONFIG:-$HOME/.config/starship.toml}"
 ls -l "${XDG_CONFIG_HOME:-$HOME/.config}/star-forge/config.toml"
 ```
 
-If `stfg` and `stfgd` already exist, skip step 2. Neither binary has a `--version` flag.
+If `stfg` and `stfgd` already exist, skip step 2. Neither binary has a `--version` flag;
+`stfgd status` ends with a `version:` line instead.
 
 ## Step 2: Install
 

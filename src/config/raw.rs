@@ -152,13 +152,7 @@ impl RawBadgeConfig {
                     }
                     BuiltinName::Runtime(name) => name,
                 };
-                validate_builtin_opts(
-                    badge_name,
-                    name,
-                    device.is_some(),
-                    field.is_some(),
-                    &tool_opts,
-                )?;
+                validate_builtin_opts(badge_name, name, device.as_deref(), field, &tool_opts)?;
                 Ok((
                     Source::Builtin {
                         name,
@@ -236,8 +230,8 @@ impl RawBadgeConfig {
 fn validate_builtin_opts(
     badge_name: &str,
     name: Builtin,
-    has_device: bool,
-    has_field: bool,
+    device: Option<&str>,
+    field: Option<GitField>,
     tool_opts: &ToolOpts,
 ) -> Result<(), String> {
     if tool_opts.any() {
@@ -246,19 +240,19 @@ fn validate_builtin_opts(
              `when_file` and `env` are only valid for `name = \"tool_version\"`"
         ));
     }
-    if has_device && name != Builtin::Battery {
+    if device.is_some() && name != Builtin::Battery {
         return Err(format!(
             "badge {badge_name}: `device` is only valid for `type = \"builtin\"` \
              `name = \"battery\"`"
         ));
     }
-    if has_field && name != Builtin::GitCounts {
+    if field.is_some() && name != Builtin::GitCounts {
         return Err(format!(
             "badge {badge_name}: `field` is only valid for `type = \"builtin\"` \
              `name = \"git_counts\"`"
         ));
     }
-    if !has_field && name == Builtin::GitCounts {
+    if field.is_none() && name == Builtin::GitCounts {
         return Err(format!(
             "badge {badge_name}: `type = \"builtin\"` `name = \"git_counts\"` \
              requires `field`"
