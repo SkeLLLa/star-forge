@@ -21,7 +21,7 @@ Single `star-forge` crate: the `stfgd` daemon and the `stfg` bin (std + libc `ge
 ## Commands
 
 - `mise run check` — fmt-check, clippy (`-D warnings`), tests, docs, Markdown lint
-  (`rumdl`). Run before declaring work done.
+  (`rumdl`), action pins, jactionlint and shellcheck. Run before declaring work done.
 - `mise run fmt` / `md-fmt` / `lint` / `md-check` / `test` / `build` / `build-release` / `bench`.
 
 ## Conventions
@@ -32,4 +32,6 @@ Single `star-forge` crate: the `stfgd` daemon and the `stfg` bin (std + libc `ge
   enforces it.
 - Search files and content with fff MCP; navigate symbols, check impact, and recall project
   memory (`docs/memory/`) with ripwire.
+- Workflows: pin every `uses:` to a full commit SHA with a `# vX.Y.Z` comment, keep
+  `permissions` minimal per job and set `timeout-minutes`; see `docs/distribution.md#hardening`.
 - Prefix shell commands with `rtk`.

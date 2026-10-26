@@ -108,6 +108,11 @@ install -m 755 star-forge-<version>-<target>/bin/* ~/.local/bin/
 Each tarball has a `.sha256` sidecar, and the release has a combined `SHA256SUMS`. Pick the musl
 tarball for the fastest `stfg` startup or on a distro without a compatible glibc.
 
+On macOS, a tarball downloaded with a browser is quarantined. Before the first start, run
+`xattr -dr com.apple.quarantine star-forge-<version>-<target>`. The binaries are signed with
+star-forge's own certificate, not notarized by Apple, so any permission you give `stfgd` stays
+granted across updates ([details](docs/distribution.md#signing)).
+
 ### mise, packslip, Nix or cargo
 
 These put `stfg` and `stfgd` on your `PATH`. Pick one:

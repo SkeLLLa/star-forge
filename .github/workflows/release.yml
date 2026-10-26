@@ -1,3 +1,4 @@
+# Release fails closed until every action is pinned to a commit SHA (pin-gate).
 name: Release
 
 on:
@@ -5,71 +6,125 @@ on:
     branches:
       - master
 
+# One release at a time: a push during a release waits for it instead of cancelling it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Nothing is granted by default; each job asks for what it needs.
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
-  RUST_TARGET: x86_64-unknown-linux-gnu
 
+# Release jobs restore no cargo cache: a cache entry written by any master workflow could
+# otherwise plant build output in a release artifact.
 jobs:
-  quality:
-    name: Quality gate
+  pin-gate:
+    name: Action pin gate
     if: ${{ github.repository_owner == 'SkeLLLa' && !contains(github.event.head_commit.message, '[skip ci]') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require every action in every workflow to be pinned
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Fetch every workflow, and the checker, as committed at the triggering SHA; no
+          # checkout, no third-party action. Fails closed: no files, no listing or any failed
+          # fetch fails the gate, and so does an unpinned action in ci.yml.
+          dir="${RUNNER_TEMP}/workflows"
+          mkdir -p "${dir}"
+          fetch() {
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${GITHUB_REPOSITORY}/contents/$1?ref=${GITHUB_SHA}"
+          }
+          names="$(
+            gh api "repos/${GITHUB_REPOSITORY}/contents/.github/workflows?ref=${GITHUB_SHA}" \
+              --jq '.[] | select(.type == "file") | select(.name | test("\\.ya?ml$")) | .name'
+          )"
+          if [ -z "${names}" ]; then
+            echo "::error::no workflow files found at ${GITHUB_SHA}"
+            exit 1
+          fi
+          files=()
+          while IFS= read -r name; do
+            case "${name}" in */* | "") echo "::error::unexpected workflow name"; exit 1 ;; esac
+            fetch ".github/workflows/${name}" > "${dir}/${name}"
+            files+=("${dir}/${name}")
+          done <<< "${names}"
+          fetch scripts/check-action-pins.sh > "${RUNNER_TEMP}/check-action-pins.sh"
+          sh "${RUNNER_TEMP}/check-action-pins.sh" "${files[@]}"
+
+  quality:
+    name: Quality gate
+    needs: pin-gate
+    if: ${{ github.repository_owner == 'SkeLLLa' && !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
-      - name: Install stable Rust with clippy and rustfmt
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy,rustfmt
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal --component clippy,rustfmt
+          rustup default "${v}"
       - name: Run quality checks
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo clippy --no-default-features --all-targets -- -D warnings
-          cargo test
-          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --locked --no-default-features --all-targets -- -D warnings
+          cargo test --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 
+  # Bumps the version, commits and tags it, publishes the crate and creates the GitHub release.
+  # The release artifacts are built afterwards, by jobs that hold no write access.
   release:
     name: Release
     needs: quality
     if: ${{ github.repository_owner == 'SkeLLLa' && !contains(github.event.head_commit.message, '[skip ci]') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       released: ${{ steps.release-plz.outputs.released }}
       version: ${{ steps.release-plz.outputs.version }}
       tag_name: ${{ steps.release-plz.outputs.tag_name }}
-    concurrency:
-      group: release-${{ github.ref }}
-      cancel-in-progress: false
+    # contents: the bump commit, the tag and the release; id-token: crates.io trusted publishing.
     permissions:
       contents: write
       id-token: write
-      attestations: write
     steps:
+      # Credentials persist on purpose: this job pushes the bump commit.
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal
+          rustup default "${v}"
 
       - name: Authenticate to crates.io (trusted publishing)
         id: crates-auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@v1.26.0
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 # v1.26.1
 
       # Install via cargo-binstall like release-plz/action does: it picks the gnu build, while
       # install-action only ships musl builds, which fail parsing the changelog template since
@@ -111,60 +166,81 @@ jobs:
           RELEASED="$(jq -r '((.releases // []) | length > 0)' "${OUTPUT_FILE}")"
           VERSION="$(jq -r '(.releases // [])[0].version // ""' "${OUTPUT_FILE}")"
           TAG_NAME="$(jq -r '(.releases // [])[0].tag // ""' "${OUTPUT_FILE}")"
-          echo "released=${RELEASED}" >> "${GITHUB_OUTPUT}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "released=${RELEASED}"
+            echo "version=${VERSION}"
+            echo "tag_name=${TAG_NAME}"
+          } >> "${GITHUB_OUTPUT}"
+
+  # --- Build (read-only) ---------------------------------------------------------------------
+  linux-assets:
+    name: Linux assets (x86_64-unknown-linux-gnu)
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Checksums and provenance come from the checksums job, the upload from publish-assets.
+    permissions:
+      contents: read
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+          persist-credentials: false
+
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal \
+            --target x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
+          rustup default "${v}"
 
       # Independent: tool compiles use cargo install's own temp target dir, so they don't
       # contend with the release build for the target/ lock. The static stfg build below
       # overwrites the gnu stfg, so it stays after this group.
       - parallel:
           - name: Install packaging tools
-            if: ${{ steps.release-plz.outputs.released == 'true' }}
-            run: cargo install --locked cargo-deb cargo-generate-rpm
+            run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
 
           - name: Install package verification tools
-            if: ${{ steps.release-plz.outputs.released == 'true' }}
             run: sudo apt-get update && sudo apt-get install -y rpm
 
           - name: Build release binary
-            if: ${{ steps.release-plz.outputs.released == 'true' }}
-            run: cargo build --release --locked --target "${RUST_TARGET}"
+            run: cargo build --release --locked --target "${TARGET}"
 
       - name: Build static stfg
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
         run: |
           set -euo pipefail
           cargo build --release --locked --no-default-features --bin stfg --target x86_64-unknown-linux-musl
-          install -m 755 target/x86_64-unknown-linux-musl/release/stfg "target/${RUST_TARGET}/release/stfg"
-          file "target/${RUST_TARGET}/release/stfg" | grep -q static
+          install -m 755 target/x86_64-unknown-linux-musl/release/stfg "target/${TARGET}/release/stfg"
+          file "target/${TARGET}/release/stfg" | grep -q static
 
       - name: Assemble binary distribution
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        env:
-          VERSION: ${{ steps.release-plz.outputs.version }}
         run: |
           set -euo pipefail
-          DIST_ROOT="target/dist/star-forge-${VERSION}-${RUST_TARGET}"
+          DIST_ROOT="target/dist/star-forge-${VERSION}-${TARGET}"
           mkdir -p "${DIST_ROOT}/bin"
-          install -m 755 "target/${RUST_TARGET}/release/stfgd" "target/${RUST_TARGET}/release/stfg" "${DIST_ROOT}/bin/"
+          install -m 755 "target/${TARGET}/release/stfgd" "target/${TARGET}/release/stfg" "${DIST_ROOT}/bin/"
           install -m 644 README.md COPYING THIRD_PARTY_NOTICES.md "${DIST_ROOT}/"
-          tar -C target/dist -czf "target/dist/star-forge-${VERSION}-${RUST_TARGET}.tar.gz" "star-forge-${VERSION}-${RUST_TARGET}"
+          tar -C target/dist -czf "target/dist/star-forge-${VERSION}-${TARGET}.tar.gz" "star-forge-${VERSION}-${TARGET}"
 
       - name: Build deb package
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        run: cargo deb --no-build --target "${RUST_TARGET}" --output "target/debian/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb"
+        run: cargo deb --no-build --target "${TARGET}" --output "target/debian/star-forge_${VERSION}_amd64.deb"
 
       - name: Build rpm package
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        run: cargo generate-rpm --target "${RUST_TARGET}" --output "target/generate-rpm/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm"
+        run: cargo generate-rpm --target "${TARGET}" --output "target/generate-rpm/star-forge-${VERSION}-1.x86_64.rpm"
 
       - name: Verify package contents
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
         run: |
           set -euo pipefail
-          deb="target/debian/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb"
-          rpm="target/generate-rpm/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm"
+          deb="target/debian/star-forge_${VERSION}_amd64.deb"
+          rpm="target/generate-rpm/star-forge-${VERSION}-1.x86_64.rpm"
           files=(
             /usr/bin/stfgd
             /usr/bin/stfg
@@ -179,162 +255,53 @@ jobs:
           done
 
       - name: Stage release artifacts
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        env:
-          VERSION: ${{ steps.release-plz.outputs.version }}
         run: |
           set -euo pipefail
           STAGE="target/release-assets"
           mkdir -p "${STAGE}"
-          cp "target/dist/star-forge-${VERSION}-${RUST_TARGET}.tar.gz" "${STAGE}/"
+          cp "target/dist/star-forge-${VERSION}-${TARGET}.tar.gz" "${STAGE}/"
           cp "target/debian/star-forge_${VERSION}_amd64.deb" "${STAGE}/"
           cp "target/generate-rpm/star-forge-${VERSION}-1.x86_64.rpm" "${STAGE}/"
-          (
-            cd "${STAGE}"
-            assets=(
-              "star-forge-${VERSION}-${RUST_TARGET}.tar.gz"
-              "star-forge_${VERSION}_amd64.deb"
-              "star-forge-${VERSION}-1.x86_64.rpm"
-            )
-            for asset in "${assets[@]}"; do
-              sha256sum -- "${asset}" > "${asset}.sha256"
-            done
-          )
 
-      - name: Attest build provenance
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        uses: actions/attest-build-provenance@v4
+      - name: Keep release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          subject-path: |
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-${{ env.RUST_TARGET }}.tar.gz
-            target/release-assets/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm
-
-      - name: Publish release assets
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.release-plz.outputs.tag_name }}
-          append_body: true
-          fail_on_unmatched_files: true
-          files: |
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-${{ env.RUST_TARGET }}.tar.gz
-            target/release-assets/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-${{ env.RUST_TARGET }}.tar.gz.sha256
-            target/release-assets/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb.sha256
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm.sha256
-
-      - name: Upload package repository inputs
-        if: ${{ steps.release-plz.outputs.released == 'true' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: package-repository-inputs
+          name: release-linux-gnu
           retention-days: 1
+          if-no-files-found: error
           path: |
-            target/release-assets/star-forge_${{ steps.release-plz.outputs.version }}_amd64.deb
-            target/release-assets/star-forge-${{ steps.release-plz.outputs.version }}-1.x86_64.rpm
-
-  macos-assets:
-    name: macOS assets (${{ matrix.target }})
-    needs: release
-    if: ${{ needs.release.outputs.released == 'true' }}
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    steps:
-      - name: Checkout the released tag
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release.outputs.tag_name }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build release binary
-        run: cargo build --release --locked --target "${{ matrix.target }}"
-
-      - name: Assemble binary distribution
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          STAGE="target/release-assets"
-          DIST_ROOT="target/dist/star-forge-${VERSION}-${TARGET}"
-          mkdir -p "${DIST_ROOT}/bin" "${STAGE}"
-          install -m 755 "target/${TARGET}/release/stfgd" "target/${TARGET}/release/stfg" "${DIST_ROOT}/bin/"
-          install -m 644 README.md COPYING THIRD_PARTY_NOTICES.md "${DIST_ROOT}/"
-          tar -C target/dist -czf "${STAGE}/star-forge-${VERSION}-${TARGET}.tar.gz" "star-forge-${VERSION}-${TARGET}"
-          (
-            cd "${STAGE}"
-            shasum -a 256 "star-forge-${VERSION}-${TARGET}.tar.gz" > "star-forge-${VERSION}-${TARGET}.tar.gz.sha256"
-          )
-          # Only the native slice can be executed on the arm64 runner.
-          if [ "${TARGET}" = "aarch64-apple-darwin" ]; then
-            # `stfg` always exits 0; with no daemon it spawns one, so stop it afterwards.
-            export STAR_FORGE_CONFIG=/dev/null XDG_RUNTIME_DIR="${RUNNER_TEMP}"
-            "${DIST_ROOT}/bin/stfg" smoke
-            "${DIST_ROOT}/bin/stfgd" stop || true
-          fi
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: target/release-assets/star-forge-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz
-
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.release.outputs.tag_name }}
-          append_body: true
-          fail_on_unmatched_files: true
-          files: |
-            target/release-assets/star-forge-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz
-            target/release-assets/star-forge-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+            target/release-assets/star-forge-${{ env.VERSION }}-${{ env.TARGET }}.tar.gz
+            target/release-assets/star-forge_${{ env.VERSION }}_amd64.deb
+            target/release-assets/star-forge-${{ env.VERSION }}-1.x86_64.rpm
 
   linux-musl-assets:
     name: Linux musl assets (x86_64-unknown-linux-musl)
     needs: release
     if: ${{ needs.release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     env:
       TARGET: x86_64-unknown-linux-musl
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      VERSION: ${{ needs.release.outputs.version }}
     steps:
       - name: Checkout the released tag
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release.outputs.tag_name }}
+          persist-credentials: false
 
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: x86_64-unknown-linux-musl
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal --target "${TARGET}"
+          rustup default "${v}"
 
       # aws-lc-sys (rustls crypto) compiles C through the `musl-gcc` wrapper from musl-tools.
       - name: Build release binary
@@ -343,8 +310,6 @@ jobs:
         run: cargo build --release --locked --target "${TARGET}"
 
       - name: Assemble binary distribution
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail
           STAGE="target/release-assets"
@@ -353,10 +318,6 @@ jobs:
           install -m 755 "target/${TARGET}/release/stfgd" "target/${TARGET}/release/stfg" "${DIST_ROOT}/bin/"
           install -m 644 README.md COPYING THIRD_PARTY_NOTICES.md "${DIST_ROOT}/"
           tar -C target/dist -czf "${STAGE}/star-forge-${VERSION}-${TARGET}.tar.gz" "star-forge-${VERSION}-${TARGET}"
-          (
-            cd "${STAGE}"
-            sha256sum -- "star-forge-${VERSION}-${TARGET}.tar.gz" > "star-forge-${VERSION}-${TARGET}.tar.gz.sha256"
-          )
           # The point of this target: no dynamic loader, no shared libraries.
           for bin in stfgd stfg; do
             file "${DIST_ROOT}/bin/${bin}" | grep -q 'static'
@@ -366,26 +327,323 @@ jobs:
           "${DIST_ROOT}/bin/stfg" smoke
           "${DIST_ROOT}/bin/stfgd" stop || true
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+      - name: Keep release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          subject-path: target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+          name: release-linux-musl
+          retention-days: 1
+          if-no-files-found: error
+          path: target/release-assets/star-forge-${{ env.VERSION }}-${{ env.TARGET }}.tar.gz
 
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v3
+  macos-assets:
+    name: macOS assets (${{ matrix.target }})
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    permissions:
+      contents: read
+    # The signing key lives only in this environment's secrets. Its deployment-branch rule
+    # (master only) keeps it out of reach of workflows run from any other branch, tag or PR;
+    # see docs/distribution.md#signing.
+    environment: macos-signing
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.release.outputs.version }}
+      # A presence flag only (a boolean, never a secret value); each secret itself is set in the
+      # env of the one step that needs it.
+      SIGNING_CONFIGURED: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tag_name: ${{ needs.release.outputs.tag_name }}
-          append_body: true
-          fail_on_unmatched_files: true
-          files: |
-            target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
-            target/release-assets/star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz.sha256
+          ref: ${{ needs.release.outputs.tag_name }}
+          persist-credentials: false
+
+      # The committed pin is the signing identity. Once it exists every release must be signed
+      # with it: an ad-hoc or differently signed release would reset every user's grants.
+      - name: Resolve the signing identity
+        run: |
+          set -euo pipefail
+          PIN_FILE="packaging/signing/release.sha1"
+          if [ -f "${PIN_FILE}" ]; then
+            PIN="$(tr -d '[:space:]' < "${PIN_FILE}" | tr '[:lower:]' '[:upper:]')"
+            if ! printf '%s' "${PIN}" | grep -Eq '^[0-9A-F]{40}$'; then
+              echo "::error::${PIN_FILE} must hold one 40-digit SHA-1"
+              exit 1
+            fi
+            if [ "${SIGNING_CONFIGURED}" != "true" ]; then
+              echo "::error::${PIN_FILE} is committed but the macos-signing environment has no MACOS_CERTIFICATE_P12 / MACOS_CERTIFICATE_PASSWORD"
+              exit 1
+            fi
+            echo "CODESIGN_IDENTITY=${PIN}" >> "${GITHUB_ENV}"
+          elif [ "${SIGNING_CONFIGURED}" = "true" ]; then
+            echo "::error::signing secrets are set but ${PIN_FILE} is missing; commit the certificate's SHA-1"
+            exit 1
+          fi
+
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal --target "${TARGET}"
+          rustup default "${v}"
+
+      # Compiled before the key is imported, so no dependency build script or proc macro runs
+      # while it is in a keychain.
+      - name: Build release binary
+        run: cargo build --release --locked --target "${TARGET}"
+
+      - name: Import the signing certificate
+        if: ${{ env.SIGNING_CONFIGURED == 'true' }}
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYCHAIN="${RUNNER_TEMP}/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "::add-mask::${KEYCHAIN_PASSWORD}"
+          echo "${MACOS_CERTIFICATE_P12}" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          security set-keychain-settings -lut 900 "${KEYCHAIN}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          # -x: the private key can't be exported again; -T: only codesign may use it.
+          security import "${RUNNER_TEMP}/certificate.p12" -P "${MACOS_CERTIFICATE_PASSWORD}" \
+            -x -t agg -f pkcs12 -k "${KEYCHAIN}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}" > /dev/null
+          security list-keychains -d user -s "${KEYCHAIN}" login.keychain-db
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+          # The secret must hold the pinned certificate, not just any identity.
+          if ! security find-identity -p codesigning "${KEYCHAIN}" | grep -q " ${CODESIGN_IDENTITY} "; then
+            echo "::error::MACOS_CERTIFICATE_P12 does not hold the identity pinned in packaging/signing/release.sha1"
+            exit 1
+          fi
+
+      # CODESIGN_IDENTITY is the pin when signing (set above), unset otherwise: sign.sh then
+      # signs ad hoc. With a pin it also verifies the designated requirement.
+      - name: Sign the binaries
+        run: packaging/macos/sign.sh "target/${TARGET}/release"
+
+      - name: Remove signing keychain and certificate
+        if: ${{ env.SIGNING_CONFIGURED == 'true' }}
+        run: |
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+          security delete-keychain "${RUNNER_TEMP}/build.keychain-db" || true
+
+      - name: Assemble binary distribution
+        run: |
+          set -euo pipefail
+          STAGE="target/release-assets"
+          DIST_ROOT="target/dist/star-forge-${VERSION}-${TARGET}"
+          mkdir -p "${DIST_ROOT}/bin" "${STAGE}"
+          install -m 755 "target/${TARGET}/release/stfgd" "target/${TARGET}/release/stfg" "${DIST_ROOT}/bin/"
+          install -m 644 README.md COPYING THIRD_PARTY_NOTICES.md "${DIST_ROOT}/"
+          COPYFILE_DISABLE=1 tar --no-mac-metadata -C target/dist \
+            -czf "${STAGE}/star-forge-${VERSION}-${TARGET}.tar.gz" "star-forge-${VERSION}-${TARGET}"
+          # The identity each leg signed with; publish-assets checks they agree.
+          printf '%s\n' "${CODESIGN_IDENTITY:-adhoc}" > "${STAGE}/signing-${TARGET}.txt"
+          # Only the native slice can be executed on the arm64 runner.
+          if [ "${TARGET}" = "aarch64-apple-darwin" ]; then
+            # `stfg` always exits 0; with no daemon it spawns one, so stop it afterwards.
+            export STAR_FORGE_CONFIG=/dev/null XDG_RUNTIME_DIR="${RUNNER_TEMP}"
+            "${DIST_ROOT}/bin/stfg" smoke
+            "${DIST_ROOT}/bin/stfgd" stop || true
+          fi
+
+      - name: Keep release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-macos-${{ matrix.target }}
+          retention-days: 1
+          if-no-files-found: error
+          path: target/release-assets/star-forge-${{ env.VERSION }}-${{ env.TARGET }}.tar.gz
+
+      - name: Keep the signing identity
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signing-${{ matrix.target }}
+          retention-days: 1
+          if-no-files-found: error
+          path: target/release-assets/signing-${{ env.TARGET }}.txt
+
+      - name: Remove temporary keychain and certificate
+        if: ${{ always() && env.SIGNING_CONFIGURED == 'true' }}
+        run: |
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+          security delete-keychain "${RUNNER_TEMP}/build.keychain-db" || true
+
+  # --- Publish -------------------------------------------------------------------------------
+  # Hashes and attests every asset, on a job that never sees the signing key and can't write
+  # the release.
+  checksums:
+    name: Checksums and provenance
+    needs: [release, linux-assets, linux-musl-assets, macos-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Fetch the assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Write checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          expected=(
+            "star-forge-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "star-forge-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+            "star-forge-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "star-forge-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "star-forge_${VERSION}_amd64.deb"
+            "star-forge-${VERSION}-1.x86_64.rpm"
+          )
+          for f in "${expected[@]}"; do
+            test -f "${f}" || { echo "::error::${f} is missing"; exit 1; }
+            sha256sum -- "${f}" > "${f}.sha256"
+          done
+          if [ "$(find . -maxdepth 1 -type f ! -name '*.sha256' | wc -l)" -ne "${#expected[@]}" ]; then
+            echo "::error::unexpected files in release-assets"
+            ls -la
+            exit 1
+          fi
+          sha256sum -- "${expected[@]}" | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-assets/star-forge-${{ env.VERSION }}-x86_64-unknown-linux-gnu.tar.gz
+            release-assets/star-forge-${{ env.VERSION }}-x86_64-unknown-linux-musl.tar.gz
+            release-assets/star-forge-${{ env.VERSION }}-aarch64-apple-darwin.tar.gz
+            release-assets/star-forge-${{ env.VERSION }}-x86_64-apple-darwin.tar.gz
+            release-assets/star-forge_${{ env.VERSION }}_amd64.deb
+            release-assets/star-forge-${{ env.VERSION }}-1.x86_64.rpm
+
+      # publish-assets merges these with the assets.
+      - name: Keep the checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checksums
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            release-assets/*.sha256
+            release-assets/SHA256SUMS
+
+  publish-assets:
+    name: Publish release assets
+    needs: [release, checksums]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+      TAG_NAME: ${{ needs.release.outputs.tag_name }}
+    steps:
+      - name: Fetch the assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Fetch the checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checksums
+          path: release-assets
+
+      - name: Fetch the signing identities
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: signing-*
+          merge-multiple: true
+          path: signing
+
+      # The macOS signing caveat, appended once to the notes release-plz wrote.
+      - name: Write the release note
+        run: |
+          set -euo pipefail
+          ids="$(sort -u signing/signing-*.txt)"
+          if [ "$(printf '%s\n' "${ids}" | wc -l)" -ne 1 ] || [ "$(find signing -type f | wc -l)" -ne 2 ]; then
+            echo "::error::the macOS legs disagree on the signing identity"
+            cat signing/*
+            exit 1
+          fi
+          if [ "${ids}" = "adhoc" ]; then
+            echo "::warning::Release is ad-hoc signed (packaging/signing/release.sha1 is not committed)"
+          fi
+          {
+            echo "## macOS"
+            echo
+            if [ "${ids}" = "adhoc" ]; then
+              echo "> **Note:** the macOS binaries are ad-hoc signed and not notarized by Apple, so"
+              echo "> macOS asks again for any permission you gave \`stfgd\` after each update."
+            else
+              echo "> **Note:** the macOS binaries are signed with star-forge's own certificate, not"
+              echo "> notarized by Apple. To check one, \`codesign -dr - stfgd\` must print"
+              echo "> \`certificate leaf = H\"$(printf %s "${ids}" | tr A-F a-f)\"\`."
+            fi
+            echo "> A tarball downloaded with a browser is quarantined: run"
+            echo "> \`xattr -dr com.apple.quarantine <extracted dir>\` before the first start."
+          } > macos-note.md
+
+      # Uploads the assets (replacing them on a rerun) and appends the note unless it's there.
+      # gh, not a release action: the job already holds the token, and the loop fails on a
+      # missing file.
+      - name: Upload the assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s failglob
+          assets=(
+            "release-assets/star-forge-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "release-assets/star-forge-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+            "release-assets/star-forge-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "release-assets/star-forge-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "release-assets/star-forge_${VERSION}_amd64.deb"
+            "release-assets/star-forge-${VERSION}-1.x86_64.rpm"
+            release-assets/*.sha256
+            release-assets/SHA256SUMS
+          )
+          for asset in "${assets[@]}"; do
+            test -f "${asset}" || { echo "::error::missing asset ${asset}"; exit 1; }
+          done
+          gh release upload "${TAG_NAME}" "${assets[@]}" --clobber
+          gh release view "${TAG_NAME}" --json body --jq .body > notes.md
+          if ! grep -qxF "## macOS" notes.md; then
+            printf '\n' >> notes.md
+            cat macos-note.md >> notes.md
+            gh release edit "${TAG_NAME}" --notes-file notes.md
+          fi
 
   packslip:
     name: Sign packslip manifest
-    needs: [release, macos-assets, linux-musl-assets]
+    needs: [release, publish-assets]
     if: ${{ needs.release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Signing never holds release-write access; publish-packslip uploads the bundle.
     permissions:
       contents: read
@@ -407,7 +665,7 @@ jobs:
       # by host libc.
       - name: Sign packslip manifest
         id: packslip
-        uses: jdx/packslip@v1
+        uses: jdx/packslip@7d397618045bd98b76cd5cb8177767b2f52789b8 # v1.10.1
         with:
           download: star-forge-*-unknown-linux-*.tar.gz star-forge-*-apple-darwin.tar.gz
           bin: stfgd stfg
@@ -418,7 +676,7 @@ jobs:
           upload: false
 
       - name: Keep signed bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: packslip-bundle
           retention-days: 1
@@ -429,11 +687,12 @@ jobs:
     name: Publish packslip manifest
     needs: [release, packslip]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - name: Fetch signed bundle
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: packslip-bundle
           path: packslip
@@ -451,6 +710,7 @@ jobs:
     name: Verify published packslip manifest
     needs: [release, publish-packslip]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     env:
@@ -458,7 +718,7 @@ jobs:
       PACKSLIP_PIN: ps1_iqg6ch676syauz3nb3hluddyku
     steps:
       - name: Install packslip
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: packslip@1.6.0
 
@@ -483,31 +743,12 @@ jobs:
             --pin "${PACKSLIP_PIN}" \
             "${args[@]}"
 
-  checksums:
-    name: Publish SHA256SUMS
-    needs: [release, macos-assets, linux-musl-assets]
-    if: ${{ needs.release.outputs.released == 'true' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      # Single writer: merge every per-asset .sha256 (Linux, musl, macOS) into one manifest.
-      - name: Assemble and upload SHA256SUMS
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-          mkdir sums && cd sums
-          gh release download "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --pattern '*.sha256'
-          cat -- *.sha256 | sort -k2 > SHA256SUMS
-          gh release upload "${TAG_NAME}" SHA256SUMS --repo "${GITHUB_REPOSITORY}" --clobber
-
   package-repositories:
     name: Publish package repositories
-    needs: release
+    needs: [release, publish-assets]
     if: ${{ needs.release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: package-repositories
       cancel-in-progress: false
@@ -520,9 +761,9 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Download current package artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: package-repository-inputs
+          name: release-linux-gnu
           path: target/release-assets
 
       - name: Install repository tools
@@ -662,13 +903,13 @@ jobs:
           gzip -cd public/deb/dists/stable/main/binary-amd64/Packages.gz | grep '^Package: star-forge$' >/dev/null
 
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: public
 
       - name: Deploy GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -89,38 +89,137 @@ use the user unit anyway, install a copy pointing at the Cargo binary (see First
 
 GitHub Actions keeps source verification separate from release automation:
 
-- `ci.yml`: Conventional Commit check, stable quality gate, MSRV build, macOS builds, and
-  `cargo audit` on pushes and pull requests.
+- `ci.yml`: Conventional Commit check, action pin check, workflow lint (jactionlint with
+  shellcheck), stable quality gate, MSRV build, musl and Nix builds, macOS builds (with an ad-hoc
+  run of the signing script), and `cargo audit` on pushes and pull requests.
 - `release.yml`: update the version and `CHANGELOG.md` directly on `master`, then create the tag,
   publish the crate, create the GitHub release, build release artifacts, attach them, and publish
   the package repositories.
 
+### Hardening
+
+- Every `uses:` is pinned to a full 40-hex commit SHA with a `# vX.Y.Z` comment; Dependabot bumps
+  both. `scripts/check-action-pins.sh` (tested with bats by `scripts/check-action-pins.bats`) fails
+  on anything else, in CI's `pin-check` job and in the release's `pin-gate`, which fetches every
+  workflow at the triggering commit through the API and runs before any other job.
+- Both workflows start from `permissions: {}`; each job asks for what it needs. Every job has a
+  `timeout-minutes`, and every checkout but the one that pushes the bump uses
+  `persist-credentials: false`.
+- Rust comes from rustup, at the version pinned in `.mise.toml` (MSRV from `Cargo.toml`); no
+  toolchain action. Release jobs restore no cargo cache, and packaging tools are installed at
+  pinned versions.
+- Release artifacts are built by jobs with `contents: read` only. One `checksums` job hashes and
+  attests every asset, and only `publish-assets` can write to the release (with `gh`, not a
+  third-party release action).
+- Dependabot waits seven days after a release before proposing it (`cooldown`), so a compromised
+  version has time to be pulled.
+- `mise run check` runs the same pin check, jactionlint and shellcheck locally.
+
 The release flow:
 
-1. `release-plz` analyzes commit history on `master`.
-2. `release-plz update` edits the next version and `CHANGELOG.md` in the workflow checkout.
-3. The workflow commits that release bump directly back to `master` (`[skip ci]`).
-4. `release-plz release` creates the tag, publishes to crates.io, and creates the GitHub release.
-5. The same workflow builds the optimized Linux binaries once, then replaces `stfg` with the
-   static musl build of `stfg`.
-6. It assembles the Linux binary tarball.
-7. It builds `deb` via `cargo-deb` and `rpm` via `cargo-generate-rpm`.
-8. It verifies both packages contain the binaries, docs, notices, and the user unit.
-9. It generates one `.sha256` sidecar per Linux artifact.
-10. It attaches the `tar.gz`, `deb`, `rpm`, and checksum files to the GitHub release and attests
-    their build provenance.
-11. A matrix job builds and attaches the macOS tarballs and their `.sha256` sidecars.
-12. `linux-musl-assets` builds the static `x86_64-unknown-linux-musl` tarball with `musl-tools`,
-    checks the binaries are static, smoke-tests them, and attaches the tarball and its `.sha256`.
-13. Once every tarball is attached, `jdx/packslip` signs a `packslip.sigstore.json` manifest
-    covering the gnu, musl, and macOS tarballs (used by `packslip install` and the `mise`
-    packslip backend), recording the commit the tag points to. The signing job has read-only
-    access; a separate job uploads the bundle, and a third verifies it against the published
-    tarballs and the signer fingerprint in `README.md`.
-14. It builds and deploys RPM/APT repository metadata to GitHub Pages.
+1. `pin-gate` checks the action pins; the `quality` gate runs after it.
+2. `release-plz` analyzes commit history on `master`.
+3. `release-plz update` edits the next version and `CHANGELOG.md` in the workflow checkout.
+4. The workflow commits that release bump directly back to `master` (`[skip ci]`).
+5. `release-plz release` creates the tag, publishes to crates.io, and creates the GitHub release.
+6. Three read-only build jobs check out the tag:
+   - `linux-assets` builds the optimized gnu binaries, replaces `stfg` with the static musl build
+     of `stfg`, assembles the tarball, builds `deb` via `cargo-deb` and `rpm` via
+     `cargo-generate-rpm`, and verifies both packages contain the binaries, docs, notices, and
+     the user unit.
+   - `linux-musl-assets` builds the static `x86_64-unknown-linux-musl` tarball with `musl-tools`,
+     checks the binaries are static, and smoke-tests them.
+   - `macos-assets` builds both macOS targets, signs them (see [Signing](#signing)), and
+     smoke-tests the native one.
+7. `checksums` writes one `.sha256` sidecar per artifact plus `SHA256SUMS`, and attests the build
+   provenance of every artifact.
+8. `publish-assets` attaches the artifacts and checksums to the GitHub release and appends the
+   macOS signing note to the release notes.
+9. `jdx/packslip` then signs a `packslip.sigstore.json` manifest covering the gnu, musl, and macOS
+   tarballs (used by `packslip install` and the `mise` packslip backend), recording the commit
+   the tag points to. The signing job has read-only access; a separate job uploads the bundle,
+   and a third verifies it against the published tarballs and the signer fingerprint in
+   `README.md`.
+10. It builds and deploys RPM/APT repository metadata to GitHub Pages.
 
 The release workflow uses the default `GITHUB_TOKEN` for repository operations. It does not depend
 on a PAT to trigger a second workflow.
+
+## Signing
+
+The macOS `stfgd` and `stfg` are signed with star-forge's own self-signed code-signing
+certificate. There is no Apple Developer ID: the project is open source and non-profit, so
+releases are not notarized and a browser download still needs
+`xattr -dr com.apple.quarantine <dir>`. What the certificate buys is a stable designated
+requirement:
+
+```text
+designated => identifier "ua.SkeLLLa.star-forge.stfgd" and certificate leaf = H"<sha1>"
+```
+
+(`stfg`'s is the same with `ua.SkeLLLa.star-forge.stfg`). macOS keys TCC grants (Full Disk Access,
+access to protected folders for `exec` badges) and keychain "Always Allow" entries to this
+requirement, so they survive updates. An ad-hoc signature pins the cdhash instead, and every
+build looks like a new program.
+
+The certificate is star-forge's alone. cAInary, quartz-drop and local dev builds each use their
+own, and the requirement pins the exact leaf, so a key leaked from one can't sign as another.
+
+**Pin.** `packaging/signing/release.sha1` holds the certificate's SHA-1. It is the `codesign`
+identity and the pin `packaging/macos/sign.sh` checks: with `CODESIGN_IDENTITY` set, signing fails
+unless both the signature and the designated requirement carry that leaf. Once the pin is
+committed, the release fails rather than ship ad hoc or with another key; changing the pin makes
+every user grant the permissions again, so do it only when the certificate expires (it is valid
+for 20 years) or leaks. Until the pin is committed, `macos-assets` signs ad hoc, emits a CI
+warning and says so in the release notes.
+
+**Secrets.** The key lives only in the `macos-signing` GitHub environment, used by the
+`macos-assets` job of `release.yml`:
+
+| Secret                       | Value                                              |
+| ---------------------------- | -------------------------------------------------- |
+| `MACOS_CERTIFICATE_P12`      | the .p12 (key and certificate), base64 on one line |
+| `MACOS_CERTIFICATE_PASSWORD` | its password                                       |
+
+Set up the environment in **Settings → Environments → New environment** `macos-signing`:
+
+- **Deployment branches and tags:** *Selected branches and tags*, with only `master`. A
+  workflow on any other branch or tag that names the environment is refused before it runs.
+  Repository secrets have no such rule, so don't keep these as repository secrets.
+- **Required reviewers** (optional): yourself, if every release should wait for approval.
+- No environment variables are needed; the identity comes from the committed pin.
+
+`ci.yml` never names the environment, and pull requests (including from forks) sign ad hoc. The
+binaries are compiled before the key is imported, so no dependency build script or proc macro
+runs while it is in a keychain. The import step puts the .p12 into a temporary keychain that
+only `/usr/bin/codesign` may use, checks that it holds the pinned identity, and removes it right
+after signing. The job holds `contents: read` only.
+
+**Making the certificate.** On the maintainer's Mac (not in CI), with the `macos-signing-cert`
+script from the maintainer's dotfiles, or the same steps by hand: an RSA 3072 self-signed
+certificate named `ua.SkeLLLa.star-forge`, organization `github.com/SkeLLLa/star-forge`, with
+critical `keyUsage = digitalSignature` and `extendedKeyUsage = codeSigning`, exported with
+`/usr/bin/openssl` (LibreSSL; the PKCS#12 that OpenSSL 3 writes by default doesn't import).
+
+```sh
+macos-signing-cert -g SkeLLLa/star-forge ua.SkeLLLa.star-forge
+cp ~/.local/share/macos-signing/ua.SkeLLLa.star-forge.release/ua.SkeLLLa.star-forge.release.sha1 \
+  packaging/signing/release.sha1
+```
+
+`-g` sets both secrets in the `macos-signing` environment through `gh`. Then back up the .p12
+and its password outside the machine and delete the directory.
+
+**Local builds.** Make a separate dev certificate and import it into the login keychain, so dev
+builds keep their grants across rebuilds without ever matching the release requirement:
+
+```sh
+macos-signing-cert -d -i ua.SkeLLLa.star-forge
+cargo build --release
+CODESIGN_IDENTITY="$(cat ~/.local/share/macos-signing/ua.SkeLLLa.star-forge.dev/*.sha1)" \
+  packaging/macos/sign.sh target/release
+codesign -d -r- target/release/stfgd
+```
 
 ## Crates.io Trusted Publishing
 

@@ -9,54 +9,162 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Read-only by default; jobs that need more declare their own permissions.
-permissions:
-  contents: read
+# Nothing is granted by default; each job asks for what it needs.
+permissions: {}
 
+env:
+  CARGO_TERM_COLOR: always
+
+# CI runs plain cargo from rustup (version read from .mise.toml, MSRV from Cargo.toml). mise is
+# for local development only; it would route cargo through mbx.
 jobs:
   conventional-commits:
     name: Conventional commit messages
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
     steps:
       - name: Verify Conventional Commit messages
-        uses: opensource-nepal/commitlint@v2
+        uses: opensource-nepal/commitlint@9c112b70de7b0e51f81d12a5268a451db5419794 # v2.0.0
+
+  # Every action is pinned to a commit SHA (Dependabot bumps the SHA and its version comment).
+  # An unpinned action fails here and in the release pin-gate. If
+  # `.github/actions/**/action.y?ml` appears, the gate and this check must cover it too.
+  pin-check:
+    name: Action pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the bats version from .mise.toml
+        id: bats
+        run: |
+          set -eu
+          v="$(sed -n 's/^bats = "\([^"]*\)"$/\1/p' .mise.toml)"
+          test -n "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install bats
+        uses: bats-core/bats-action@77d6fb60505b4d0d1d73e48bd035b55074bbfb43 # 4.0.0
+        with:
+          bats-version: ${{ steps.bats.outputs.version }}
+          support-install: false
+          assert-install: false
+          detik-install: false
+          file-install: false
+      - name: Test the pin checker
+        run: bats scripts/check-action-pins.bats
+      - name: Check action pins
+        run: scripts/check-action-pins.sh .github/workflows/*.yml
+
+  actions-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The release archive, checked against its checksum and against the build provenance of
+      # jdx/jactionlint's release workflow at the same tag. The runner image has shellcheck,
+      # which jactionlint runs on every `run:` script.
+      - name: Install jactionlint (version from .mise.toml)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^jactionlint = "\([^"]*\)"$/\1/p' .mise.toml)"
+          test -n "${v}"
+          dir="${RUNNER_TEMP}/jactionlint"
+          mkdir -p "${dir}/bin"
+          cd "${dir}"
+          tgz="jactionlint_${v}_linux_amd64.tar.gz"
+          gh release download "v${v}" -R jdx/jactionlint -p "${tgz}" -p "jactionlint_${v}_checksums.txt"
+          grep -E "^[0-9a-f]{64}  ${tgz}\$" "jactionlint_${v}_checksums.txt" | sha256sum -c -
+          gh attestation verify "${tgz}" -R jdx/jactionlint \
+            --signer-workflow jdx/jactionlint/.github/workflows/release.yaml \
+            --source-ref "refs/tags/v${v}"
+          tar -xzf "${tgz}" -C bin jactionlint
+          echo "${dir}/bin" >> "${GITHUB_PATH}"
+      - name: Show tools
+        run: |
+          jactionlint --version
+          shellcheck --version
+      - name: jactionlint
+        run: jactionlint
+      - name: shellcheck
+        run: shellcheck scripts/*.sh scripts/*.bats packaging/macos/*.sh
 
   rust-quality:
     name: Rust quality (stable)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - name: Install stable Rust with clippy and rustfmt
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy,rustfmt
+          persist-credentials: false
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal --component clippy,rustfmt
+          rustup default "${v}"
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-quality-${{ hashFiles('.mise.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-quality-
       - name: Run quality checks
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo clippy --no-default-features --all-targets -- -D warnings
-          cargo test
-          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --locked --no-default-features --all-targets -- -D warnings
+          cargo test --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 
   msrv:
-    name: MSRV build (1.88)
+    name: MSRV build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: "1.88"
+          persist-credentials: false
+      - name: Install MSRV toolchain (rust-version from Cargo.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal
+          rustup default "${v}"
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: msrv
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv-
       - name: Build
         run: cargo build --locked --all-targets
       - name: Test
@@ -65,14 +173,30 @@ jobs:
   musl:
     name: musl static build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal --target x86_64-unknown-linux-musl
+          rustup default "${v}"
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: musl
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('.mise.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
       - name: Build
         run: |
           cargo build --locked --no-default-features --bin stfg --target x86_64-unknown-linux-musl
@@ -81,9 +205,14 @@ jobs:
   nix:
     name: Nix build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - name: Build
         run: nix build .#default --print-build-logs
       - name: Check outputs
@@ -95,42 +224,68 @@ jobs:
   macos:
     name: macOS (${{ matrix.target }})
     runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Install stable Rust with clippy
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy
-          targets: ${{ matrix.target }}
+          persist-credentials: false
+      - name: Install Rust (version from .mise.toml)
+        run: |
+          set -eu
+          v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${v}"
+          rustup toolchain install "${v}" --profile minimal --component clippy --target "${TARGET}"
+          rustup default "${v}"
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('.mise.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
       # cfg-gated code must be warning-free on macOS too (dead code, unused imports, casts).
       - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features --target "${TARGET}" -- -D warnings
       # macos-latest is arm64: the x86_64 slice can only be cross-built (linked), not run.
       - name: Build
         if: matrix.target == 'x86_64-apple-darwin'
-        run: cargo build --locked --all-targets --target ${{ matrix.target }}
+        run: cargo build --locked --all-targets --target "${TARGET}"
       - name: Test
         if: matrix.target == 'aarch64-apple-darwin'
-        run: cargo test --locked --target ${{ matrix.target }}
+        run: cargo test --locked --target "${TARGET}"
+      # The release signing path, ad hoc (this workflow never names the macos-signing
+      # environment, so pull requests, forks included, can't reach the key).
+      - name: Sign ad hoc
+        run: |
+          set -euo pipefail
+          cargo build --locked --bins --target "${TARGET}"
+          packaging/macos/sign.sh "target/${TARGET}/debug"
+          codesign -dv "target/${TARGET}/debug/stfgd"
 
   audit:
     name: Cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
-      issues: write
-      checks: write
     steps:
-      - uses: actions/checkout@v7
-      - name: Audit dependencies
-        uses: rustsec/audit-check@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Audit dependencies
+        run: cargo audit

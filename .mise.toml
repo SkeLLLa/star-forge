@@ -8,17 +8,23 @@ fetch_remote_versions_cache = "4h"
 missing_tools = "always"
 
 [tools]
-rust = { version = "1.99.0", components = "rust-analyzer,rust-src" }
-mr-boxington = "1.22.0"
+rust = { version = "1.99.1", components = "rust-analyzer,rust-src" }
+mr-boxington = { version = "1.27.0", workflow = "release.yml@refs/heads/main" }
 rg = "15.2.0"
 fd = "10.5.0"
 jq = "1.8.2"
-rtk = { version = "0.51.0", postinstall = "rtk init -g --auto-patch" }
+rtk = { version = "1.0.1", postinstall = "rtk init -g --auto-patch" }
 "github:dmtrKovalenko/fff.nvim" = { version = "0.11.0", bin = "fff-mcp", platforms = { linux-x64 = { asset_pattern = "fff-mcp-x86_64-unknown-linux-musl" }, linux-arm64 = { asset_pattern = "fff-mcp-aarch64-unknown-linux-musl" }, macos-x64 = { asset_pattern = "fff-mcp-x86_64-apple-darwin" }, macos-arm64 = { asset_pattern = "fff-mcp-aarch64-apple-darwin" } } }
-"github:redhat-et/ripwire" = { version = "0.6.5", exe = "ripwire", platforms = { linux-x64 = { asset_pattern = "ripwire-*-linux-x64.tar.gz" }, linux-arm64 = { asset_pattern = "ripwire-*-linux-arm64.tar.gz" }, macos-x64 = { asset_pattern = "ripwire-*-macos-x64.tar.gz" }, macos-arm64 = { asset_pattern = "ripwire-*-macos-arm64.tar.gz" } } }
-rumdl = "0.2.78"
-"github:jdx/packslip" = "1.6.0"
-hyperfine = "1.20.0"
+"github:redhat-et/ripwire" = { version = "0.6.8", bin = "ripwire", platforms = { linux-x64 = { asset_pattern = "ripwire-*-linux-x64.tar.gz" }, linux-arm64 = { asset_pattern = "ripwire-*-linux-arm64.tar.gz" }, macos-arm64 = { asset_pattern = "ripwire-*-macos-arm64.tar.gz" } } }
+rumdl = "0.3.0"
+"github:jdx/packslip" = "1.11.0"
+hyperfine = "2.0.0"
+# Workflow lint (CI's actions-lint job reads the jactionlint version from here).
+jactionlint = "2.3.0"
+shellcheck = "0.11.0"
+# Tests for scripts/check-action-pins.sh (CI's pin-check job installs this version with
+# bats-core/bats-action).
+bats = "1.14.0"
 
 # Tasks that compile run Cargo through mbx (mr-boxington): compiled crates are cached and shared
 # across checkouts. Plain `cargo` keeps working without it; CI uses plain Cargo.
@@ -61,9 +67,21 @@ run = "rumdl fmt ."
 description = "Lint Markdown files"
 run = "rumdl check ."
 
+[tasks."lint:actions"]
+description = "jactionlint (with shellcheck on run: scripts) on the workflows and dependabot.yml"
+run = "jactionlint"
+
+[tasks."lint:pins"]
+description = "Check that every GitHub action is pinned to a commit SHA"
+run = ["bats scripts/check-action-pins.bats", "sh scripts/check-action-pins.sh .github/workflows/*.yml"]
+
+[tasks."lint:shell"]
+description = "shellcheck the repository's shell scripts"
+run = "shellcheck scripts/*.sh scripts/*.bats packaging/macos/*.sh"
+
 [tasks.check]
 description = "Run the full quality suite"
-depends = ["fmt-check", "lint", "test", "doc", "md-check"]
+depends = ["fmt-check", "lint", "test", "doc", "md-check", "lint:actions", "lint:pins", "lint:shell"]
 
 [tasks.bench]
 description = "Benchmark stfg against running the same commands directly"
