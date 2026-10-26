@@ -547,13 +547,15 @@ the socket directory before it can serve requests.
 The client bounds its daemon launch with a worker thread under the same 30 ms deadline. A
 stuck syscall is abandoned, not cancelled; the client exits without joining it. The implicit
 `current_dir()` lookup (skipped with `--cwd`) runs inline on Linux, where `getcwd(2)` reads
-the dentry cache, not the filesystem, so it can't hang on a dead mount; on macOS it runs on a
-deadline-bounded worker as well.
+the dentry cache, not the filesystem, so it can't hang on a dead mount. On macOS it runs on a
+worker started first and awaited after connecting, under the same deadline: a timeout prints
+empty lines, and a daemon that isn't running is still started.
 
 ## Environment variables
 
 - `STAR_FORGE_CONFIG` — config file path override.
-- `STAR_FORGE_TIMEOUT_MS` — override the client's 30 ms deadline (mostly for testing).
+- `STAR_FORGE_TIMEOUT_MS` — override the client's 30 ms deadline (mostly for testing; capped at
+  one hour).
 - `XDG_RUNTIME_DIR` / `XDG_CONFIG_HOME` — standard XDG dirs; fall back to `/tmp/star-forge-$UID`
   (the usual case on macOS, which doesn't set `XDG_RUNTIME_DIR`) and `~/.config` respectively.
   The runtime dir must be a real directory owned by you and not group/other-writable; anything

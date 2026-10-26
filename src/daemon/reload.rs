@@ -1,8 +1,7 @@
 //! Config hot-reload: file identity stamps and the throttled reload check.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::cache::{Entry, Key};
@@ -25,11 +24,6 @@ pub(super) fn stamp(config: &Path, palette: Option<&Path>) -> Stamp {
     }
 }
 
-/// Numbers each [`publish_env_patterns`] call, so a late one never replaces a newer file.
-static PUBLISH_GENERATION: AtomicU64 = AtomicU64::new(0);
-/// The newest generation that has touched the file; held across the rename (or removal).
-static PUBLISHED_GENERATION: Mutex<u64> = Mutex::new(0);
-
 /// Writes `cfg`'s `env` patterns where clients read them (`client::read_env_patterns`), so a
 /// `get` carries only variables some badge can use. Through a temp file and a rename, so a
 /// client never reads a torn file; a publish that outlives its budget and lands after a newer
@@ -38,16 +32,18 @@ static PUBLISHED_GENERATION: Mutex<u64> = Mutex::new(0);
 /// anyway), and on any failure the next config check retries. A stale file left behind is
 /// harmless: its tag no longer matches, so the daemon uses its own environment.
 pub(super) async fn publish_env_patterns(state: &Daemon, cfg: Arc<Config>) {
-    let Some(path) = state
-        .config_meta
-        .lock()
-        .expect("config_meta lock poisoned")
-        .env_patterns
-        .clone()
-    else {
-        return;
+    let (path, generation, published_generation) = {
+        let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
+        let Some(path) = meta.env_patterns.clone() else {
+            return;
+        };
+        meta.publish_generation += 1;
+        (
+            path,
+            meta.publish_generation,
+            Arc::clone(&meta.published_generation),
+        )
     };
-    let generation = PUBLISH_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let written = state
         .providers
         .blocking
@@ -62,7 +58,7 @@ pub(super) async fn publish_env_patterns(state: &Daemon, cfg: Arc<Config>) {
                 }
                 let tmp = path.with_extension(format!("tmp.{generation}"));
                 let wrote = std::fs::write(&tmp, text).is_ok();
-                let mut published = PUBLISHED_GENERATION
+                let mut published = published_generation
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if *published > generation {
@@ -273,6 +269,7 @@ mod tests {
     use crate::template::Dialect;
     use crate::test_support::TempDir;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     #[test]

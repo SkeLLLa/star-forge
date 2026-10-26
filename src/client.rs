@@ -10,6 +10,7 @@
 //! followed by `<0x1F>ENV_MARK(<0x1F>NAME=value)*` (the client's environment).
 //! Response is exactly one line per requested badge, in order, then EOF.
 
+use std::ffi::{CStr, OsString, c_char};
 use std::io::{self, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
@@ -94,11 +95,12 @@ pub fn env_patterns_tag<S: AsRef<str>>(patterns: &[S]) -> String {
     format!("{hash:016x}")
 }
 
-/// `pattern` is a variable name, or a prefix with one trailing `*`.
-pub fn env_matches(pattern: &str, name: &str) -> bool {
-    pattern
-        .strip_suffix('*')
-        .map_or(pattern == name, |prefix| name.starts_with(prefix))
+/// `pattern` is a variable name, or a prefix with one trailing `*`; `name` may be non-UTF-8.
+pub fn env_matches_bytes(pattern: &str, name: &[u8]) -> bool {
+    pattern.strip_suffix('*').map_or_else(
+        || pattern.as_bytes() == name,
+        |prefix| name.starts_with(prefix.as_bytes()),
+    )
 }
 
 /// Whether the runtime dir `dir` can be trusted with the socket: a real directory (not a
@@ -200,7 +202,7 @@ fn connect_nonblocking(path: &Path) -> Connect {
     addr.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).unwrap_or_default();
     for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
         // `c_char` is `i8` on x86_64/Apple, `u8` on Linux aarch64: a byte copy either way.
-        *dst = libc::c_char::from_ne_bytes([src]);
+        *dst = c_char::from_ne_bytes([src]);
     }
     // `sun_len` (BSD/macOS only) stays 0: the kernel sets it from `addr_len`.
     let Ok(addr_len) = libc::socklen_t::try_from(
@@ -289,7 +291,7 @@ enum EnvBlock {
 }
 
 /// Encodes the one-line `get` request. `None` if `cwd` or any badge contains `\n` or the
-/// field separator — the caller must print empty lines without connecting in that case.
+/// field separator — the caller must print empty lines without sending a request in that case.
 /// `env: None` sends no env block (the daemon uses its own); `Some` sends one, even empty, so
 /// the daemon knows the client lacks every variable it didn't send. A selection with a
 /// variable that can't be encoded, or a block past the line cap, is dropped whole.
@@ -482,24 +484,42 @@ pub fn remaining(deadline: Instant) -> Option<Duration> {
     (deadline > now).then(|| deadline - now)
 }
 
+/// Work started on a worker thread under a deadline (see [`run_before_deadline`]).
+struct Pending<T>(std::sync::mpsc::Receiver<T>);
+
+/// Starts `job` on a worker that runs it only if `deadline` hasn't passed by then. Never
+/// fails: past the deadline or if the thread can't be spawned, [`Pending::wait`] is `None`.
+fn start_before_deadline<T: Send + 'static>(
+    deadline: Instant,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Pending<T> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if remaining(deadline).is_some() {
+        let _ = std::thread::Builder::new().spawn(move || {
+            if remaining(deadline).is_some() {
+                let _ = sender.send(job());
+            }
+        });
+    }
+    Pending(receiver)
+}
+
+impl<T> Pending<T> {
+    /// The job's result if it arrives before `deadline`; the worker is not joined otherwise.
+    fn wait(self, deadline: Instant) -> Option<T> {
+        let result = self.0.recv_timeout(remaining(deadline)?).ok()?;
+        remaining(deadline)?;
+        Some(result)
+    }
+}
+
 /// Bound filesystem-dependent preparation without linking an async runtime. Timed-out
 /// workers are not joined; the short-lived client process terminates them on exit.
 fn run_before_deadline<T: Send + 'static>(
     deadline: Instant,
     job: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
-    remaining(deadline)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .spawn(move || {
-            if remaining(deadline).is_some() {
-                let _ = sender.send(job());
-            }
-        })
-        .ok()?;
-    let result = receiver.recv_timeout(remaining(deadline)?).ok()?;
-    remaining(deadline)?;
-    Some(result)
+    start_before_deadline(deadline, job).wait(deadline)
 }
 
 // ---- the hot path ---------------------------------------------------------------
@@ -511,27 +531,101 @@ fn current_dir_string() -> String {
         .unwrap_or_default()
 }
 
-/// The process environment (UTF-8 entries only) that `patterns` select (`None`: all of it).
-fn current_env(patterns: Option<&[String]>) -> Vec<(String, String)> {
-    std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .filter(|(k, _)| patterns.is_none_or(|ps| ps.iter().any(|p| env_matches(p, k))))
-        .collect()
+/// The process environment, UTF-8 entries only.
+fn current_env() -> Vec<(String, String)> {
+    with_environ(|vars| {
+        vars.iter()
+            .filter_map(|&(k, v)| {
+                Some((
+                    str::from_utf8(k).ok()?.to_owned(),
+                    str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect()
+    })
 }
 
-/// Whether some variable `patterns` select has a non-UTF-8 name or value, which can't be sent:
-/// a filtered environment is sent whole or not at all.
-fn selected_env_has_non_utf8(patterns: &[String]) -> bool {
-    std::env::vars_os().any(|(k, v)| {
-        let name = k.as_encoded_bytes();
-        let selected = patterns.iter().any(|p| {
-            p.strip_suffix('*').map_or_else(
-                || p.as_bytes() == name,
-                |prefix| name.starts_with(prefix.as_bytes()),
-            )
-        });
-        selected && (k.to_str().is_none() || v.to_str().is_none())
-    })
+/// Calls `f` with the environment's (name, value) entries as bytes, in `environ` order, split
+/// like std's `vars_os` (at the first `=` after the first byte; entries without one skipped).
+/// Reads `environ` in place instead of copying every entry into `OsString`s.
+///
+/// Not thread-safe against env mutation; sound only because nothing in this binary mutates
+/// the environment. If that ever changes, switch back to `std::env::vars_os()`.
+fn with_environ<R>(f: impl FnOnce(&[(&[u8], &[u8])]) -> R) -> R {
+    let mut entries = Vec::new();
+    let mut slot = environ_ptr();
+    if !slot.is_null() {
+        loop {
+            // SAFETY: `slot` points into the null-terminated environ array: it starts at the
+            // non-null head and only advances past entries found non-null, so it is at or
+            // before the terminator. No thread writes the environment while this runs: this
+            // binary never calls set_var/remove_var/setenv/putenv, so other live threads (the
+            // macOS cwd worker, test runners) only read it.
+            let entry = unsafe { *slot };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: a non-null environ entry is a NUL-terminated C string owned by the C
+            // runtime, and (as above) nothing frees or replaces it before `f` returns; the
+            // borrow can't outlive this call because `f` is higher-ranked over its lifetime.
+            let bytes = unsafe { CStr::from_ptr(entry) }.to_bytes();
+            if let Some(kv) = split_env_entry(bytes) {
+                entries.push(kv);
+            }
+            slot = slot.wrapping_add(1);
+        }
+    }
+    f(&entries)
+}
+
+/// Splits a `NAME=value` environ entry like std: at the first `=` after the first byte (so a
+/// name may start with `=`); `None` if there is none.
+fn split_env_entry(entry: &[u8]) -> Option<(&[u8], &[u8])> {
+    let eq = 1 + entry.get(1..)?.iter().position(|&b| b == b'=')?;
+    Some((&entry[..eq], &entry[eq + 1..]))
+}
+
+/// The `environ` array head; may be null.
+#[cfg(target_vendor = "apple")]
+fn environ_ptr() -> *const *const c_char {
+    // SAFETY: no preconditions; returns the address of libSystem's `environ` variable, valid
+    // for the process lifetime.
+    let environ = unsafe { libc::_NSGetEnviron() };
+    // SAFETY: that non-null, aligned address, read once; no concurrent writer (see
+    // `with_environ`).
+    unsafe { *environ }.cast_const().cast()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+unsafe extern "C" {
+    /// POSIX `environ`; the `libc` crate doesn't declare it on Linux (glibc or musl).
+    static mut environ: *const *const c_char;
+}
+
+/// The `environ` array head; may be null.
+#[cfg(not(target_vendor = "apple"))]
+fn environ_ptr() -> *const *const c_char {
+    // SAFETY: by-value read of the pointer-sized global the C runtime initializes before
+    // `main`; nothing writes it concurrently (see `with_environ`).
+    unsafe { environ }
+}
+
+/// The `vars` that `patterns` select, in order; `None` if a selected one has a non-UTF-8 name
+/// or value, which can't be sent: a filtered environment is sent whole or not at all.
+fn select_env<'a>(
+    vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    patterns: &[String],
+) -> Option<Vec<(String, String)>> {
+    let mut selected = Vec::new();
+    for (k, v) in vars {
+        if patterns.iter().any(|p| env_matches_bytes(p, k)) {
+            selected.push((
+                str::from_utf8(k).ok()?.to_owned(),
+                str::from_utf8(v).ok()?.to_owned(),
+            ));
+        }
+    }
+    Some(selected)
 }
 
 /// Parses [`ENV_PATTERNS_FILE`]: `None` unless it starts with [`ENV_PATTERNS_HEADER`].
@@ -566,12 +660,15 @@ fn read_env_patterns() -> Option<Vec<String>> {
 /// hasn't said (it filters per badge either way).
 fn env_to_send() -> Option<EnvBlock> {
     match read_env_patterns() {
-        Some(patterns) if patterns.is_empty() || selected_env_has_non_utf8(&patterns) => None,
-        Some(patterns) => Some(EnvBlock::Selected {
-            tag: env_patterns_tag(&patterns),
-            vars: current_env(Some(&patterns)),
-        }),
-        None => Some(EnvBlock::All(current_env(None))),
+        Some(patterns) if patterns.is_empty() => None,
+        Some(patterns) => {
+            let vars = with_environ(|vars| select_env(vars.iter().copied(), &patterns))?;
+            Some(EnvBlock::Selected {
+                tag: env_patterns_tag(&patterns),
+                vars,
+            })
+        }
+        None => Some(EnvBlock::All(current_env())),
     }
 }
 
@@ -589,31 +686,65 @@ fn parse_get_args(mut args: impl Iterator<Item = String>) -> (Vec<String>, Optio
     (badges, cwd)
 }
 
-/// The cwd to send: `cwd` if given, else the process cwd so path-scoped (git) badges work
-/// without an explicit `--cwd`, matching how starship invokes `get <badge>` in the prompt's
-/// dir. No canonicalize. Inline on Linux: `getcwd(2)` reads the dentry cache, not the
-/// filesystem, so it can't hang on a dead mount.
-#[cfg(target_os = "linux")]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "same signature as the non-Linux body"
-)]
-fn initial_cwd(cwd: Option<&str>, _deadline: Instant) -> Option<String> {
-    Some(cwd.map_or_else(current_dir_string, str::to_string))
+/// The cwd to send: already known, or still being read on a worker (macOS only).
+enum PendingCwd {
+    Ready(String),
+    #[cfg(not(target_os = "linux"))]
+    Reading(Pending<String>),
 }
 
-/// Elsewhere (macOS `getcwd(3)` may `open(".")` and ask the filesystem) the process cwd is
-/// read under the deadline instead.
-#[cfg(not(target_os = "linux"))]
-fn initial_cwd(cwd: Option<&str>, deadline: Instant) -> Option<String> {
-    cwd.map_or_else(
-        || run_before_deadline(deadline, current_dir_string),
-        |cwd| Some(cwd.to_string()),
-    )
+impl PendingCwd {
+    /// `cwd` if given, else the process cwd so path-scoped (git) badges work without an
+    /// explicit `--cwd`, matching how starship invokes `get <badge>` in the prompt's dir. No
+    /// canonicalize. Inline on Linux: `getcwd(2)` reads the dentry cache, not the filesystem,
+    /// so it can't hang on a dead mount.
+    #[cfg(target_os = "linux")]
+    fn start(cwd: Option<&str>, _deadline: Instant) -> Self {
+        Self::Ready(cwd.map_or_else(current_dir_string, str::to_string))
+    }
+
+    /// Elsewhere (macOS `getcwd(3)` may `open(".")` and ask the filesystem) the process cwd is
+    /// read on a worker under the deadline, overlapping the env scan and connect.
+    #[cfg(not(target_os = "linux"))]
+    fn start(cwd: Option<&str>, deadline: Instant) -> Self {
+        cwd.map_or_else(
+            || Self::Reading(start_before_deadline(deadline, current_dir_string)),
+            |cwd| Self::Ready(cwd.to_string()),
+        )
+    }
+
+    /// The cwd, unless `deadline` passes first.
+    fn wait(self, deadline: Instant) -> Option<String> {
+        match self {
+            Self::Ready(cwd) => {
+                remaining(deadline)?;
+                Some(cwd)
+            }
+            #[cfg(not(target_os = "linux"))]
+            Self::Reading(pending) => pending.wait(deadline),
+        }
+    }
 }
 
 /// Client deadline unless `STAR_FORGE_TIMEOUT_MS` overrides it; `daemon.cold_wait` must stay under it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30);
+
+/// Cap on a `STAR_FORGE_TIMEOUT_MS` override.
+const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The client timeout for a `STAR_FORGE_TIMEOUT_MS` value: [`DEFAULT_TIMEOUT`] if unset or
+/// not a millisecond count, capped at [`MAX_TIMEOUT`].
+fn timeout_from_env(value: Option<&str>) -> Duration {
+    value
+        .and_then(|s| s.parse().ok())
+        .map_or(DEFAULT_TIMEOUT, Duration::from_millis)
+        .min(MAX_TIMEOUT)
+}
+
+/// `now + timeout`, or `now` (already passed) if that overflows `Instant`.
+fn deadline_after(now: Instant, timeout: Duration) -> Instant {
+    now.checked_add(timeout).unwrap_or(now)
+}
 
 /// `stfgd get`/`stfg` hot path: always returns exactly `badges.len()`
 /// strings, empty on any failure, never panics, never writes to stderr. Only a missing
@@ -621,20 +752,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30);
 /// busy (full backlog on Linux) or unresponsive daemon, or an untrusted runtime dir, does
 /// not, per the design.
 fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
-    let timeout = std::env::var("STAR_FORGE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(
+        Instant::now(),
+        timeout_from_env(std::env::var("STAR_FORGE_TIMEOUT_MS").ok().as_deref()),
+    );
     let empty = || vec![String::new(); badges.len()];
 
-    let Some(cwd) = initial_cwd(cwd, deadline) else {
+    // Malformed argv never touches the daemon (no connect, no spawn).
+    if !badges.iter().all(|b| valid_field(b)) || cwd.is_some_and(|c| !valid_field(c)) {
         return empty();
-    };
+    }
+    let cwd = PendingCwd::start(cwd, deadline);
+    // Must run before any thread that could touch the env (spawn worker); see `with_environ`.
     let env = env_to_send();
-    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, env.as_ref()) else {
-        return empty();
-    };
 
     let mut stream = match connect_daemon() {
         Connect::Ok(stream) => stream,
@@ -644,6 +774,14 @@ fn client_get(badges: &[String], cwd: Option<&str>) -> Vec<String> {
             return empty();
         }
         Connect::Busy => return empty(),
+    };
+
+    // Dropping the stream unsent is harmless: the daemon ignores a request-less EOF.
+    let Some(cwd) = cwd.wait(deadline) else {
+        return empty();
+    };
+    let Some(req) = encode_request(env!("CARGO_PKG_VERSION"), &cwd, badges, env.as_ref()) else {
+        return empty();
     };
 
     if write_all_before_deadline(&mut stream, req.as_bytes(), deadline).is_err() {
@@ -673,9 +811,12 @@ fn print_values(values: &[String]) {
 }
 
 /// CLI entry shared by `stfg` and `stfgd get`: `<badge>... [--cwd <path>]`, prints one line
-/// per badge, always succeeds.
-pub fn run_cli(args: impl Iterator<Item = String>) {
-    let (badges, cwd) = parse_get_args(args);
+/// per badge, always succeeds. Non-UTF-8 arguments are taken lossily rather than panicking.
+pub fn run_cli(args: impl Iterator<Item = OsString>) {
+    let (badges, cwd) = parse_get_args(args.map(|a| {
+        a.into_string()
+            .unwrap_or_else(|a| a.to_string_lossy().into_owned())
+    }));
     let values = client_get(&badges, cwd.as_deref());
     print_values(&values);
 }
@@ -912,10 +1053,103 @@ mod tests {
 
     #[test]
     fn env_matches_names_and_trailing_star_prefixes() {
-        assert!(env_matches("PATH", "PATH"));
-        assert!(!env_matches("PATH", "PATHX"));
-        assert!(env_matches("MISE_*", "MISE_SHELL"));
-        assert!(!env_matches("MISE_*", "XMISE_A"));
+        assert!(env_matches_bytes("PATH", b"PATH"));
+        assert!(!env_matches_bytes("PATH", b"PATHX"));
+        assert!(env_matches_bytes("MISE_*", b"MISE_SHELL"));
+        assert!(!env_matches_bytes("MISE_*", b"XMISE_A"));
+        assert!(env_matches_bytes("MISE_*", b"MISE_\xff"));
+        assert!(!env_matches_bytes("PATH", b"PATH\xff"));
+    }
+
+    fn patterns(ps: &[&str]) -> Vec<String> {
+        ps.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn select_env_matches_exact_names_and_star_prefixes_in_order() {
+        let vars: &[(&[u8], &[u8])] = &[
+            (b"PATH", b"/bin"),
+            (b"PATHX", b"x"),
+            (b"GIT_DIR", b".git"),
+            (b"GIT_X", b"y"),
+            (b"HOME", b"/home/u"),
+        ];
+        let pairs = |kvs: &[(&str, &str)]| {
+            kvs.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            select_env(vars.iter().copied(), &patterns(&["PATH", "GIT_*"])),
+            Some(pairs(&[
+                ("PATH", "/bin"),
+                ("GIT_DIR", ".git"),
+                ("GIT_X", "y")
+            ]))
+        );
+    }
+
+    #[test]
+    fn select_env_ignores_unselected_non_utf8() {
+        let vars: &[(&[u8], &[u8])] = &[(b"OTHER", b"\xff"), (b"\xff", b"v"), (b"PATH", b"/bin")];
+        assert_eq!(
+            select_env(vars.iter().copied(), &patterns(&["PATH"])),
+            Some(vec![("PATH".to_string(), "/bin".to_string())])
+        );
+    }
+
+    #[test]
+    fn select_env_is_none_if_a_selected_value_is_non_utf8() {
+        let vars: &[(&[u8], &[u8])] = &[(b"PATH", b"/bin"), (b"GIT_DIR", b"\xff")];
+        assert_eq!(
+            select_env(vars.iter().copied(), &patterns(&["PATH", "GIT_*"])),
+            None
+        );
+    }
+
+    #[test]
+    fn select_env_is_none_if_a_selected_name_is_non_utf8() {
+        let vars: &[(&[u8], &[u8])] = &[(b"FOO_\xff", b"v")];
+        assert_eq!(
+            select_env(vars.iter().copied(), &patterns(&["FOO_*"])),
+            None
+        );
+    }
+
+    #[test]
+    fn select_env_with_no_matches_is_empty_not_none() {
+        let vars: &[(&[u8], &[u8])] = &[(b"HOME", b"/home/u"), (b"X", b"\xff")];
+        assert_eq!(
+            select_env(vars.iter().copied(), &patterns(&["PATH"])),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn split_env_entry_matches_std() {
+        let ok = |e: &[u8], k: &[u8], v: &[u8]| assert_eq!(split_env_entry(e), Some((k, v)));
+        ok(b"A=b", b"A", b"b");
+        ok(b"A=", b"A", b"");
+        ok(b"A=b=c", b"A", b"b=c");
+        ok(b"=foo=bar", b"=foo", b"bar");
+        assert_eq!(split_env_entry(b"="), None);
+        assert_eq!(split_env_entry(b""), None);
+        assert_eq!(split_env_entry(b"NOEQ"), None);
+    }
+
+    #[test]
+    fn with_environ_agrees_with_vars_os() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw: Vec<(Vec<u8>, Vec<u8>)> = with_environ(|vars| {
+            vars.iter()
+                .map(|&(k, v)| (k.to_vec(), v.to_vec()))
+                .collect()
+        });
+        let std: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+            .map(|(k, v)| (k.into_vec(), v.into_vec()))
+            .collect();
+        assert_ne!(raw, Vec::new());
+        assert_eq!(raw, std);
     }
 
     #[test]
@@ -1142,6 +1376,61 @@ mod tests {
             panic!("worker failure is reported as no result")
         });
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn pending_work_runs_while_the_caller_continues() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pending = start_before_deadline(deadline, move || gate.recv().is_ok());
+        // The job is blocked on `gate` until here: `start_before_deadline` didn't wait on it.
+        release.send(()).unwrap();
+        assert_eq!(pending.wait(deadline), Some(true));
+    }
+
+    #[test]
+    fn pending_wait_after_the_deadline_is_none() {
+        let pending = start_before_deadline(Instant::now() + Duration::from_secs(10), || 7);
+        assert_eq!(pending.wait(Instant::now()), None);
+    }
+
+    #[test]
+    fn pending_cwd_reads_the_process_cwd() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(
+            PendingCwd::start(None, deadline).wait(deadline),
+            Some(current_dir_string())
+        );
+    }
+
+    #[test]
+    fn pending_cwd_prefers_the_given_cwd_and_respects_the_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(
+            PendingCwd::start(Some("/x"), deadline).wait(deadline),
+            Some("/x".to_string())
+        );
+        let passed = Instant::now();
+        assert_eq!(PendingCwd::start(Some("/x"), passed).wait(passed), None);
+    }
+
+    #[test]
+    fn timeout_from_env_defaults_and_caps() {
+        assert_eq!(timeout_from_env(None), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from_env(Some("abc")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from_env(Some("-1")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from_env(Some("5")), Duration::from_millis(5));
+        assert_eq!(timeout_from_env(Some("18446744073709551615")), MAX_TIMEOUT);
+    }
+
+    #[test]
+    fn deadline_after_never_panics() {
+        let now = Instant::now();
+        assert!(deadline_after(now, Duration::MAX) >= now);
+        assert_eq!(
+            deadline_after(now, Duration::from_millis(10)),
+            now + Duration::from_millis(10)
+        );
     }
 
     #[test]

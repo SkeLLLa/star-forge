@@ -49,6 +49,11 @@ struct ConfigMeta {
     env_patterns: Option<PathBuf>,
     /// The last publish to `env_patterns` failed; the next config check retries it.
     env_patterns_pending: bool,
+    /// Numbers each `reload::publish_env_patterns` call, so a late one never replaces a newer
+    /// file.
+    publish_generation: u64,
+    /// The newest generation that has touched the file; held across the rename (or removal).
+    published_generation: Arc<Mutex<u64>>,
 }
 
 /// Records a config error, logging it to stderr unless it repeats the previous one.
@@ -154,6 +159,8 @@ impl Daemon {
                 last_error: None,
                 env_patterns: None,
                 env_patterns_pending: false,
+                publish_generation: 0,
+                published_generation: Arc::new(Mutex::new(0)),
             }),
             providers,
             last_request: AtomicInstant::new(now),

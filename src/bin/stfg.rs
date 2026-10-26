@@ -8,5 +8,5 @@ mod client;
 mod test_support;
 
 fn main() {
-    client::run_cli(std::env::args().skip(1));
+    client::run_cli(std::env::args_os().skip(1));
 }

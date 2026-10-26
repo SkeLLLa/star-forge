@@ -24,20 +24,20 @@ const NOT_RUNNING_STATUS: i32 = 3;
 const NOT_RUNNING_RELOAD: i32 = 7;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     let Some(cmd) = args.next() else {
         eprintln!("usage: stfgd <get|daemon|status|stop|reload> ...");
         std::process::exit(1);
     };
 
-    match cmd.as_str() {
-        "get" => cmd_get(args),
-        "daemon" => daemon::run(),
-        "status" => cmd_status(),
-        "stop" => cmd_admin("stop", 0),
-        "reload" => cmd_admin("reload", NOT_RUNNING_RELOAD),
-        other => {
-            eprintln!("stfgd: unknown command {other:?}");
+    match cmd.to_str() {
+        Some("get") => cmd_get(args),
+        Some("daemon") => daemon::run(),
+        Some("status") => cmd_status(),
+        Some("stop") => cmd_admin("stop", 0),
+        Some("reload") => cmd_admin("reload", NOT_RUNNING_RELOAD),
+        _ => {
+            eprintln!("stfgd: unknown command {:?}", cmd.to_string_lossy());
             std::process::exit(1);
         }
     }
@@ -45,7 +45,7 @@ fn main() {
 
 /// The hot path: always exits 0, one line per requested badge, never writes to stderr.
 /// Same implementation as `stfg` (see `client.rs`).
-fn cmd_get(args: impl Iterator<Item = String>) {
+fn cmd_get(args: impl Iterator<Item = std::ffi::OsString>) {
     client::run_cli(args);
 }
 

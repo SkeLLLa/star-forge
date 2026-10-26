@@ -43,7 +43,7 @@ query time, and the daemon needs query activity to drive demand-based scheduling
 **Client `get` path** (sync, `std::os::unix::net::UnixStream`, implemented once in `src/client.rs`
 and shared by both binaries — see §3):
 
-1. Compute a deadline `now + 30ms` (`STAR_FORGE_TIMEOUT_MS` override).
+1. Compute a deadline `now + 30ms` (`STAR_FORGE_TIMEOUT_MS` override, capped at one hour).
 2. `lstat()` the runtime dir first: missing → spawn without connecting; anything but a real
    directory (not a symlink) owned by `getuid()` with no group/other write bits → print empty
    lines, exit 0, never spawn (`status`/`stop`/`reload` report "daemon not running"; LSB exit
@@ -67,8 +67,9 @@ The detached daemon spawn runs on a std worker thread bounded by the same deadli
 waits for the spawn result only, never for daemon readiness. The implicit `current_dir()` lookup
 (skipped when `--cwd` is given) runs inline on Linux, where `getcwd(2)` resolves from the dentry
 cache without touching the filesystem, so a dead mount can't stall it. macOS makes no such
-guarantee, so there it runs on a deadline-bounded worker too (timeout → all-empty output). A
-timed-out syscall is not cancelled: the short-lived
+guarantee, so there it runs on a worker started first, overlapping the env scan and connect, and
+awaited after connecting under the same deadline (timeout → all-empty output; a daemon that isn't
+running is still spawned). A timed-out syscall is not cancelled: the short-lived
 client exits without joining its worker. stdout writes and OS scheduling are not real-time
 guarantees, so the deadline bounds the client's own waits, not wall-clock process lifetime.
 
@@ -158,8 +159,10 @@ block for the same reason. No block (an older client) means the daemon's own env
 `Some(selection)` and makes `provider` `env_remove` every daemon variable matching the allowlist but
 absent from the selection, so an unset client variable doesn't leak. An older daemon reads the block
 as unknown badge names, whose lines the client drops (it keeps only as many lines as it asked for).
-If cwd or any badge name contains `\n`, `\r`, or `\x1f`, the client refuses to encode the request at
-all and prints empty lines without connecting (see `client::encode_request`). The daemon answers
+If cwd or any badge name contains `\n` or `\x1f`, the client refuses to encode the request at
+all and prints empty lines without sending it (see `client::encode_request`). Badges and `--cwd`
+are checked before connecting (no connect, no spawn); only a macOS process cwd, read on a worker,
+is checked after. The daemon answers
 with exactly one line per requested badge, in the same order, then closes; a rendered value's own
 `\n`/`\r` are replaced with a space so the line framing can't be broken by badge content. Version
 mismatch (`ver` differs from the daemon's own `CARGO_PKG_VERSION`) → the daemon answers normally,

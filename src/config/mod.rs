@@ -38,7 +38,10 @@ pub enum Scope {
     ProjectRoot,
 }
 
-pub use crate::client::env_matches;
+/// `pattern` is a variable name, or a prefix with one trailing `*`.
+pub fn env_matches(pattern: &str, name: &str) -> bool {
+    crate::client::env_matches_bytes(pattern, name.as_bytes())
+}
 
 impl Config {
     /// Every badge's `env` patterns, sorted and deduplicated: what clients need to send.
