@@ -16,7 +16,8 @@ env:
   CARGO_TERM_COLOR: always
 
 # CI runs plain cargo from rustup (version read from .mise.toml, MSRV from Cargo.toml). mise is
-# for local development only; it would route cargo through mbx.
+# for local development only, where it routes cargo through mbx; the complexity job alone uses
+# it in CI, to install cccc.
 jobs:
   conventional-commits:
     name: Conventional commit messages
@@ -102,6 +103,64 @@ jobs:
         run: jactionlint
       - name: shellcheck
         run: shellcheck -S info scripts/*.sh scripts/*.bats packaging/macos/*.sh packaging/ci/*.sh
+
+  # `mise run lint:complexity`. Its own job: mise installs only cccc here, so the Rust jobs keep
+  # plain cargo from rustup.
+  complexity:
+    name: Complexity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # mise 2026.10.14, pinned by checksum. mise.lock pins the tools (the action adds --locked).
+      # Dependabot bumps the action SHA only: update `version` and `sha256` by hand.
+      - name: Install cccc (version from .mise.toml)
+        uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.14
+          sha256: 50be7185bcf75929f01cc5630276bcb43ca367f7c5b176e2580903d28c611dc4
+          install_args: github:moznion/cccc
+          cache: false
+      # Both rankings, like `mise run lint:complexity`: each run fails on either ceiling but only
+      # lists the offenders it ranks by.
+      - name: Cognitive and cyclomatic complexity (cccc.toml)
+        run: |
+          s=0
+          cccc --top-cognitive 10 src tests || s=$?
+          cccc --top-cyclomatic 10 src tests || s=$?
+          exit "${s}"
+
+  # `mise run lint:fallow` through fallow's action, for its annotations and job summary. The
+  # crate has no JavaScript/TypeScript yet, so it analyzes nothing until some lands.
+  fallow:
+    name: Fallow
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the fallow version from .mise.toml
+        id: fallow
+        run: |
+          set -eu
+          v="$(sed -n 's/^"github:fallow-rs\/fallow" = "\([^"]*\)"$/\1/p' .mise.toml)"
+          test -n "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      # The action checks the binary's SHA-256 and Ed25519 signature for a pinned version.
+      - name: Run fallow
+        uses: fallow-rs/fallow@85fa32733e951df85966842f2bb6a3f2720a940c # v3.37.0
+        with:
+          version: ${{ steps.fallow.outputs.version }}
+          config: fallow.toml
+          # The whole tree, like `mise run lint:fallow`, not only a PR's changed files.
+          auto-changed-since: false
 
   rust-quality:
     name: Rust quality (stable)
@@ -292,7 +351,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-audit
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit@0.22.2
       - name: Audit dependencies
@@ -309,7 +368,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-deny
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-deny@0.20.2
       - name: Check licenses, bans, sources and advisories

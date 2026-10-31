@@ -93,8 +93,10 @@ use the user unit anyway, install a copy pointing at the Cargo binary (see First
 GitHub Actions keeps source verification separate from release automation:
 
 - `ci.yml`: Conventional Commit check, action pin check, workflow lint (jactionlint with
-  shellcheck), stable quality gate, MSRV build, musl and Nix builds, macOS builds (with an ad-hoc
-  run of the signing script), and `cargo audit` on pushes and pull requests.
+  shellcheck), complexity ceilings (cccc, `cccc.toml`), fallow (`fallow.toml`; JavaScript and
+  TypeScript only, so it has nothing to analyze yet), stable quality gate, MSRV build, musl and
+  Nix builds, macOS builds (with an ad-hoc run of the signing script), `cargo audit` and
+  `cargo deny` on pushes and pull requests.
 - `release.yml`: update the version and `CHANGELOG.md` directly on `master`, then create the tag,
   publish the crate, create the GitHub release, build release artifacts, attach them, and publish
   the package repositories.
@@ -120,7 +122,8 @@ GitHub Actions keeps source verification separate from release automation:
   the workflows by hand.
 - Dependabot waits seven days after a release before proposing it (`cooldown`), so a compromised
   version has time to be pulled.
-- `mise run check` runs the same pin check, jactionlint and shellcheck locally.
+- `mise run check` runs the same pin check, jactionlint, shellcheck, cargo-deny, cccc and fallow
+  locally.
 
 The release flow:
 

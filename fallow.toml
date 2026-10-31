@@ -1,0 +1,10 @@
+# fallow: dead code, duplication and complexity of JavaScript/TypeScript (`mise run lint:fallow`).
+# See https://fallow.tools/docs/
+#
+# The crate is Rust only, so fallow finds nothing to analyze today (cccc gates the Rust
+# complexity, cccc.toml). It runs anyway so any JS/TS that lands later is gated from day one,
+# at the same ceilings as cccc.
+
+[health]
+maxCyclomatic = 15
+maxCognitive = 15

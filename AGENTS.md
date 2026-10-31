@@ -21,7 +21,10 @@ Single `star-forge` crate: the `stfgd` daemon and the `stfg` bin (std + libc `ge
 ## Commands
 
 - `mise run check` — fmt-check, clippy (`-D warnings`), tests, docs, Markdown lint
-  (`rumdl`), action pins, jactionlint and shellcheck. Run before declaring work done.
+  (`rumdl`), action pins, jactionlint, shellcheck, cargo-deny, complexity (`cccc`, ceilings in
+  `cccc.toml`) and `fallow`. Run before declaring work done.
+- Keep every function under the `cccc.toml` ceilings by splitting it into cohesive helpers;
+  don't raise the ceilings to make a function fit.
 - `mise run fmt` / `md-fmt` / `lint` / `md-check` / `test` / `build` / `build-release` / `bench`.
 
 ## Conventions

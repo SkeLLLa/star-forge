@@ -1,8 +1,8 @@
 //! Config hot-reload: file identity stamps and the throttled reload check.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::cache::{Entry, Key};
 use super::{Daemon, MAINTENANCE_BUDGET, set_config_error};
@@ -101,31 +101,9 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, check: ReloadCheck, now: I
         (cfg.daemon.config_check, cfg.daemon.palette_from.clone())
     };
     let deadline = tokio::time::Instant::now() + MAINTENANCE_BUDGET;
-    let (path, previous) = loop {
-        let notified = state.reload_finished.notified();
-        let ready = {
-            let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
-            if check == ReloadCheck::Throttled
-                && now.saturating_duration_since(meta.last_checked) < config_check
-            {
-                return;
-            }
-            if meta.checking {
-                None
-            } else {
-                meta.checking = true;
-                meta.last_checked = now;
-                Some((meta.path.clone(), meta.stamp))
-            }
-        };
-        if let Some(ready) = ready {
-            break ready;
-        }
-        if check == ReloadCheck::Throttled
-            || tokio::time::timeout_at(deadline, notified).await.is_err()
-        {
-            return;
-        }
+    let Some((path, previous)) = claim_check(state, check, now, config_check, deadline).await
+    else {
+        return;
     };
     let result = state
         .providers
@@ -148,51 +126,8 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, check: ReloadCheck, now: I
             Some((st, cfg))
         })
         .await;
-    // Set by a successful reload; published once every lock is released.
-    let mut published = None;
-    match result {
-        Ok(Some((st, Ok(new_cfg)))) => {
-            let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
-            meta.stamp = st;
-            meta.last_error = None;
-            drop(meta);
-            let new_cfg = Arc::new(new_cfg);
-            let mut core = state.core();
-            let old_cfg = std::mem::replace(&mut core.config, Arc::clone(&new_cfg));
-            core.cache
-                .retain(|key, entry| retain_entry(&old_cfg, &new_cfg, key, entry));
-            drop(core);
-            state.reschedule.notify_one();
-            published = Some(new_cfg);
-        }
-        Ok(Some((_, Err(e)))) => {
-            let msg = format!("config reload failed, keeping previous config: {e}");
-            set_config_error(
-                &mut state.config_meta.lock().expect("config_meta lock poisoned"),
-                msg,
-            );
-        }
-        Err(why) => {
-            let msg = match why {
-                Rejected::Saturated => "config check skipped: filesystem workers are busy",
-                Rejected::Expired => "config check timed out",
-                Rejected::Panicked => "config check panicked",
-            }
-            .into();
-            set_config_error(
-                &mut state.config_meta.lock().expect("config_meta lock poisoned"),
-                msg,
-            );
-        }
-        // Unchanged stamp: a failed parse never stores it, so any old error was transient.
-        Ok(None) => {
-            state
-                .config_meta
-                .lock()
-                .expect("config_meta lock poisoned")
-                .last_error = None;
-        }
-    }
+    // The config a successful reload swapped in; published once every lock is released.
+    let mut published = apply_check(state, result);
     // A failed earlier publish is retried with the running config.
     if published.is_none()
         && state
@@ -213,6 +148,95 @@ pub(super) async fn check_reload(state: &Arc<Daemon>, check: ReloadCheck, now: I
         .expect("config_meta lock poisoned")
         .checking = false;
     state.reload_finished.notify_waiters();
+}
+
+/// Takes the `checking` flag for this check, returning the config path and the stamp it was
+/// last loaded with. `None` if throttled, or if another check is running and this one is
+/// throttled or out of time; a forced check waits for the running one until `deadline`.
+async fn claim_check(
+    state: &Daemon,
+    check: ReloadCheck,
+    now: Instant,
+    config_check: Duration,
+    deadline: tokio::time::Instant,
+) -> Option<(PathBuf, Stamp)> {
+    loop {
+        let notified = state.reload_finished.notified();
+        {
+            let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
+            if check == ReloadCheck::Throttled
+                && now.saturating_duration_since(meta.last_checked) < config_check
+            {
+                return None;
+            }
+            if !meta.checking {
+                meta.checking = true;
+                meta.last_checked = now;
+                return Some((meta.path.clone(), meta.stamp));
+            }
+        }
+        if check == ReloadCheck::Throttled
+            || tokio::time::timeout_at(deadline, notified).await.is_err()
+        {
+            return None;
+        }
+    }
+}
+
+/// What the blocking stat-and-load found: `None` if the stamp was unchanged, else the stamp
+/// to record and the load result.
+type Loaded = Option<(Stamp, Result<Config, String>)>;
+
+/// Records a finished check: swaps in a reloaded config (pruning the cache against it) or
+/// the reason it failed, and returns the reloaded config for the caller to publish.
+/// Synchronous, so none of its locks can be held across an `.await`.
+fn apply_check(state: &Daemon, result: Result<Loaded, Rejected>) -> Option<Arc<Config>> {
+    match result {
+        Ok(Some((st, Ok(new_cfg)))) => {
+            let mut meta = state.config_meta.lock().expect("config_meta lock poisoned");
+            meta.stamp = st;
+            meta.last_error = None;
+            drop(meta);
+            let new_cfg = Arc::new(new_cfg);
+            let mut core = state.core();
+            let old_cfg = std::mem::replace(&mut core.config, Arc::clone(&new_cfg));
+            core.cache
+                .retain(|key, entry| retain_entry(&old_cfg, &new_cfg, key, entry));
+            drop(core);
+            state.reschedule.notify_one();
+            Some(new_cfg)
+        }
+        Ok(Some((_, Err(e)))) => {
+            let msg = format!("config reload failed, keeping previous config: {e}");
+            set_config_error(
+                &mut state.config_meta.lock().expect("config_meta lock poisoned"),
+                msg,
+            );
+            None
+        }
+        Err(why) => {
+            let msg = match why {
+                Rejected::Saturated => "config check skipped: filesystem workers are busy",
+                Rejected::Expired => "config check timed out",
+                Rejected::Panicked => "config check panicked",
+            }
+            .into();
+            set_config_error(
+                &mut state.config_meta.lock().expect("config_meta lock poisoned"),
+                msg,
+            );
+            None
+        }
+        // Unchanged stamp: a failed parse never stores it, so any old error was transient.
+        Ok(None) => {
+            state
+                .config_meta
+                .lock()
+                .expect("config_meta lock poisoned")
+                .last_error = None;
+            None
+        }
+    }
 }
 
 /// Whether a reload keeps `key`'s entry, resetting it if its badge changed. An unchanged

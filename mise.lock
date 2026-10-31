@@ -189,51 +189,139 @@ checksum = "sha256:f706a44c55b9fce9c854f2dd426e64788ced848e8e1cd8538ad8d9fcdca2f
 url = "https://github.com/dmtrKovalenko/fff/releases/download/v0.11.0/x86_64-pc-windows-msvc.dll"
 url_api = "https://api.github.com/repos/dmtrKovalenko/fff/releases/assets/578309711"
 
+[[tools."github:fallow-rs/fallow"]]
+version = "3.37.0"
+backend = "github:fallow-rs/fallow"
+specifiers = ["3.37.0"]
+
+[tools."github:fallow-rs/fallow"."platforms.linux-arm64"]
+checksum = "sha256:cbbf98681687fd2f43be852f15aab8ad34fb51cf6f7e354d3bdc1a9b7cba9c5a"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682720947"
+provenance = "github-attestations"
+
+[tools."github:fallow-rs/fallow"."platforms.linux-arm64-musl"]
+checksum = "sha256:8b43b327c6c7ccebbc49279a51605116032a50a089a165392506155db543be5d"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682720995"
+provenance = "github-attestations"
+
+[tools."github:fallow-rs/fallow"."platforms.linux-x64"]
+checksum = "sha256:7c09d9b7812be030951f75ebfdd98a4e23ecaee6260c34d7e7f3a6c28a0c3cf0"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682812889"
+provenance = "github-attestations"
+
+[tools."github:fallow-rs/fallow"."platforms.linux-x64-musl"]
+checksum = "sha256:af036ba15ce7e1a4dc981f9a59f07fb0eb61b3e6a89c5270a243d8184eda2d88"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682816484"
+provenance = "github-attestations"
+
+[tools."github:fallow-rs/fallow"."platforms.macos-arm64"]
+checksum = "sha256:02caed6d3da52ea5ffff84b8619bc399a9302c5c6748633177db64005895a159"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682720860"
+provenance = "github-attestations"
+
+[tools."github:fallow-rs/fallow"."platforms.macos-x64"]
+checksum = "sha256:abf1897d6521dbd8fbfb01a4add5070538fdb7cde049090f991780fd3576acc6"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682801832"
+provenance = "github-attestations"
+
+[tools."github:fallow-rs/fallow"."platforms.windows-x64"]
+checksum = "sha256:f20ad53eb2190e9ab04288a58068f568699757744fccf5adca216a5250789134"
+url = "https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/fallow-rs/fallow/releases/assets/682802512"
+provenance = "github-attestations"
+
 [[tools."github:jdx/packslip"]]
-version = "1.11.0"
+version = "1.11.3"
 backend = "github:jdx/packslip"
-specifiers = ["1.11.0"]
+specifiers = ["1.11.3"]
 
 [tools."github:jdx/packslip"."platforms.linux-arm64"]
-checksum = "sha256:42574c6cbb44483ba57ce6ce22069be827c5f2ea37246eae5f47a398200fb155"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip-v1.11.0-linux-arm64.tar.xz"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517564"
+checksum = "sha256:32a7698f499b270327832d62869e9eaa0449fa689eed7941ac2668f36c130389"
+url = "https://github.com/jdx/packslip/releases/download/v1.11.3/packslip-v1.11.3-linux-arm64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/693759071"
 provenance = "github-attestations"
 
 [tools."github:jdx/packslip"."platforms.linux-arm64-musl"]
-checksum = "sha256:42574c6cbb44483ba57ce6ce22069be827c5f2ea37246eae5f47a398200fb155"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip-v1.11.0-linux-arm64.tar.xz"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517564"
+checksum = "sha256:32a7698f499b270327832d62869e9eaa0449fa689eed7941ac2668f36c130389"
+url = "https://github.com/jdx/packslip/releases/download/v1.11.3/packslip-v1.11.3-linux-arm64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/693759071"
 provenance = "github-attestations"
 
 [tools."github:jdx/packslip"."platforms.linux-x64"]
-checksum = "sha256:0ddf1c710c05a03a0a7f2717233500f0745501723d3c699881f7f6e643b40dd4"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip-v1.11.0-linux-x64.tar.xz"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517618"
+checksum = "sha256:26efeca080b011c310f90bcd2f57cd78b4a364552831ed84f5216c7cba0932ad"
+url = "https://github.com/jdx/packslip/releases/download/v1.11.3/packslip-v1.11.3-linux-x64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/693759188"
 provenance = "github-attestations"
 
 [tools."github:jdx/packslip"."platforms.linux-x64-musl"]
-checksum = "sha256:0ddf1c710c05a03a0a7f2717233500f0745501723d3c699881f7f6e643b40dd4"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip-v1.11.0-linux-x64.tar.xz"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517618"
+checksum = "sha256:26efeca080b011c310f90bcd2f57cd78b4a364552831ed84f5216c7cba0932ad"
+url = "https://github.com/jdx/packslip/releases/download/v1.11.3/packslip-v1.11.3-linux-x64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/693759188"
 provenance = "github-attestations"
 
 [tools."github:jdx/packslip"."platforms.macos-arm64"]
-checksum = "sha256:4031d37e8aecd0c72668a080b0ca63d4c27f534955512f1bbd0f84f234e6bb28"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip-v1.11.0-darwin-arm64.tar.xz"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517527"
-provenance = "github-attestations"
-
-[tools."github:jdx/packslip"."platforms.macos-x64"]
-checksum = "sha256:44e45fcf0dc03e102c95eb453ccb1209b47ff993ef7a1345e495900ea8bd22c8"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip.1"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517717"
+checksum = "sha256:25985ece3e3ab5ad2d0f9d7c1da03218507e9d0c170392d72b830e02348c27cc"
+url = "https://github.com/jdx/packslip/releases/download/v1.11.3/packslip-v1.11.3-darwin-arm64.tar.xz"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/693758977"
 provenance = "github-attestations"
 
 [tools."github:jdx/packslip"."platforms.windows-x64"]
-checksum = "sha256:88e90a7ba0a8000b9953d22658ea9e51c7daa09fa620c123ec05f6f262b3d9b7"
-url = "https://github.com/jdx/packslip/releases/download/v1.11.0/packslip-v1.11.0-windows-x64.zip"
-url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/667517702"
+checksum = "sha256:6de57a9e75ec895074c1b7b4f2a692e77b7e929f4f2a3daed247e1c2e7046a7c"
+url = "https://github.com/jdx/packslip/releases/download/v1.11.3/packslip-v1.11.3-windows-x64.zip"
+url_api = "https://api.github.com/repos/jdx/packslip/releases/assets/693759353"
+provenance = "github-attestations"
+
+[[tools."github:moznion/cccc"]]
+version = "1.8.5"
+backend = "github:moznion/cccc"
+specifiers = ["1.8.5"]
+
+[tools."github:moznion/cccc"."platforms.linux-arm64"]
+checksum = "sha256:62004c8f7bfd5c452a5e0afe54248919d7f3156ab707c24d33715566ffc3182e"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651439"
+provenance = "github-attestations"
+
+[tools."github:moznion/cccc"."platforms.linux-arm64-musl"]
+checksum = "sha256:62004c8f7bfd5c452a5e0afe54248919d7f3156ab707c24d33715566ffc3182e"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651439"
+provenance = "github-attestations"
+
+[tools."github:moznion/cccc"."platforms.linux-x64"]
+checksum = "sha256:7419ea8d8828c3d405694be400da1b21cdb854e9af1c10110d5d970bc1700094"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651485"
+provenance = "github-attestations"
+
+[tools."github:moznion/cccc"."platforms.linux-x64-musl"]
+checksum = "sha256:7419ea8d8828c3d405694be400da1b21cdb854e9af1c10110d5d970bc1700094"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651485"
+provenance = "github-attestations"
+
+[tools."github:moznion/cccc"."platforms.macos-arm64"]
+checksum = "sha256:486ded852eaa3483956acde058e32b3616a4883c84ba1f424852680e61963801"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651449"
+provenance = "github-attestations"
+
+[tools."github:moznion/cccc"."platforms.macos-x64"]
+checksum = "sha256:9ef0ad139665f0ecccecbb183cc851c87068d7bbf4fb9f1e572387b871a47ea8"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651463"
+provenance = "github-attestations"
+
+[tools."github:moznion/cccc"."platforms.windows-x64"]
+checksum = "sha256:da6c0b70c6c9610807bf796ea37f00cdeb2a70c7af7b6b949c5b84b2b8738986"
+url = "https://github.com/moznion/cccc/releases/download/v1.8.5/cccc-v1.8.5-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/moznion/cccc/releases/assets/683651471"
 provenance = "github-attestations"
 
 [[tools."github:redhat-et/ripwire"]]

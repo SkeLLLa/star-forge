@@ -157,6 +157,8 @@ const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_PATH_EVICT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_MAX_PATHS: usize = 256;
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
+/// The shortest `interval`/`battery_interval` [`validate`] accepts.
+const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `[daemon]`, fully resolved: every field is a concrete value, defaulted per the schema in
 /// design.md §7 (no derived formulas — `battery_interval`'s only fallback is `interval`
@@ -527,11 +529,37 @@ fn resolve_group(
 /// Rejects a config whose resolved values would make the scheduler misbehave: this runs
 /// after every value is resolved, so it sees the same numbers the scheduler will use.
 fn validate(daemon: &DaemonConfig, badge: &BTreeMap<String, BadgeConfig>) -> Result<(), String> {
-    let one_sec = Duration::from_secs(1);
-    if daemon.interval < one_sec {
+    validate_daemon(daemon)?;
+
+    // coalesce must stay smaller than every resolved interval, or a batch of refreshes due
+    // seconds apart would collapse into the same wakeup as ones due a full interval apart.
+    let mut intervals = vec![
+        ("daemon.interval", daemon.interval),
+        ("daemon.battery_interval", daemon.battery_interval),
+    ];
+    for (name, cfg) in badge {
+        validate_badge(name, cfg)?;
+        intervals.push((name.as_str(), cfg.interval));
+        intervals.push((name.as_str(), cfg.battery_interval));
+    }
+    for (ctx, interval) in intervals {
+        if daemon.coalesce >= interval {
+            return Err(format!(
+                "daemon.coalesce ({:?}) must be < every resolved interval, but {ctx} resolves to {:?}",
+                daemon.coalesce, interval
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// [`validate`]'s checks on `[daemon]` values that stand alone.
+fn validate_daemon(daemon: &DaemonConfig) -> Result<(), String> {
+    if daemon.interval < MIN_INTERVAL {
         return Err("daemon.interval must be >= 1s".to_string());
     }
-    if daemon.battery_interval < one_sec {
+    if daemon.battery_interval < MIN_INTERVAL {
         return Err("daemon.battery_interval must be >= 1s".to_string());
     }
     // Zero would retry a failing badge immediately, in a tight loop (`retry_max` can't be 0
@@ -554,35 +582,20 @@ fn validate(daemon: &DaemonConfig, badge: &BTreeMap<String, BadgeConfig>) -> Res
     if daemon.max_paths < 1 {
         return Err("daemon.max_paths must be >= 1".to_string());
     }
+    Ok(())
+}
 
-    // coalesce must stay smaller than every resolved interval, or a batch of refreshes due
-    // seconds apart would collapse into the same wakeup as ones due a full interval apart.
-    let mut intervals = vec![
-        ("daemon.interval", daemon.interval),
-        ("daemon.battery_interval", daemon.battery_interval),
-    ];
-    for (name, cfg) in badge {
-        if cfg.interval < one_sec {
-            return Err(format!("badge {name}.interval must be >= 1s"));
-        }
-        if cfg.battery_interval < one_sec {
-            return Err(format!("badge {name}.battery_interval must be >= 1s"));
-        }
-        if cfg.timeout == Duration::ZERO {
-            return Err(format!("badge {name}.timeout must be > 0"));
-        }
-        intervals.push((name.as_str(), cfg.interval));
-        intervals.push((name.as_str(), cfg.battery_interval));
+/// [`validate`]'s checks on one resolved badge.
+fn validate_badge(name: &str, cfg: &BadgeConfig) -> Result<(), String> {
+    if cfg.interval < MIN_INTERVAL {
+        return Err(format!("badge {name}.interval must be >= 1s"));
     }
-    for (ctx, interval) in intervals {
-        if daemon.coalesce >= interval {
-            return Err(format!(
-                "daemon.coalesce ({:?}) must be < every resolved interval, but {ctx} resolves to {:?}",
-                daemon.coalesce, interval
-            ));
-        }
+    if cfg.battery_interval < MIN_INTERVAL {
+        return Err(format!("badge {name}.battery_interval must be >= 1s"));
     }
-
+    if cfg.timeout == Duration::ZERO {
+        return Err(format!("badge {name}.timeout must be > 0"));
+    }
     Ok(())
 }
 

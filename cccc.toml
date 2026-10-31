@@ -1,0 +1,5 @@
+# cccc: cognitive and cyclomatic complexity of the Rust sources (`mise run lint:complexity`).
+# 15 is SonarQube's default cognitive ceiling and fallow's (fallow.toml uses the same numbers).
+max-cognitive = 15
+max-cyclomatic = 15
+table = true

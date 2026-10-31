@@ -318,65 +318,20 @@ async fn resolve(
     let power = refresh_power_if_due(state, now);
     maybe_evict_idle(state, cfg, now);
 
+    let pass = Pass {
+        state,
+        cfg,
+        cwd,
+        env,
+        snapshot: &snapshot,
+        timed_out,
+        now,
+        power,
+    };
     let mut values = BTreeMap::new();
     let mut cold_waiters: Vec<ColdWaiter> = Vec::new();
-
     for name in badges {
-        let Some(badge_cfg) = cfg.badge.get(name) else {
-            values.insert(name.clone(), String::new());
-            continue;
-        };
-
-        // Fresh in-process git values were computed on a worker, never on the reactor.
-        if let Some(value) = snapshot.immediate.get(name) {
-            values.insert(name.clone(), value.clone());
-            continue;
-        }
-
-        let is_path_scoped = badge_cfg.scope != Scope::Global;
-        if is_path_scoped && timed_out {
-            // Root unknown: serve what is cached, spawn nothing.
-            let stale = cwd.map_or_else(String::new, |c| stale_value(state, name, Path::new(c)));
-            values.insert(name.clone(), stale);
-            continue;
-        }
-        let resolved = snapshot.scoped.get(name);
-        let scope = resolved.and_then(|r| r.root.clone());
-        if is_path_scoped && scope.is_none() {
-            // No git repo / project root, or `when_file` unmet: render empty, no fetch at all.
-            values.insert(name.clone(), String::new());
-            continue;
-        }
-        let current_watch = resolved.and_then(|r| r.watch.as_ref());
-        let key = cache::Key::new(name.as_str(), scope, select_env(&badge_cfg.path.env, env));
-        let current_fp = needs_fingerprint(&badge_cfg.source)
-            .then_some(snapshot.fingerprint)
-            .flatten();
-
-        let (plan, identity, current_value) = plan_badge(
-            state,
-            cfg.daemon.max_paths,
-            &key,
-            now,
-            cache::effective_interval(badge_cfg, power),
-            current_fp,
-            current_watch,
-        );
-
-        if plan.spawn {
-            let done = plan.cold.then(|| {
-                let (tx, rx) = oneshot::channel();
-                cold_waiters.push(ColdWaiter {
-                    name: name.clone(),
-                    key: key.clone(),
-                    rx,
-                });
-                tx
-            });
-            spawn_fetch(Arc::clone(state), key, identity, Arc::clone(cfg), done);
-        }
-
-        values.insert(name.clone(), current_value.unwrap_or_default());
+        values.insert(name.clone(), pass.badge_value(name, &mut cold_waiters));
     }
 
     if !cold_waiters.is_empty() {
@@ -387,6 +342,85 @@ async fn resolve(
     }
 
     Outcome::Done(values)
+}
+
+/// What every badge of one [`resolve`] pass shares.
+struct Pass<'a> {
+    state: &'a Arc<Daemon>,
+    cfg: &'a Arc<Config>,
+    cwd: Option<&'a str>,
+    env: Option<&'a [(&'a str, &'a str)]>,
+    snapshot: &'a GitSnapshot,
+    /// The filesystem snapshot timed out: path-scoped roots are unknown.
+    timed_out: bool,
+    now: Instant,
+    power: cache::Power,
+}
+
+impl Pass<'_> {
+    /// `name`'s value for this request: a fresh in-process git value, else the cached one
+    /// (empty if none yet). Starts a fetch if one is due; a cold key's fetch also joins
+    /// `cold_waiters`. Synchronous, so no reload can land while it runs.
+    fn badge_value(&self, name: &str, cold_waiters: &mut Vec<ColdWaiter>) -> String {
+        let Some(badge_cfg) = self.cfg.badge.get(name) else {
+            return String::new();
+        };
+
+        // Fresh in-process git values were computed on a worker, never on the reactor.
+        if let Some(value) = self.snapshot.immediate.get(name) {
+            return value.clone();
+        }
+
+        let is_path_scoped = badge_cfg.scope != Scope::Global;
+        if is_path_scoped && self.timed_out {
+            // Root unknown: serve what is cached, spawn nothing.
+            return self
+                .cwd
+                .map_or_else(String::new, |c| stale_value(self.state, name, Path::new(c)));
+        }
+        let resolved = self.snapshot.scoped.get(name);
+        let scope = resolved.and_then(|r| r.root.clone());
+        if is_path_scoped && scope.is_none() {
+            // No git repo / project root, or `when_file` unmet: render empty, no fetch at all.
+            return String::new();
+        }
+        let current_watch = resolved.and_then(|r| r.watch.as_ref());
+        let key = cache::Key::new(name, scope, select_env(&badge_cfg.path.env, self.env));
+        let current_fp = needs_fingerprint(&badge_cfg.source)
+            .then_some(self.snapshot.fingerprint)
+            .flatten();
+
+        let (plan, identity, current_value) = plan_badge(
+            self.state,
+            self.cfg.daemon.max_paths,
+            &key,
+            self.now,
+            cache::effective_interval(badge_cfg, self.power),
+            current_fp,
+            current_watch,
+        );
+
+        if plan.spawn {
+            let done = plan.cold.then(|| {
+                let (tx, rx) = oneshot::channel();
+                cold_waiters.push(ColdWaiter {
+                    name: name.to_owned(),
+                    key: key.clone(),
+                    rx,
+                });
+                tx
+            });
+            spawn_fetch(
+                Arc::clone(self.state),
+                key,
+                identity,
+                Arc::clone(self.cfg),
+                done,
+            );
+        }
+
+        current_value.unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

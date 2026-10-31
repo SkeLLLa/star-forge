@@ -258,15 +258,15 @@ Other builtins: `battery`, `hostname`, `load_avg`, `mem_used_percent`, `uptime`,
 ## Benchmarks
 
 `stfg` with a warm cache against running the same work directly, as a starship `[custom.*]`
-module would. Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on an Intel Core
-Ultra 7 165H (Linux, release build), in the star-forge repository itself:
+module would. Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on an AMD Ryzen AI
+9 365 (Linux, release build), in the star-forge repository itself:
 
 | Work | `stfg` | Bare command | Speedup |
 | --- | ---: | ---: | ---: |
-| Branch name (`git branch --show-current`) | 0.79 ms | 1.06 ms | 1.3× |
-| Modified count (`git status --porcelain=v2 --branch`) | 0.78 ms | 1.63 ms | 2.1× |
-| 300 ms command (`sh -c 'sleep 0.3; echo ok'`) | 0.76 ms | 302.7 ms | 399× |
-| All three in one group vs. all three commands | 0.80 ms | 305.9 ms | 380× |
+| Branch name (`git branch --show-current`) | 0.63 ms | 1.07 ms | 1.7× |
+| Modified count (`git status --porcelain=v2 --branch`) | 0.64 ms | 1.79 ms | 2.8× |
+| 300 ms command (`sh -c 'sleep 0.3; echo ok'`) | 0.61 ms | 303.8 ms | 496× |
+| All three in one group vs. all three commands | 0.64 ms | 308.2 ms | 484× |
 
 Most of an `stfg` call is starting the process; the daemon's share is about 0.14 ms, measured
 separately (see [batching calls](docs/configuration.md#batching-calls)). The `sleep` stands in
@@ -288,7 +288,7 @@ are also written to `bench/results.md` under Cargo's target directory.
 ```sh
 mise install          # Rust toolchain, mr-boxington, linters
 mise run build        # debug build; `mise run build-release` for target/release/{stfg,stfgd}
-mise run check        # fmt-check, clippy, tests, docs, Markdown lint
+mise run check        # fmt-check, clippy, tests, docs, Markdown lint, complexity, fallow
 ```
 
 The mise tasks run Cargo through [Mr Boxington](https://mr-boxington.jdx.dev) (`mbx`), which

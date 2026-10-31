@@ -319,34 +319,11 @@ impl Parser<'_> {
                     _ => '\\',
                 },
                 '{' => {
-                    let name = self.until('}', at)?;
-                    if name.is_empty()
-                        || !name
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                    {
-                        return Err(format!("at {}: invalid variable name `{name}`", at + 1));
-                    }
-                    if !self.vars.contains(&name) {
-                        self.vars.push(name.clone());
-                    }
-                    nodes.push(Node::Var(name));
+                    nodes.push(self.var(at)?);
                     continue;
                 }
                 '[' => {
-                    let children = self.seq(Some(']'), at)?;
-                    if self.chars.get(self.pos) != Some(&'(') {
-                        return Err(format!(
-                            "at {}: `]` must be followed by `(style)`",
-                            self.pos
-                        ));
-                    }
-                    let sat = self.pos;
-                    self.pos += 1;
-                    let style = self.until(')', sat)?;
-                    let ops = parse_style(&style, self.pal)
-                        .map_err(|e| format!("at {}: {e}", sat + 1))?;
-                    nodes.push(Node::Span(ops, children));
+                    nodes.push(self.span(at)?);
                     continue;
                 }
                 '(' => {
@@ -367,6 +344,39 @@ impl Parser<'_> {
                 _ => nodes.push(Node::Text(lit.to_string())),
             }
         }
+    }
+
+    /// A `{name}` variable whose `{` (at `at`) was just consumed; records the name in first-use
+    /// order.
+    fn var(&mut self, at: usize) -> Result<Node, String> {
+        let name = self.until('}', at)?;
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!("at {}: invalid variable name `{name}`", at + 1));
+        }
+        if !self.vars.contains(&name) {
+            self.vars.push(name.clone());
+        }
+        Ok(Node::Var(name))
+    }
+
+    /// A `[text](style)` span whose `[` (at `at`) was just consumed.
+    fn span(&mut self, at: usize) -> Result<Node, String> {
+        let children = self.seq(Some(']'), at)?;
+        if self.chars.get(self.pos) != Some(&'(') {
+            return Err(format!(
+                "at {}: `]` must be followed by `(style)`",
+                self.pos
+            ));
+        }
+        let sat = self.pos;
+        self.pos += 1;
+        let style = self.until(')', sat)?;
+        let ops = parse_style(&style, self.pal).map_err(|e| format!("at {}: {e}", sat + 1))?;
+        Ok(Node::Span(ops, children))
     }
 
     /// Raw text up to (and consuming) `end`; no nesting or escapes.
@@ -405,27 +415,39 @@ fn render(
                     any = true;
                 }
             }
-            Node::Span(ops, children) => {
-                let mut eff = parent.clone();
-                eff.apply(ops);
-                let mut inner = String::new();
-                any |= render(children, get, d, &eff, &mut inner);
-                if inner.is_empty() {
-                    continue;
-                }
-                if eff == *parent {
-                    out.push_str(&inner);
-                    continue;
-                }
-                let plain = Style::default();
-                out.push_str(&d.open(&eff, *parent != plain));
-                out.push_str(&inner);
-                out.push_str(d.close());
-                if *parent != plain {
-                    out.push_str(&d.restore(parent));
-                }
-            }
+            Node::Span(ops, children) => any |= render_span(ops, children, get, d, parent, out),
         }
+    }
+    any
+}
+
+/// Renders a `[..](style)` span: `parent` with `ops` applied, re-emitting a non-plain `parent`
+/// after it closes. Returns whether a variable inside it was non-empty.
+fn render_span(
+    ops: &[Op],
+    children: &[Node],
+    get: &dyn Fn(&str) -> String,
+    d: Dialect,
+    parent: &Style,
+    out: &mut String,
+) -> bool {
+    let mut eff = parent.clone();
+    eff.apply(ops);
+    let mut inner = String::new();
+    let any = render(children, get, d, &eff, &mut inner);
+    if inner.is_empty() {
+        return any;
+    }
+    if eff == *parent {
+        out.push_str(&inner);
+        return any;
+    }
+    let plain = Style::default();
+    out.push_str(&d.open(&eff, *parent != plain));
+    out.push_str(&inner);
+    out.push_str(d.close());
+    if *parent != plain {
+        out.push_str(&d.restore(parent));
     }
     any
 }

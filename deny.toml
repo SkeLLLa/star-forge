@@ -19,11 +19,10 @@ yanked = "deny"
 ignore = []
 
 [licenses]
-# Each one can be combined into a GPL-3.0-or-later work.
+# What the dependency graph needs; each one can be combined into a GPL-3.0-or-later work. Add
+# a license here only when a new dependency requires it (cargo-deny warns about unused ones).
 allow = [
   "Apache-2.0",
-  "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
   "BSD-3-Clause",
   "CC0-1.0",
   "GPL-3.0-or-later",
@@ -32,7 +31,6 @@ allow = [
   "MIT-0",
   "Unicode-3.0",
   "Unlicense",
-  "Zlib",
 ]
 confidence-threshold = 0.9
 

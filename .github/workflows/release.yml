@@ -828,7 +828,7 @@ jobs:
       # consumers pick by host libc.
       - name: Sign packslip manifest
         id: packslip
-        uses: jdx/packslip@7d397618045bd98b76cd5cb8177767b2f52789b8 # v1.10.1
+        uses: jdx/packslip@44e50e5f64551234b4a382d991bd7f7f7d021d06 # v1.11.3
         with:
           download: star-forge-*-unknown-linux-*.tar.gz star-forge-*-apple-darwin.tar.gz
           bin: stfgd stfg
@@ -879,11 +879,14 @@ jobs:
     env:
       # Signer fingerprint published in README.md; constant across releases.
       PACKSLIP_PIN: ps1_iqg6ch676syauz3nb3hluddyku
+      # Only release.yml on master signs; no other workflow or branch.
+      PACKSLIP_WORKFLOW: .github/workflows/release.yml@refs/heads/master
     steps:
+      # The version .mise.toml pins, as users of `packslip install` run it.
       - name: Install packslip
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: packslip@1.6.0
+          tool: packslip@1.11.3
 
       # Check what users download: the public release URLs, not this run's local files.
       - name: Verify manifest against published tarballs
@@ -902,7 +905,7 @@ jobs:
           done
           curl -fsSLO --retry 3 "${base}/packslip.sigstore.json"
           packslip verify packslip.sigstore.json \
-            --identity-prefix "https://github.com/${GITHUB_REPOSITORY}/" \
+            --identity "https://github.com/${GITHUB_REPOSITORY}/${PACKSLIP_WORKFLOW}" \
             --issuer https://token.actions.githubusercontent.com \
             --pin "${PACKSLIP_PIN}" \
             "${args[@]}"
