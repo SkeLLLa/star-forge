@@ -1,6 +1,10 @@
 [workspace]
 changelog_update = true
 git_release_enable = true
+# Immutable releases: release-plz creates a draft, release.yml attaches every asset and the
+# packslip bundle, then publishes it (publish-packslip). A draft can't be marked latest.
+git_release_draft = true
+git_release_latest = false
 release_always = true
 semver_check = false
 

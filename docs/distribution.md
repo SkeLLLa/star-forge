@@ -132,7 +132,9 @@ The release flow:
 2. `release-plz` analyzes commit history on `master`.
 3. `release-plz update` edits the next version and `CHANGELOG.md` in the workflow checkout.
 4. The workflow commits that release bump directly back to `master` (`[skip ci]`).
-5. `release-plz release` creates the tag, publishes to crates.io, and creates the GitHub release.
+5. `release-plz release` creates the tag, publishes to crates.io, and creates the GitHub release
+   as a **draft**. Releases are immutable once published, so it stays a draft until every asset
+   is attached (step 10).
 6. Three read-only build jobs check out the tag; the Linux ones run once per architecture
    (`x86_64` and `aarch64`), each on a native runner:
    - `linux-assets` builds the optimized gnu binaries, replaces `stfg` with the static musl build
@@ -150,15 +152,16 @@ The release flow:
    from them and the nine releases before. It doesn't deploy them yet.
 8. `checksums` writes one `.sha256` sidecar per artifact plus `SHA256SUMS`, and attests the build
    provenance of every artifact.
-9. `publish-assets` attaches the artifacts and checksums to the GitHub release and appends the
+9. `publish-assets` attaches the artifacts and checksums to the draft release and appends the
    macOS signing note to the release notes.
 10. `jdx/packslip` then signs a `packslip.sigstore.json` manifest covering the gnu, musl, and macOS
     tarballs (used by `packslip install` and the `mise` packslip backend), recording the commit
-    the tag points to. The signing job has read-only access; a separate job uploads the bundle,
-    and a third verifies it against the published tarballs and the signer fingerprint in
-    `README.md`.
-11. `pages` deploys the repositories `packages` built to GitHub Pages, once the release assets
-    are public.
+    the tag points to. The signing job has read-only access and signs this run's tarball
+    artifacts; a separate job uploads the bundle and then publishes the release, which makes it
+    immutable; a third verifies the bundle against the published tarballs and the signer
+    fingerprint in `README.md`.
+11. `pages` deploys the site `packages` built (the repositories, the Nix flake and the landing
+    page) to GitHub Pages, once the release is published.
 
 The release workflow uses the default `GITHUB_TOKEN` for repository operations. It does not depend
 on a PAT to trigger a second workflow.
