@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.1](https://github.com/SkeLLLa/star-forge/compare/v1.10.0...v1.10.1) - 2026-11-13
+
+### Fixed
+
+- *(release)* keep the GitHub release a draft until its assets and packslip bundle are attached.
+  v1.10.0 was published before its assets could be uploaded and, as releases are immutable, has
+  none; install 1.10.1 instead.
+
 ## [1.10.0](https://github.com/SkeLLLa/star-forge/compare/v1.9.0...v1.10.0) - 2026-11-13
 
 ### Added
