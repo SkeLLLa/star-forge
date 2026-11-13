@@ -1,4 +1,4 @@
-{ lib, rustPlatform, stdenv }:
+{ lib, rustPlatform, stdenv, pkg-config, aws-lc }:
 
 rustPlatform.buildRustPackage {
   pname = "star-forge";
@@ -10,6 +10,11 @@ rustPlatform.buildRustPackage {
     filter = path: _: baseNameOf path != "target";
   };
   cargoLock.lockFile = ../../Cargo.lock;
+
+  # nixpkgs' cargo setup hook sets AWS_LC_SYS_USE_SYSTEM=1, so aws-lc-sys (rustls via reqwest)
+  # links nixpkgs' aws-lc instead of building its bundled copy.
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ aws-lc ];
 
   # Integration tests spawn a daemon and use sockets/$HOME; not reliable in the Nix sandbox.
   doCheck = false;
