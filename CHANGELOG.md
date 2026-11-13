@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0](https://github.com/SkeLLLa/star-forge/compare/v1.9.0...v1.10.0) - 2026-11-13
+
+### Added
+
+- *(release)* publish a prebuilt Nix flake and a packslip card with pkg-pages 1.1.0
+
 ## [1.9.0](https://github.com/SkeLLLa/star-forge/compare/v1.8.0...v1.9.0) - 2026-10-31
 
 ### Added
