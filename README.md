@@ -130,7 +130,10 @@ mise use -g github:SkeLLLa/star-forge
 # packslip. Checks the signed release manifest before it installs into ~/.local/bin.
 packslip install github.com/SkeLLLa/star-forge --pin ps1_iqg6ch676syauz3nb3hluddyku
 
-# Nix. Builds from source; on Linux it also installs the user service.
+# Nix, prebuilt (Linux). Installs the release's static binaries, pinned by SHA-256.
+nix profile install https://skellla.github.io/star-forge/nix/flake.tar.gz
+
+# Nix, from source. On Linux it also installs the user service.
 nix profile install github:SkeLLLa/star-forge
 
 # cargo. Builds from crates.io.
