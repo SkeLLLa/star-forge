@@ -455,6 +455,19 @@ nix profile install github:SkeLLLa/star-forge
 
 The flake builds from source (`packaging/nix/package.nix`) and, on Linux, installs the systemd
 user unit to `lib/systemd/user/` with `ExecStart` pointing at the store path.
+`flake.lock` pins nixpkgs; refresh it with `nix flake update`. nixpkgs' Rust builds link the
+system AWS-LC, so `package.nix` adds `aws-lc` and `pkg-config` for `aws-lc-sys`.
+
+Linux users can also install the prebuilt static binaries without building anything:
+
+```bash
+nix profile install https://skellla.github.io/star-forge/nix/flake.tar.gz
+```
+
+`packages` publishes that flake on the Pages site (pkg-pages' `nix-*` inputs). It names the
+release's `x86_64` and `aarch64` musl tarballs by URL and SHA-256, and installs `stfg` and
+`stfgd`; it ships no systemd unit. The flake itself is not signed: it is trusted through HTTPS and
+the hashes it pins.
 
 ### mise
 

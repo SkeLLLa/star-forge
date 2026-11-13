@@ -301,13 +301,13 @@ jobs:
   # See https://github.com/ziptie-soft/pkg-pages/blob/master/docs/actions.md#publish-reusable-workflow
   packages:
     name: Linux packages and repositories
-    needs: [release, linux-assets]
+    needs: [release, linux-assets, linux-musl-assets]
     if: ${{ needs.release.outputs.released == 'true' }}
     permissions:
       contents: read
       pages: write # publish.yml's deploy job declares it; deploy is false here
       id-token: write
-    uses: ziptie-soft/pkg-pages/.github/workflows/publish.yml@76f377330743d249eeb5aa151220f38e4062ef6e # v1.0.0
+    uses: ziptie-soft/pkg-pages/.github/workflows/publish.yml@5ff7ea06ab279291e2d604f596bac44bdeaeb160 # v1.1.0
     with:
       version: ${{ needs.release.outputs.version }}
       tag: ${{ needs.release.outputs.tag_name }}
@@ -316,6 +316,16 @@ jobs:
       rpm-artifacts: release-linux-rpm-*
       name: star-forge
       description: Cached statusline badges for starship, tmux and other prompts.
+      # A hash-pinned Nix flake on the site (<base-url>/nix/flake.tar.gz) that installs the static
+      # musl tarballs of this release; publish-assets attaches them before `pages` deploys.
+      nix-artifacts: release-linux-musl-*
+      nix-archives: |
+        x86_64-linux=star-forge-${{ needs.release.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+        aarch64-linux=star-forge-${{ needs.release.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
+      nix-binaries: bin/stfg bin/stfgd
+      # The landing page's packslip and mise card; the bundle comes from the `packslip` jobs.
+      packslip: true
+      packslip-pin: ps1_iqg6ch676syauz3nb3hluddyku
       # Overrides the URL for a custom domain; empty: https://skellla.github.io/star-forge
       base-url: ${{ vars.PAGES_BASE_URL }}
       deb-architectures: amd64 arm64
