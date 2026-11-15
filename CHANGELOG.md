@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.2](https://github.com/SkeLLLa/star-forge/compare/v1.10.1...v1.10.2) - 2026-11-15
+
+### Fixed
+
+- *(deps)* bump toml
+
+### Other
+
+- *(release)* upgrade ziptie-soft/pkg-pages to v2.0.0
+
 ## [1.10.1](https://github.com/SkeLLLa/star-forge/compare/v1.10.0...v1.10.1) - 2026-11-13
 
 ### Fixed
