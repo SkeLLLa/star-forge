@@ -73,13 +73,20 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --component clippy,rustfmt
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: clippy,rustfmt
+          cache: false
+          build-warnings: warn
       - name: Run quality checks
         run: |
           cargo fmt --all -- --check
@@ -112,13 +119,19 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          cache: false
+          build-warnings: warn
 
       - name: Authenticate to crates.io (trusted publishing)
         id: crates-auth
@@ -216,13 +229,20 @@ jobs:
           ref: ${{ needs.release.outputs.tag_name }}
           persist-credentials: false
 
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --target "${TARGET},${MUSL_TARGET}"
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          target: ${{ env.TARGET }},${{ env.MUSL_TARGET }}
+          cache: false
+          build-warnings: warn
 
       # Independent: tool compiles use cargo install's own temp target dir, so they don't
       # contend with the release build for the target/ lock. The static stfg build below
@@ -394,13 +414,20 @@ jobs:
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --target "${TARGET}"
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: warn
 
       # aws-lc-sys (rustls crypto) compiles C through the `musl-gcc` wrapper from musl-tools.
       - name: Build release binary
@@ -486,13 +513,20 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --target "${TARGET}"
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: warn
 
       # Compiled before the key is imported, so no dependency build script or proc macro runs
       # while it is in a keychain.

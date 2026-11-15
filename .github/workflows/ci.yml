@@ -15,9 +15,10 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
 
-# CI runs plain cargo from rustup (version read from .mise.toml, MSRV from Cargo.toml). mise is
-# for local development only, where it routes cargo through mbx; the complexity job alone uses
-# it in CI, to install cccc.
+# CI runs plain cargo, installed by actions-rust-lang/setup-rust-toolchain (version read from
+# .mise.toml, MSRV from Cargo.toml; its own cache off, warnings left to clippy). mise is for local
+# development only, where it routes cargo through mbx; the complexity job alone uses it in CI, to
+# install cccc.
 jobs:
   conventional-commits:
     name: Conventional commit messages
@@ -105,7 +106,7 @@ jobs:
         run: shellcheck -S info scripts/*.sh scripts/*.bats packaging/macos/*.sh packaging/ci/*.sh
 
   # `mise run lint:complexity`. Its own job: mise installs only cccc here, so the Rust jobs keep
-  # plain cargo from rustup.
+  # plain cargo.
   complexity:
     name: Complexity
     runs-on: ubuntu-latest
@@ -172,13 +173,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --component clippy,rustfmt
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: clippy,rustfmt
+          cache: false
+          build-warnings: warn
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -207,13 +215,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install MSRV toolchain (rust-version from Cargo.toml)
+      - name: Read the MSRV from Cargo.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install the MSRV toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          cache: false
+          build-warnings: warn
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -247,13 +261,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --target "${TARGET}"
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          target: ${{ env.TARGET }}
+          cache: false
+          build-warnings: warn
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -304,13 +325,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust (version from .mise.toml)
+      - name: Read the Rust version from .mise.toml
+        id: rust
         run: |
           set -eu
           v="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
           test -n "${v}"
-          rustup toolchain install "${v}" --profile minimal --component clippy --target "${TARGET}"
-          rustup default "${v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          target: ${{ env.TARGET }}
+          components: clippy
+          cache: false
+          build-warnings: warn
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

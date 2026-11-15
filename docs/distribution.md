@@ -114,9 +114,11 @@ GitHub Actions keeps source verification separate from release automation:
 - Both workflows start from `permissions: {}`; each job asks for what it needs. Every job has a
   `timeout-minutes`, and every checkout but the one that pushes the bump uses
   `persist-credentials: false`.
-- Rust comes from rustup, at the version pinned in `.mise.toml` (MSRV from `Cargo.toml`); no
-  toolchain action. Release jobs restore no cargo cache, and packaging tools are installed at
-  pinned versions.
+- Rust comes from `actions-rust-lang/setup-rust-toolchain` (pinned like every action, with
+  semver tags Dependabot and zizmor track), at the version pinned in `.mise.toml` (MSRV from
+  `Cargo.toml`), with its cache off (`cache: false`) and warnings left non-fatal outside clippy
+  (`build-warnings: warn`). Release jobs restore no cargo cache, and packaging tools are installed
+  at pinned versions.
 - Release artifacts are built by jobs with `contents: read` only. One `checksums` job hashes and
   attests every asset, and only `publish-assets` can write to the release (with `gh`, not a
   third-party release action).
