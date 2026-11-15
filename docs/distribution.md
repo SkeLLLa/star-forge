@@ -70,9 +70,12 @@ Release CI publishes signed package repositories (see [Linux signing](#linux-sig
 and the public key at `https://skellla.github.io/star-forge/star-forge.asc`.
 [ziptie-soft/pkg-pages](https://github.com/ziptie-soft/pkg-pages)'s reusable workflow builds them
 (the `packages` job): the RPM repository with `createrepo_c --compatibility`, the APT repository
-(a `stable` suite and `main` component) with `apt-ftparchive`, and an `index.html` listing in
-every directory, since Pages serves none. GitHub Releases remain the
-long-term artifact archive; Pages keeps the current release plus up to nine previous ones.
+(a `stable` suite and `main` component) with `apt-ftparchive`, a `star-forge-keyring` .deb that
+installs the pin as APT's key for the repository (so `apt upgrade` delivers key rotations and
+revocations), a signed manifest of its packages (`pkg-pages.tsv`), and an `index.html` listing in
+every directory, since Pages serves none. GitHub Releases remain the long-term artifact archive;
+Pages keeps the current release plus up to nine previous ones, and each release takes the earlier
+ones from the live site, checked against that manifest.
 
 One-time repository setup: GitHub Pages must use **GitHub Actions** as its source (Settings →
 Pages → Build and deployment), or equivalently:
@@ -145,11 +148,12 @@ The release flow:
      checks the binaries are static, and smoke-tests them.
    - `macos-assets` builds both macOS targets, signs them (see [Signing](#signing)), and
      smoke-tests the native one.
-7. `packages` calls pkg-pages' `publish.yml` (pinned by commit SHA): it signs the `.rpm` files
-   (see [Linux signing](#linux-signing)), checks their signatures and installs the `.rpm` on
-   Fedora 44 and the `.deb` on Debian trixie and Ubuntu 26.04 (`x86_64`), and on Fedora 44 and
-   Debian trixie (`aarch64`), smoke-tests `stfg`, then builds the signed APT and DNF repositories
-   from them and the nine releases before. It doesn't deploy them yet.
+7. `packages` calls pkg-pages' `publish.yml` (pinned by commit SHA): it fetches the nine
+   releases before from the live site, signs the `.rpm` files (see
+   [Linux signing](#linux-signing)), checks their signatures and installs the `.rpm` on Fedora 44
+   and the `.deb` on Debian trixie and Ubuntu 26.04 (`x86_64`), and on Fedora 44 and Debian trixie
+   (`aarch64`), smoke-tests `stfg`, then builds the APT and DNF repositories and the keyring
+   package, signs the repository metadata and checks the site. It doesn't deploy it yet.
 8. `checksums` writes one `.sha256` sidecar per artifact plus `SHA256SUMS`, and attests the build
    provenance of every artifact.
 9. `publish-assets` attaches the artifacts and checksums to the draft release and appends the
@@ -266,23 +270,23 @@ unsigned and builds unsigned repositories, with a notice. Once it is committed, 
 the release when the `REPO_SIGNING_KEY` secret is
 missing, belongs to another primary key, or can't sign (passphrase, expiry, or a subkey the pin
 revokes); setting the secret without committing the pin fails too. `import` also merges the pin
-into CI's keyring, so the published `star-forge.asc` is the committed certificate.
-Its install tests check the .rpm against the pin before installing it, and its site build checks
-every .rpm it publishes.
+into CI's keyring, so the published `star-forge.asc` and the keyring package carry the committed
+certificate. Its install tests check the .rpm against the pin before installing it, and its site
+check verifies every signature on the site against the pin.
 
-**Where it signs.** `packages`' sign job runs after `linux-assets` (rpm-sign in pkg-pages'
-pinned Fedora 44 image) and uploads the signed files as one artifact, which `checksums` and
-`publish-assets` use instead of the build's `release-linux-rpm-<arch>`, so the checksums and the
-release page see only the signed files. No build runs in a job that holds the key. Its repo job
-(in pkg-pages' Debian trixie image: the runner's rpm 4.18 can't read a pin with a revoked
-subkey) signs the metadata and also signs the .rpm files of the earlier releases it republishes.
-The release's own is already signed and stays byte-identical, while those from before the key,
-or signed by a since-revoked subkey, differ from their release page copies (and
-checksums) by the signature. `pages` only deploys the site, so the key and the Pages deploy token
-never share a job.
+**Where it signs.** The key exists in two of `packages`' jobs only. Its sign job runs after
+`linux-assets` (rpm-sign in pkg-pages' pinned Fedora 44 image) and uploads the signed files as
+one artifact, which `checksums` and `publish-assets` use instead of the build's
+`release-linux-rpm-<arch>`, so the checksums and the release page see only the signed files. Its
+seal job signs the repository metadata (`InRelease`, `repomd.xml`) and `pkg-pages.tsv`, after a
+build job without the key has parsed the packages and built the site. No build runs in a job that
+holds the key. Earlier releases' .rpm files stay as the site's manifest proves them; one the
+current subkey didn't sign (from before the key, or after a rotation) is signed again with it, so
+it differs from its release page copy (and checksums) by the signature. `pages` only deploys the
+site, so the key and the Pages deploy token never share a job.
 
 **Secret.** The subkey lives only in the `linux-signing` GitHub environment, used only by
-`packages`' sign and repo jobs (the reusable workflow sets `environment: linux-signing`, and
+`packages`' sign and seal jobs (the reusable workflow sets `environment: linux-signing`, and
 `release.yml` maps the secret to it):
 
 | Secret             | Value                                                                         |
@@ -290,7 +294,7 @@ never share a job.
 | `REPO_SIGNING_KEY` | one signing subkey, armored, without a passphrase (`linux-signing.sh ci-key`) |
 
 Settings → Environments → New environment `linux-signing`, deployment branches: only `master`
-(optionally required reviewers), or:
+(optionally required reviewers, who are then asked twice per release, for sign and seal), or:
 
 ```sh
 gh api -X PUT repos/SkeLLLa/star-forge/environments/linux-signing \
@@ -324,14 +328,20 @@ which revokes the whole key even if the keyring is lost. Commit `repo.asc` in th
 that updates the README's install commands to the signed ones (the index page shows them); the
 next release is the first signed one.
 
-**Rotating or revoking the subkey.** Users trust the primary, so a subkey change needs no action
-from them beyond the `star-forge.asc` they fetch. Before the subkey expires, or if the secret
-leaks: with the offline keyring, revoke the old subkey if it leaked (`gpg --edit-key "$FPR"`,
-`key N`, `revkey`, `save`), add a new one with `--quick-add-key`, export `repo.asc` again and set
-the secret from `ci-key` for the new one. Commit `repo.asc`: until then, `import` refuses a
-subkey the pin doesn't know, and once a revocation is committed it refuses the revoked one. Users
-then get the revocation with the next `star-forge.asc` they fetch; dnf refuses packages signed
-by the revoked subkey, and the next site build re-signs the earlier releases' with the new one.
+**Rotating or revoking the subkey.** Users trust the primary, so a subkey change asks no new
+trust of them. Keep a standby signing subkey in the pin (`gpg --quick-add-key "$FPR" rsa4096 sign
+never`, then export and commit `repo.asc`, and release), so every client's copy of the key
+already lists it. To rotate, before the subkey expires: first switch CI to the standby
+(`packaging/ci/linux-signing.sh ci-key <STANDBY> | gh secret set REPO_SIGNING_KEY --env
+linux-signing`) and release, which re-signs the earlier releases' .rpm files with it; only then
+revoke the old subkey (`gpg --edit-key "$FPR"`, `key N`, `revkey`, reason "superseded", `save`),
+add the next standby, commit `repo.asc` and release. Never switch CI to a subkey published only in
+the same release: dnf5 caches the repository key at first use, and pkg-pages refuses a subkey the
+committed pin doesn't list. If the secret leaks, don't wait: revoke the subkey, add a new one,
+commit `repo.asc`, then set the secret (releases fail in between, which is intended). APT users
+get new subkeys and revocations through `star-forge-keyring` with `apt upgrade`; DNF never
+fetches a key again on its own, so DNF users apply a revocation by hand
+([pkg-pages' signing guide](https://github.com/ziptie-soft/pkg-pages/blob/v2.0.0/docs/signing.md#rotating-or-revoking-the-subkey)).
 If the primary itself leaks, import the revocation certificate (remove the `:` before `-----BEGIN` first),
 commit the revoked `repo.asc` (every release fails from then on), and start over with a new key;
 users have to fetch it again.
@@ -443,11 +453,10 @@ sudo dnf install star-forge
 ### APT repository
 
 ```bash
-sudo install -d -m 0755 /etc/apt/keyrings
-sudo curl -fsSLo /etc/apt/keyrings/star-forge.asc https://skellla.github.io/star-forge/star-forge.asc
-echo 'deb [signed-by=/etc/apt/keyrings/star-forge.asc] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
+sudo curl -fsSLo /usr/share/keyrings/star-forge-keyring.asc https://skellla.github.io/star-forge/star-forge.asc
+sudo curl -fsSLo /etc/apt/sources.list.d/star-forge.list https://skellla.github.io/star-forge/deb/star-forge.list
 sudo apt update
-sudo apt install star-forge
+sudo apt install star-forge-keyring star-forge
 ```
 
 ### Nix

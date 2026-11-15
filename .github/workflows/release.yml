@@ -308,9 +308,11 @@ jobs:
   # ziptie-soft/pkg-pages signs the .rpm files with the subkey of the linux-signing environment
   # (checked against the pin packaging/signing/repo.asc, failing closed), install-tests them on
   # clean systems, and builds the APT and DNF repositories from them, the .deb files and the 9
-  # releases before this one. The .deb files carry no signature of their own: APT checks the
-  # repositories' signed InRelease. No build runs in a job that holds the key. The site is only
-  # built here; `pages` deploys it once the release assets are public.
+  # releases before this one, plus a star-forge-keyring .deb that carries the pin. The key exists
+  # only in its sign and seal jobs; the job that parses the packages has none, and no build runs in
+  # a job that holds it. The .deb files carry no signature of their own: APT checks the
+  # repositories' signed InRelease. The site is only built here; `pages` deploys it once the
+  # release assets are public.
   # See https://github.com/ziptie-soft/pkg-pages/blob/master/docs/actions.md#publish-reusable-workflow
   packages:
     name: Linux packages and repositories
@@ -320,7 +322,7 @@ jobs:
       contents: read
       pages: write # publish.yml's deploy job declares it; deploy is false here
       id-token: write
-    uses: ziptie-soft/pkg-pages/.github/workflows/publish.yml@5ff7ea06ab279291e2d604f596bac44bdeaeb160 # v1.1.0
+    uses: ziptie-soft/pkg-pages/.github/workflows/publish.yml@3490cd5955c17ab9ec0e460b905a8ee079c5bc9f # v2.0.0
     with:
       version: ${{ needs.release.outputs.version }}
       tag: ${{ needs.release.outputs.tag_name }}
@@ -341,6 +343,12 @@ jobs:
       packslip-pin: ps1_iqg6ch676syauz3nb3hluddyku
       # Overrides the URL for a custom domain; empty: https://skellla.github.io/star-forge
       base-url: ${{ vars.PAGES_BASE_URL }}
+      # Earlier releases come from the live site, checked against its signed pkg-pages.tsv. The
+      # site pkg-pages v1.1 built has none, so the first v2 release takes them from the GitHub
+      # releases, and signs v1.4.2's .rpm, which predates the key, with the current subkey. Remove
+      # both lines once that release is out (pkg-pages docs/upgrading.md#the-bootstrap-release).
+      history-from: releases
+      resign-history: true
       deb-architectures: amd64 arm64
       rpm-architectures: x86_64 aarch64
       install-tests: >-

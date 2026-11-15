@@ -74,17 +74,20 @@ This is the recommended method on Debian and Ubuntu: `apt upgrade` then keeps `s
 date.
 
 ```sh
-sudo install -d -m 0755 /etc/apt/keyrings
-sudo curl -fsSLo /etc/apt/keyrings/star-forge.asc https://skellla.github.io/star-forge/star-forge.asc
-echo 'deb [signed-by=/etc/apt/keyrings/star-forge.asc] https://skellla.github.io/star-forge/deb stable main' | sudo tee /etc/apt/sources.list.d/star-forge.list
+sudo curl -fsSLo /usr/share/keyrings/star-forge-keyring.asc https://skellla.github.io/star-forge/star-forge.asc
+sudo curl -fsSLo /etc/apt/sources.list.d/star-forge.list https://skellla.github.io/star-forge/deb/star-forge.list
 sudo apt update
-sudo apt install star-forge
+sudo apt install star-forge-keyring star-forge
 ```
 
 The packages and the repository metadata are signed with the star-forge packages key,
 [star-forge.asc](https://skellla.github.io/star-forge/star-forge.asc) (the same as
 [packaging/signing/repo.asc](packaging/signing/repo.asc)); APT and DNF refuse anything it didn't
-sign. DNF asks you to confirm the key's fingerprint on the first install. The repositories keep
+sign. DNF asks you to confirm the key's fingerprint on the first install. The
+`star-forge-keyring` package keeps APT's copy of the key current, so key rotations and
+revocations arrive with `apt upgrade`. If you set up the repository before it existed (with the
+key in `/etc/apt/keyrings/`), that setup keeps working; run the commands above once to switch
+over, then delete `/etc/apt/keyrings/star-forge.asc`. The repositories keep
 the 10 most recent releases, so you can also pin or downgrade a version
 ([details](docs/distribution.md#linux-signing)).
 
@@ -166,7 +169,7 @@ unit), then:
 | Installed with | Remove with |
 | --- | --- |
 | DNF | `sudo dnf remove star-forge`, then `sudo rm /etc/yum.repos.d/star-forge.repo` |
-| APT | `sudo apt remove star-forge`, then `sudo rm /etc/apt/sources.list.d/star-forge.list /etc/apt/keyrings/star-forge.asc` |
+| APT | `sudo apt purge star-forge star-forge-keyring`, then `sudo rm /etc/apt/sources.list.d/star-forge.list` |
 | Tarball or packslip | `rm ~/.local/bin/stfg ~/.local/bin/stfgd` |
 | mise | `mise unuse -g github:SkeLLLa/star-forge` |
 | Nix | `nix profile remove star-forge` |
