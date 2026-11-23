@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.3](https://github.com/SkeLLLa/star-forge/compare/v1.10.2...v1.10.3) - 2026-11-23
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.10.2](https://github.com/SkeLLLa/star-forge/compare/v1.10.1...v1.10.2) - 2026-11-15
 
 ### Fixed
